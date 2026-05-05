@@ -18,13 +18,10 @@ HYDRA_HOST="hydra"
 SHIELD_HOST="shield"
 
 # Remote base path
-REMOTE_BASE="/data/sandbox/marvel"
+REMOTE_BASE="/home/stan/sandbox/marvel"
 
 # Deploy targets (subdirs under REMOTE_BASE that get each algo_pkg)
 DEPLOY_DIRS=(gauntlet optimus ltp)
-
-# Also deploy to stan_li_py
-STAN_LI_BASE="/data/sandbox/stan_li_py"
 
 # All algo packages
 ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie)
@@ -104,10 +101,6 @@ deploy_algo() {
         echo "    -> $remote_path"
     done
 
-    # Deploy to stan_li_py
-    local stan_path="$host:$STAN_LI_BASE/${algo}_pkg/"
-    rsync -az --delete "$build_dir/" "$stan_path"
-    echo "    -> $stan_path"
 }
 
 # ---- Main ----
