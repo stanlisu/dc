@@ -24,7 +24,7 @@ REMOTE_BASE="/home/stan/sandbox/marvel"
 DEPLOY_DIRS=(gauntlet optimus ltp)
 
 # All algo packages
-ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie)
+ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
 
 BUILD_ONLY=false
 ALGOS=("${ALL_ALGOS[@]}")
