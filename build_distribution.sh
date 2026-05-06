@@ -21,7 +21,7 @@ SHIELD_HOST="shield"
 REMOTE_BASE="/home/stan/sandbox/marvel"
 
 # Deploy targets (subdirs under REMOTE_BASE that get each algo_pkg)
-DEPLOY_DIRS=(gauntlet optimus ltp)
+DEPLOY_DIRS=(gauntlet optimus ltp sumo)
 
 # All algo packages
 ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
