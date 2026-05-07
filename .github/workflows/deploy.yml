@@ -1,0 +1,61 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PyArmor
+        run: pip install pyarmor
+
+      - name: Build obfuscated packages
+        run: |
+          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
+          for algo in "${ALGOS[@]}"; do
+            echo "Building $algo..."
+            build_dir="build_dist/${algo}_pkg"
+            rm -rf "$build_dir"
+            mkdir -p "$build_dir"
+            pyarmor gen -O "$build_dir/src" -r "${algo}_pkg/src/$algo"
+            cp "${algo}_pkg/setup.py" "$build_dir/"
+            sed -i 's/python_requires=">=3.7",/python_requires=">=3.7", package_data={"": ["*.so", "*.dylib", "*.dll"]}, zip_safe=False,/g' "$build_dir/setup.py"
+            [ -f "${algo}_pkg/README.md" ] && cp "${algo}_pkg/README.md" "$build_dir/"
+            [ -f "${algo}_pkg/requirements.txt" ] && cp "${algo}_pkg/requirements.txt" "$build_dir/"
+          done
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 13.115.134.141 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 192.168.72.135 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy to Hydra
+        run: |
+          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
+          for algo in "${ALGOS[@]}"; do
+            rsync -az --delete "build_dist/${algo}_pkg/" "stan@13.115.134.141:/home/stan/sandbox/marvel/${algo}_pkg/"
+          done
+          ssh stan@13.115.134.141 '~/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+
+      - name: Deploy to Shield
+        run: |
+          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
+          for algo in "${ALGOS[@]}"; do
+            rsync -az --delete "build_dist/${algo}_pkg/" "stan@192.168.72.135:/home/stan/sandbox/marvel/${algo}_pkg/"
+          done
+          ssh stan@192.168.72.135 '/opt/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'

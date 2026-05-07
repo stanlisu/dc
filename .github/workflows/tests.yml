@@ -19,8 +19,17 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pytest pytest-cov
-          pip install -e agamotto_pkg/
+          pip install pytest pytest-cov pytest-asyncio
+          pip install pandas numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
+          pip install -e agamotto_pkg/ \
+                      orb_pkg/ \
+                      scepter_pkg/ \
+                      mjolnir_pkg/ \
+                      vomir_pkg/ \
+                      vibranium_pkg/ \
+                      valkyrie_pkg/ \
+                      aether_pkg/ \
+                      stormbreaker_pkg/
 
-      - name: Run agamotto tests
+      - name: Run tests
         run: pytest agamotto_pkg/tests/ -v --tb=short
