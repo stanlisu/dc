@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 _BTC = "BINANCE_PERP_BTC_USDT"
 _BTC_NATIVE = normalize_symbol(_BTC)
 
+# Dedup set for the regime-filter silent-except warning in predict().
+# Keyed by (regime_name, position, exception_class_name). Lives for the
+# process lifetime — long enough to surface the failure in offline replay
+# and any live bridge restart cycle, short enough to not need explicit
+# clearing.
+_LOGGED_FILTER_FAILURES: set = set()
+
 
 class MjolnirTrading:
     """Live inference engine: predict on 5s bars using trained Mjolnir models.
@@ -214,12 +221,24 @@ class MjolnirTrading:
             model_name = entry.get("model", "LightGBM").lower()
             threshold = float(entry.get("threshold", 0.001))
 
-            # Check regime condition using one-row DataFrame
+            # Check regime condition using one-row DataFrame.
+            # Instrumentation: log first occurrence of each (regime, position,
+            # exception_class) so offline-replay "None for every bar" failures
+            # surface their root cause without flooding logs. continue behavior
+            # is unchanged — this is a diagnostic step, not a fix.
             try:
                 mask = self._research._apply_filter_mask(feats.iloc[[-2]], regime_name, position)
                 if not mask.any():
                     continue
-            except Exception:
+            except Exception as exc:
+                key = (regime_name, position, type(exc).__name__)
+                if key not in _LOGGED_FILTER_FAILURES:
+                    _LOGGED_FILTER_FAILURES.add(key)
+                    logger.warning(
+                        "regime filter raised — regime=%s position=%s: %s: %s "
+                        "(first occurrence; suppressing duplicates)",
+                        regime_name, position, type(exc).__name__, exc,
+                    )
                 continue
 
             # Load model
