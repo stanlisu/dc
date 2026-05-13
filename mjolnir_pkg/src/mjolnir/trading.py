@@ -278,6 +278,19 @@ class MjolnirTrading:
                 best_short_thresh = (threshold if best_short_thresh is None
                                      else max(best_short_thresh, threshold))
 
+        # SHORT-drought diagnostic — log per-regime vote counts BEFORE the
+        # gate so ops can grep "predict votes" to distinguish (a) shorts
+        # never being counted (predict() bug) from (b) shorts counted but
+        # losing `long_count > short_count` (stack-composition issue).
+        # bridge result lines alone can't tell these apart. Cheap; one INFO
+        # per symbol per decision.
+        logger.info(
+            "predict votes %s: long_count=%d short_count=%d "
+            "best_long=%s best_short=%s",
+            symbol, long_count, short_count,
+            best_long_thresh, best_short_thresh,
+        )
+
         # Bug 7 (audit D3) — required key, no silent default per CLAUDE.md.
         if "MIN_SIGNAL_COUNT" not in self.config:
             raise KeyError(
