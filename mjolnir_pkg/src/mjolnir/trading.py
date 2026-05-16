@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -24,6 +25,17 @@ from mjolnir.core.research import MjolnirResearch, _DEFAULT_FEATURE_WINDOWS
 from mjolnir.core.utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PredictDiag:
+    """Diagnostic payload from predict(). Frozen — immutable after creation."""
+    side: str            # "long" or "short"
+    threshold: float     # aggregate best threshold (min long / max short)
+    y_pred: float        # raw model score of the strongest-signal model
+    y_pred_thresh: float  # per-model threshold of the strongest-signal model
+    regime: str          # regime name of the strongest-signal model
+    model_name: str      # model key (e.g. "r1_long_lightgbm")
 
 _BTC = "BINANCE_PERP_BTC_USDT"
 _BTC_NATIVE = normalize_symbol(_BTC)
@@ -137,11 +149,12 @@ class MjolnirTrading:
         bufs[symbol].append(bar)
         tss[symbol].append(timestamp)
 
-    def predict(self, symbol: str) -> Optional[Tuple[str, float]]:
+    def predict(self, symbol: str) -> Optional[PredictDiag]:
         """Predict signal for symbol using the latest complete bar.
 
         Returns:
-            ('long', threshold) or ('short', threshold) if signal, else None.
+            PredictDiag(side, threshold, y_pred, y_pred_thresh, regime,
+            model_name) if signal, else None.
         """
         if symbol not in self._buffers:
             return None
@@ -214,6 +227,9 @@ class MjolnirTrading:
         short_count = 0
         best_long_thresh: Optional[float] = None
         best_short_thresh: Optional[float] = None
+        # Track the strongest-signal model per side: (pred, thresh, regime, model_key)
+        best_long_diag: Optional[Tuple[float, float, str, str]] = None
+        best_short_diag: Optional[Tuple[float, float, str, str]] = None
 
         for entry in self._regime_stack:
             regime_name = entry.get("regime", "")
@@ -273,10 +289,16 @@ class MjolnirTrading:
                 long_count += 1
                 best_long_thresh = (threshold if best_long_thresh is None
                                     else min(best_long_thresh, threshold))
+                margin = pred - threshold
+                if best_long_diag is None or margin > (best_long_diag[0] - best_long_diag[1]):
+                    best_long_diag = (pred, threshold, regime_name, model_key)
             elif position == "short" and pred < threshold:
                 short_count += 1
                 best_short_thresh = (threshold if best_short_thresh is None
                                      else max(best_short_thresh, threshold))
+                margin = threshold - pred
+                if best_short_diag is None or margin > (best_short_diag[1] - best_short_diag[0]):
+                    best_short_diag = (pred, threshold, regime_name, model_key)
 
         # SHORT-drought diagnostic — log per-regime vote counts BEFORE the
         # gate so ops can grep "predict votes" to distinguish (a) shorts
@@ -297,7 +319,7 @@ class MjolnirTrading:
                 "MIN_SIGNAL_COUNT is required in setting.json (typically 1)"
             )
         min_count = int(self.config["MIN_SIGNAL_COUNT"])
-        result: Optional[Tuple[str, float]] = None
+        result: Optional[PredictDiag] = None
         # Bug 6 (audit B5/D5) — explicit None-check, NOT `or 0.001`. A regime
         # with threshold=0.0 is legitimate; the falsy collapse would silently
         # rewrite it to 0.001 (FEE-bug pattern). If the count gate triggered
@@ -309,19 +331,44 @@ class MjolnirTrading:
                     f"long_count={long_count} but best_long_thresh is None — "
                     "regime stack accounting bug"
                 )
-            result = ("long", best_long_thresh)
+            if best_long_diag is None:
+                raise RuntimeError(
+                    f"long_count={long_count} but best_long_diag is None — "
+                    "regime stack accounting bug"
+                )
+            pred_val, pred_thresh, regime, mkey = best_long_diag
+            result = PredictDiag(
+                side="long", threshold=best_long_thresh,
+                y_pred=pred_val, y_pred_thresh=pred_thresh,
+                regime=regime, model_name=mkey,
+            )
         elif short_count >= min_count and short_count > long_count:
             if best_short_thresh is None:
                 raise RuntimeError(
                     f"short_count={short_count} but best_short_thresh is None — "
                     "regime stack accounting bug"
                 )
-            result = ("short", best_short_thresh)
+            if best_short_diag is None:
+                raise RuntimeError(
+                    f"short_count={short_count} but best_short_diag is None — "
+                    "regime stack accounting bug"
+                )
+            pred_val, pred_thresh, regime, mkey = best_short_diag
+            result = PredictDiag(
+                side="short", threshold=best_short_thresh,
+                y_pred=pred_val, y_pred_thresh=pred_thresh,
+                regime=regime, model_name=mkey,
+            )
 
         # Apply REVERSE: -1 flips long→short and short→long
         reverse = int(self.config.get("REVERSE", 1))
         if result is not None and reverse == -1:
-            result = ("short" if result[0] == "long" else "long", result[1])
+            result = PredictDiag(
+                side="short" if result.side == "long" else "long",
+                threshold=result.threshold,
+                y_pred=result.y_pred, y_pred_thresh=result.y_pred_thresh,
+                regime=result.regime, model_name=result.model_name,
+            )
 
         # Note: IPC send moved to MjolnirBridge._inference_loop after Phase 6
         # so the bridge can attach a per-symbol qty (computed from
