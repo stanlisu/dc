@@ -443,14 +443,23 @@ class MjolnirResearch:
             sym = native_to_sym.get(native, native)
             feats["symbol"] = sym
             feats["timestamp"] = feats.index
-            # Apply ladder-adjusted return columns only when training at native
-            # resolution (TIME_UNIT == bar resolution).  In boundary-aligned mode
-            # (e.g. 5s bars predicting 1m close), the ladder logic uses a 1-bar
-            # shift which would be wrong — skip it.
+            # Apply ladder-adjusted return columns. The horizon (in bars)
+            # matches the prediction window: native-mode (bar_tf ==
+            # TIME_UNIT) uses 1 bar; boundary-aligned mode (e.g. 5s bars
+            # predicting 30s closes) uses TIME_UNIT_seconds /
+            # bar_tf_seconds so the low/high lookahead spans the full
+            # prediction horizon. Without this the boundary-mode target
+            # collapses to a frictionless close-to-close return, which
+            # the maker-first executor cannot trade — every signal where
+            # price gaps the predicted direction immediately gets credit
+            # in research but never fills live.
             time_unit = self.config.get("TIME_UNIT", "5s")
-            boundary_mode = self.config.get("TRAIN_BARS_DIR") and time_unit != "5s"
-            if not boundary_mode and all(c in feats.columns for c in ("close", "low", "high")):
-                ladder_cols = self._compute_ladder_returns(feats, "close", "low", "high")
+            bar_tf = "5s" if self.config.get("TRAIN_BARS_DIR") else time_unit
+            horizon_bars = max(
+                1, _TF_SECONDS[time_unit] // _TF_SECONDS[bar_tf])
+            if all(c in feats.columns for c in ("close", "low", "high")):
+                ladder_cols = self._compute_ladder_returns(
+                    feats, "close", "low", "high", horizon_bars=horizon_bars)
                 for col in ladder_cols.columns:
                     feats[col] = ladder_cols[col].values
             # Drop rows with NaN in return columns (last target_horizon bars)
@@ -671,7 +680,6 @@ class MjolnirResearch:
         symbols_cfg = self.config.get("SYMBOLS", [])
         native_to_sym = {normalize_symbol(s): s for s in symbols_cfg}
 
-        boundary_mode = bool(cfg.get("TRAIN_BARS_DIR")) and time_unit != "5s"
         reverse = int(self.config.get("REVERSE", 1))
 
         save_dir = os.path.join(out_dir, "filter")
@@ -751,12 +759,21 @@ class MjolnirResearch:
                 feats["symbol"] = sym_canonical
                 feats["timestamp"] = feats.index
 
-                # Apply ladder returns (skipped in boundary-aligned mode).
-                if not boundary_mode and all(
+                # Apply ladder returns. horizon_bars matches the
+                # prediction window so the low/high lookahead spans the
+                # same span as the price-return horizon. In native mode
+                # (bar_tf == TIME_UNIT) this is 1; in boundary-aligned
+                # mode (e.g. mjolnir.base.30s_1 = 5s bars predicting 30s
+                # boundary closes) it is TIME_UNIT_seconds /
+                # bar_tf_seconds, so a 5s/30s experiment uses horizon=6.
+                horizon_bars = max(
+                    1, _TF_SECONDS[time_unit] // _TF_SECONDS[bar_tf])
+                if all(
                     c in feats.columns for c in ("close", "low", "high")
                 ):
                     ladder_cols = self._compute_ladder_returns(
                         feats, "close", "low", "high",
+                        horizon_bars=horizon_bars,
                     )
                     for col in ladder_cols.columns:
                         feats[col] = ladder_cols[col].values
@@ -1284,22 +1301,42 @@ class MjolnirResearch:
         close_col: str,
         low_col: str,
         high_col: str,
+        horizon_bars: int = 1,
     ) -> pd.DataFrame:
         """Compute ladder-adjusted return columns for a single symbol.
 
         Mirrors the agamotto.research.AgamottoResearch.engineer_features ladder
-        logic exactly: same step_size (1 bps), same clipping, same column names.
+        logic (same step_size = 1 bps, same clipping, same column names),
+        generalized to a variable forward horizon so the fill window matches
+        the prediction window.
+
+        At horizon_bars == 1 the behaviour is identical to the original
+        1-bar shift, preserving native-mode parity (TIME_UNIT == bar
+        resolution, e.g. mjolnir.base.5s_1). For boundary-aligned
+        experiments (e.g. mjolnir.base.30s_1: 5s bars predicting the next
+        30s boundary close) callers should pass
+        horizon_bars = TIME_UNIT_seconds / bar_tf_seconds so the low/high
+        lookahead spans the full prediction horizon, instead of only the
+        next single bar (which under-counted ladder fills and produced
+        a frictionless close-to-close target).
 
         Args:
-            df:        DataFrame with at least close_col, low_col, high_col.
-            close_col: Name of the close price column.
-            low_col:   Name of the low price column.
-            high_col:  Name of the high price column.
+            df:           DataFrame with at least close_col, low_col, high_col.
+            close_col:    Name of the close price column.
+            low_col:      Name of the low price column.
+            high_col:     Name of the high price column.
+            horizon_bars: Forward horizon used both for the price return
+                          (close[t+h] / close[t] - 1) and for the
+                          low/high min/max lookahead window. Must be >= 1.
 
         Returns:
             DataFrame with columns: return_long, return_short,
             return_long_raw, return_short_raw.
         """
+        if horizon_bars < 1:
+            raise ValueError(
+                f"horizon_bars must be >= 1, got {horizon_bars}")
+
         step_size = 0.0001
         ladder = int(self.config.get("LADDER", 1) or 0)
         # FEE is required (no fallback): see commit 0500d8fa for rationale.
@@ -1310,18 +1347,37 @@ class MjolnirResearch:
         low_series = df[low_col]
         high_series = df[high_col]
 
-        price_return = close.pct_change(fill_method=None).shift(-1)
+        # Forward h-bar price return: close[t+h] / close[t] - 1.
+        price_return = close.pct_change(
+            horizon_bars, fill_method=None).shift(-horizon_bars)
         close_safe = close.replace(0, np.nan)
-        low_next = low_series.shift(-1)
-        high_next = high_series.shift(-1)
 
-        distance_long = ((close_safe - low_next) / close_safe).replace(
+        # Forward-rolling min low / max high over (t, t+horizon_bars]:
+        # shift(-1) so position t holds low[t+1], then reverse-rolling so
+        # the window covers the next horizon_bars bars (exclusive of t).
+        # At horizon_bars=1 this reduces to low.shift(-1) / high.shift(-1).
+        low_shifted = low_series.shift(-1)
+        high_shifted = high_series.shift(-1)
+        low_window = (
+            low_shifted.iloc[::-1]
+            .rolling(horizon_bars, min_periods=1)
+            .min()
+            .iloc[::-1]
+        )
+        high_window = (
+            high_shifted.iloc[::-1]
+            .rolling(horizon_bars, min_periods=1)
+            .max()
+            .iloc[::-1]
+        )
+
+        distance_long = ((close_safe - low_window) / close_safe).replace(
             [np.inf, -np.inf], np.nan)
         long_layers = np.floor(distance_long / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
         total_long_layers = 1 + long_layers
 
-        distance_short = ((high_next - close_safe) / close_safe).replace(
+        distance_short = ((high_window - close_safe) / close_safe).replace(
             [np.inf, -np.inf], np.nan)
         short_layers = np.floor(distance_short / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
