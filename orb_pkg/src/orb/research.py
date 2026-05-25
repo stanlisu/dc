@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from typing import Dict, List
+import gc
 import logging
+
 import numpy as np
 import pandas as pd
 
@@ -72,33 +74,33 @@ class OrbResearch(AgamottoResearch):
     # ------------------------------------------------------------------
 
     def load(self) -> None:
-        """Load data for each timeframe in parallel via ThreadPoolExecutor."""
-        from concurrent.futures import ThreadPoolExecutor
+        """Load data for each timeframe serially.
 
-        def _load_tf(tf):
+        WHY: the prior ThreadPoolExecutor(max_workers=len(self.timeframes))
+        path held 4 multi-symbol kline frames + all of TA-Lib's intermediate
+        Series allocations alive simultaneously, peaking at ~65 GB RSS and
+        OOM-killing on 29 symbols × 4 TFs × 3.5 years (2026-05-22 smoke).
+        Serializing the loop + gc between TFs cuts that 4x to ~0.4 GB peak.
+        Per-symbol streaming was tried (2026-05-23 smoke3) but proved much
+        slower for ORB-scale data — see commit log for benchmark.
+        """
+        for tf in self.timeframes:
             tf_config = {**self.config, "TIME_UNIT": tf}
             inst = AgamottoResearch(tf_config, self.home_root)
             inst.load()
-            return tf, inst
-
-        with ThreadPoolExecutor(max_workers=len(self.timeframes)) as pool:
-            for tf, inst in pool.map(_load_tf, self.timeframes):
-                self._tf_instances[tf] = inst
-
+            self._tf_instances[tf] = inst
+            gc.collect()
         # Parent compatibility: self.raw = base-TF raw data
         self.raw = self._tf_instances[self.base_tf].raw
 
     def engineer_features(self) -> None:
-        """Engineer features for each TF in parallel, then align."""
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _engineer_tf(item):
-            tf, inst = item
+        """Engineer features for each TF serially, then align. See load() for rationale."""
+        for tf, inst in list(self._tf_instances.items()):
             inst.engineer_features()
-            return tf
-
-        with ThreadPoolExecutor(max_workers=len(self._tf_instances)) as pool:
-            list(pool.map(_engineer_tf, list(self._tf_instances.items())))
+            # Free raw OHLCV — engineer_features keeps a reference inside .features
+            # via the leading copy() but the original .raw is no longer needed.
+            inst.raw = None
+            gc.collect()
         self._align_timeframes()
 
     def verticalize(self) -> None:

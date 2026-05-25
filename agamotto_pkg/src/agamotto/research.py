@@ -215,7 +215,13 @@ class AgamottoResearch:
         if self.raw is None:
             raise RuntimeError("Call load() before engineer_features().")
 
-        df = self.raw.copy()
+        # WHY: drop the self.raw.copy() — the loop below only reads df[col] to
+        # build new Series; it never mutates df in place. The duplicate cost
+        # ~one wide multi-symbol OHLCV frame (e.g. 15m × 29 syms × 3.5y =
+        # ~300 MB) during engineer_features, contributing to the 2026-05-22
+        # OOM peak. self.raw is freed by the caller (OrbResearch.engineer_features
+        # sets inst.raw = None after) so retaining the reference here is safe.
+        df = self.raw
         engineered_frames = [df]
         
         # Get ladder config for position sizing
@@ -451,7 +457,13 @@ class AgamottoResearch:
 
         feature_df = pd.concat(engineered_frames, axis=1)
 
-        feature_df = feature_df.copy()
+        # WHY: pd.concat with axis=1 in pandas ≥2.0 returns an owning DataFrame
+        # (not a view), so the immediately-following column assignments
+        # (feature_df["year"] = ..., ["month"] = ..., ["close_timestamp"] = ...)
+        # do not need a defensive .copy() to avoid SettingWithCopyWarning.
+        # Dropping the copy saves a full feature-matrix duplication
+        # (~1.5 GB peak for 15m × 29 syms × 3.5y × ~55 engineered cols),
+        # which was a major contributor to the 2026-05-22 OOM.
         feature_df["year"] = feature_df.index.year
         feature_df["month"] = feature_df.index.month
 
