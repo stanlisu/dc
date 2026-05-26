@@ -20,8 +20,7 @@ SHIELD_HOST="shield"
 # Remote base path
 REMOTE_BASE="/home/stan/sandbox/marvel"
 
-# Deploy targets (subdirs under REMOTE_BASE that get each algo_pkg)
-DEPLOY_DIRS=(gauntlet optimus ltp sumo)
+# Deploy target: marvel root only (algo_pkg dirs live at REMOTE_BASE/)
 
 # All algo packages
 ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
@@ -95,11 +94,9 @@ deploy_algo() {
 
     echo "  Deploying ${algo}_pkg -> $host..."
 
-    for subdir in "${DEPLOY_DIRS[@]}"; do
-        local remote_path="$host:$REMOTE_BASE/$subdir/${algo}_pkg/"
-        rsync -az --delete "$build_dir/" "$remote_path"
-        echo "    -> $remote_path"
-    done
+    local remote_path="$host:$REMOTE_BASE/${algo}_pkg/"
+    rsync -az --delete "$build_dir/" "$remote_path"
+    echo "    -> $remote_path"
 
 }
 

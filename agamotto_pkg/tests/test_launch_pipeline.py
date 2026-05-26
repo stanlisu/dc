@@ -6,8 +6,16 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 LAUNCHER = str(Path(__file__).resolve().parents[2] / "bin" / "launch_pipeline.sh")
 MARVEL_ROOT = str(Path(__file__).resolve().parents[2])
+
+# Skip all tests when launcher script doesn't exist (dc/ standalone runs).
+pytestmark = pytest.mark.skipif(
+    not Path(LAUNCHER).exists(),
+    reason=f"launcher not found at {LAUNCHER}"
+)
 
 
 def _run(cmd, env=None, timeout=10):
