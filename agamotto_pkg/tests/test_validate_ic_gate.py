@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+# `gauntlet` lives in the marvel repo, not dc — skip when unavailable (dc CI).
+pytest.importorskip("gauntlet")
 from gauntlet.validate_ic_gate import compute_ic_summary, load_preds, IC_GATE
 
 
