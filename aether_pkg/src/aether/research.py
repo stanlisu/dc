@@ -64,11 +64,18 @@ class AetherResearch(OrbResearch):
         return out_dir
 
     def train_pooled_models(self, out_dir: str, period: str) -> None:
-        """Train one model per {base_tf}_{position} on ALL vertical_features rows.
+        """Rolling pooled training: one model per {base_tf}_{position} per window.
+
+        For each rolling window (train ``window_size - 1`` months, test 1 month)
+        a model is trained on the pooled (all-symbol) rows of the train months
+        and evaluated on the test month. Predictions are emitted ONLY for the
+        test month of each window, so ``predictions_{long,short}.csv`` are fully
+        out-of-sample (no leakage). The LAST window's best model is saved as the
+        production weights under ``weights/<period>/``.
 
         Args:
             out_dir: Experiment directory (e.g. gauntlet/pred_aether1h_1).
-            period:  Weight window name (e.g. "window_2026_03").
+            period:  Weight window name for the production (last-window) weights.
         """
         # Lazy import to avoid circular imports and keep aether/ self-contained
         _gauntlet = os.path.join(
@@ -77,8 +84,9 @@ class AetherResearch(OrbResearch):
             sys.path.insert(0, _gauntlet)
         from rolling_predict_returns import (
             select_feature_columns,
-            prepare_xy,
             train_models as _train_models,
+            build_windows,
+            split_by_month,
         )
 
         vf = getattr(self, "vertical_features", None)
@@ -90,9 +98,20 @@ class AetherResearch(OrbResearch):
                     "Run create() first.")
             vf = pd.read_csv(vf_path, parse_dates=["timestamp"])
 
+        for col in ("year", "month"):
+            if col not in vf.columns:
+                raise KeyError(
+                    f"vertical_features missing '{col}' column required for "
+                    "rolling windows (expected from verticalize()).")
+
         feature_cols = select_feature_columns(vf.columns.tolist())
         sweep_models = self.config.get(
             "SWEEP_MODELS", ["LightGBM", "XGBoost", "Ridge", "HistGBR"])
+        # Window length is required and explicit — no silent fallback. train =
+        # window_size - 1 months, test = 1 month (e.g. 12 => train 11 / test 1).
+        if "WINDOW_SIZE" not in self.config:
+            raise KeyError("WINDOW_SIZE missing from config (required for rolling)")
+        window_size = int(self.config["WINDOW_SIZE"])
         weights_root = Path(out_dir) / "weights" / period
 
         for position, target_col in [("long", "return_long"), ("short", "return_short")]:
@@ -107,114 +126,107 @@ class AetherResearch(OrbResearch):
                     f"Only {len(df_clean)} rows with valid {target_col} — skipping")
                 continue
 
-            # Chronological 80/20 split
-            df_sorted = df_clean.sort_values("timestamp")
-            split = int(len(df_sorted) * 0.8)
-            train_df = df_sorted.iloc[:split].copy()
-            test_df = df_sorted.iloc[split:].copy()
+            months = sorted(set(zip(df_clean["year"].astype(int),
+                                    df_clean["month"].astype(int))))
+            windows = build_windows(months, window_size)
+            if not windows:
+                # Fail fast rather than silently degrading to a single split —
+                # a one-shot 80/20 over all history is exactly the leakage bug
+                # this method replaces.
+                raise ValueError(
+                    f"{position}: only {len(months)} month(s) of data, need "
+                    f">= {window_size} for rolling windows (WINDOW_SIZE).")
 
-            # Drop feature columns that are entirely NaN in the training set
-            # (all-NaN cols cause RobustScaler to emit NaN centers → Ridge fails)
-            non_null_cols = [
-                c for c in feature_cols
-                if not train_df[c].replace([np.inf, -np.inf], np.nan).isna().all()
-            ]
-            if len(non_null_cols) < len(feature_cols):
+            months_map = split_by_month(df_clean)
+            oos_parts: list[pd.DataFrame] = []
+            last_artifact = None  # (best, best_name, active_feature_cols) for prod weights
+
+            for window in windows:
+                train_parts = [months_map[m] for m in window.train_months
+                               if m in months_map]
+                test_df = months_map.get(window.test_month)
+                if not train_parts or test_df is None or test_df.empty:
+                    logger.warning(
+                        f"{position} {window.test_label}: missing train/test "
+                        "rows — skipping window")
+                    continue
+                train_df = pd.concat(train_parts, ignore_index=True)
+
+                # Drop feature cols entirely NaN in THIS window's train set
+                # (all-NaN cols make RobustScaler emit NaN centers → Ridge fails).
+                active_feature_cols = [
+                    c for c in feature_cols
+                    if not train_df[c].replace([np.inf, -np.inf], np.nan).isna().all()
+                ]
+
+                results = _train_models(
+                    train_df=train_df,
+                    test_df=test_df.copy(),
+                    feature_cols=active_feature_cols,
+                    imputation="median",
+                    target_col=target_col,
+                    target_models=sweep_models,
+                )
+                if not results:
+                    continue
+
+                valid = {
+                    n: r for n, r in results.items()
+                    if "error" not in r
+                    and not np.isnan(r.get("test_r2", float("nan")))
+                }
+                if not valid:
+                    logger.warning(
+                        f"{position} {window.test_label}: all models failed")
+                    continue
+
+                best_name = max(valid, key=lambda n: valid[n]["test_r2"])
+                best = valid[best_name]
+
+                # Accumulate OOS predictions for this window's TEST month only.
+                # train_models predicts on test rows surviving prepare_xy's
+                # non-NaN-target mask, so align against the same subset.
+                clean_test = test_df.dropna(subset=[target_col])
+                if len(clean_test) != len(best["y_pred"]):
+                    logger.warning(
+                        f"{position} {window.test_label}: pred/test length "
+                        f"mismatch ({len(best['y_pred'])} vs {len(clean_test)}) "
+                        "— skipping window predictions")
+                else:
+                    oos_parts.append(pd.DataFrame({
+                        "timestamp": clean_test["timestamp"].values,
+                        "symbol": clean_test["symbol"].values,
+                        "y_pred": best["y_pred"],
+                    }))
+
+                last_artifact = (best, best_name, active_feature_cols)
+
+            # Production weights = LAST window's best model.
+            if last_artifact is not None:
+                best, best_name, active_feature_cols = last_artifact
+                key = f"{self.base_tf}_{position}"
+                pos_dir = weights_root / key
+                pos_dir.mkdir(parents=True, exist_ok=True)
+                low = best_name.lower()
+                joblib.dump(best["model"],  pos_dir / f"{low}_model.pkl")
+                joblib.dump(best["scaler"], pos_dir / f"{low}_scaler.pkl")
+                joblib.dump(
+                    {"feature_columns": active_feature_cols, "model_name": best_name},
+                    pos_dir / f"{low}_meta.pkl",
+                )
                 logger.info(
-                    f"Dropped {len(feature_cols) - len(non_null_cols)} all-NaN "
-                    f"feature cols for {position}")
-            active_feature_cols = non_null_cols
+                    f"Saved {best_name} production artifacts to {pos_dir} "
+                    f"(last window {windows[-1].test_label})")
 
-            logger.info(
-                f"Training {position}: {len(train_df)} train rows, "
-                f"{len(test_df)} test rows, {len(active_feature_cols)} features")
-
-            results = _train_models(
-                train_df=train_df,
-                test_df=test_df,
-                feature_cols=active_feature_cols,
-                imputation="median",
-                target_col=target_col,
-                target_models=sweep_models,
-            )
-
-            if not results:
+            # Write OOS predictions (test months only — leakage-free).
+            if oos_parts:
+                preds = (pd.concat(oos_parts, ignore_index=True)
+                         .sort_values(["timestamp", "symbol"]))
+                pred_path = Path(out_dir) / f"predictions_{position}.csv"
+                preds[["timestamp", "symbol", "y_pred"]].to_csv(pred_path, index=False)
+                logger.info(
+                    f"Wrote {len(preds)} OOS rows across {len(windows)} windows "
+                    f"to {pred_path}")
+            else:
                 logger.warning(
-                    f"No models trained for {position} — skipping")
-                continue
-
-            # Pick best model by test R2 (skip error entries)
-            valid = {
-                n: r for n, r in results.items()
-                if "error" not in r and not np.isnan(r.get("test_r2", float("nan")))
-            }
-            if not valid:
-                logger.warning(
-                    f"All models failed for {position} — skipping")
-                continue
-
-            best_name = max(valid, key=lambda n: valid[n]["test_r2"])
-            best = valid[best_name]
-            logger.info(
-                f"Best model for {position}: {best_name} "
-                f"(test_r2={best['test_r2']:.4f})")
-
-            key = f"{self.base_tf}_{position}"
-            pos_dir = weights_root / key
-            pos_dir.mkdir(parents=True, exist_ok=True)
-
-            low = best_name.lower()
-            joblib.dump(best["model"],  pos_dir / f"{low}_model.pkl")
-            joblib.dump(best["scaler"], pos_dir / f"{low}_scaler.pkl")
-            joblib.dump(
-                {"feature_columns": active_feature_cols, "model_name": best_name},
-                pos_dir / f"{low}_meta.pkl",
-            )
-            logger.info(f"Saved {best_name} artifacts to {pos_dir}")
-
-        # Generate full predictions for all rows using the best trained models
-        self._write_pooled_predictions(out_dir, period, vf, feature_cols)
-
-    def _write_pooled_predictions(
-        self,
-        out_dir: str,
-        period: str,
-        vf: "pd.DataFrame",
-        feature_cols: list,
-    ) -> None:
-        """Run forward pass on all rows; write predictions_long/short.csv."""
-        weights_root = Path(out_dir) / "weights" / period
-
-        for position in ["long", "short"]:
-            key = f"{self.base_tf}_{position}"
-            pos_dir = weights_root / key
-            if not pos_dir.exists():
-                logger.warning(
-                    f"No weights for {key} — skipping prediction export")
-                continue
-
-            # Find the pkl files
-            model_files = list(pos_dir.glob("*_model.pkl"))
-            if not model_files:
-                logger.warning(f"No model .pkl files found in {pos_dir}")
-                continue
-            model_path = model_files[0]
-            low = model_path.stem.replace("_model", "")
-            scaler_path = pos_dir / f"{low}_scaler.pkl"
-            meta_path   = pos_dir / f"{low}_meta.pkl"
-
-            model  = joblib.load(model_path)
-            scaler = joblib.load(scaler_path)
-            meta   = joblib.load(meta_path)
-            f_cols = meta["feature_columns"]
-
-            df = vf.copy()
-            X = df[f_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            X_scaled = scaler.transform(X)
-            df["y_pred"] = model.predict(X_scaled)
-
-            out_cols = ["timestamp", "symbol", "y_pred"]
-            pred_path = Path(out_dir) / f"predictions_{position}.csv"
-            df[out_cols].to_csv(pred_path, index=False)
-            logger.info(
-                f"Wrote {len(df)} rows to {pred_path}")
+                    f"{position}: no OOS predictions produced (all windows skipped)")
