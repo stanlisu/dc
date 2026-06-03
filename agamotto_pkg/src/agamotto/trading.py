@@ -19,6 +19,47 @@ logger = logging.getLogger(__name__)
 # Don't add handlers here - let it propagate to root logger
 # This ensures it uses the same handler configuration as the main process
 
+
+def dual_gate_filter(sym_preds: "pd.DataFrame"):
+    """Split one symbol's regime predictions into firing longs and shorts,
+    applying the dual-horizon agreement gate.
+
+    A row fires only when the 1-bar prediction clears ``opt_threshold`` in its
+    direction AND — when the regime stack carries a 2-bar threshold for that row
+    (``opt_threshold_2bar`` present and non-null with a ``prediction_2bar``) —
+    the 2-bar prediction clears ``opt_threshold_2bar`` in the SAME direction
+    (long: both above their thresholds; short: both below). Rows lacking a 2-bar
+    threshold fall back to 1-bar-only (preserves non-DH behavior). Symmetric for
+    long and short.
+
+    Returns (longs_df, shorts_df).
+    """
+    has_dual = (
+        "opt_threshold_2bar" in sym_preds.columns
+        and "prediction_2bar" in sym_preds.columns
+    )
+
+    long_base = (
+        (sym_preds["position"] == "long") &
+        (sym_preds["prediction"] > sym_preds["opt_threshold"])
+    )
+    short_base = (
+        (sym_preds["position"] == "short") &
+        (sym_preds["prediction"] < sym_preds["opt_threshold"])
+    )
+
+    if has_dual:
+        has_2bar = sym_preds["opt_threshold_2bar"].notna()
+        long_dual_ok = ~has_2bar | (sym_preds["prediction_2bar"] > sym_preds["opt_threshold_2bar"])
+        short_dual_ok = ~has_2bar | (sym_preds["prediction_2bar"] < sym_preds["opt_threshold_2bar"])
+        longs = sym_preds[long_base & long_dual_ok]
+        shorts = sym_preds[short_base & short_dual_ok]
+    else:
+        longs = sym_preds[long_base]
+        shorts = sym_preds[short_base]
+
+    return longs, shorts
+
 # Use relative import for internal module
 try:
     from .lib_binance import fetch_futures_klines, klines_to_dataframe
@@ -711,23 +752,9 @@ class AgamottoTrading(AgamottoResearch):
             if sym_preds.empty:
                 continue
 
-            # Check Longs
-            longs = sym_preds[
-                (sym_preds["position"] == "long") &
-                (sym_preds["prediction"] > sym_preds["opt_threshold"])
-            ]
-
-            # Check Shorts: base condition + optional dual-bar AND
-            short_base = (
-                (sym_preds["position"] == "short") &
-                (sym_preds["prediction"] < sym_preds["opt_threshold"])
-            )
-            if "opt_threshold_2bar" in sym_preds.columns and "prediction_2bar" in sym_preds.columns:
-                has_2bar = sym_preds["opt_threshold_2bar"].notna()
-                dual_ok = ~has_2bar | (sym_preds["prediction_2bar"] < sym_preds["opt_threshold_2bar"])
-                shorts = sym_preds[short_base & dual_ok]
-            else:
-                shorts = sym_preds[short_base]
+            # Dual-horizon agreement gate (symmetric long+short). See
+            # dual_gate_filter() for the rule.
+            longs, shorts = dual_gate_filter(sym_preds)
 
             long_count = len(longs)
             short_count = len(shorts)

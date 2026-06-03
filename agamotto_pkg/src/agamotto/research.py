@@ -234,6 +234,11 @@ class AgamottoResearch:
         # default — only safe by coincidence here, banned per CLAUDE.md.
         fee_rate = float(self.config["FEE"]) / 10000.0
         step_size = 0.0001
+        # Dual-horizon: when enabled, also emit a 2-bar-horizon target set
+        # (ret_2bar + laddered/fee return_{long,short}_2bar) so a second model
+        # can be trained as a same-direction confirmation gate. Off by default —
+        # only DH experiments set DUAL_HORIZON, so base experiments are unaffected.
+        dual_horizon = bool(self.config.get("DUAL_HORIZON"))
 
         for col in df.columns:
             if col.endswith("_close"):
@@ -295,6 +300,35 @@ class AgamottoResearch:
                 # Raw returns (no fee) for downstream Sharpe calculation
                 price_return_long_raw = (price_return * total_long_layers).rename(f"{base}_return_long_raw")
                 price_return_short_raw = (price_return * total_short_layers).rename(f"{base}_return_short_raw")
+
+                # Dual-horizon 2-bar target set — mirror of the 1-bar block above
+                # over a 2-bar forward hold. ret_2bar is the plain cumulative
+                # return the 2-bar confirmation model trains on (analogous to the
+                # 1-bar `ret`); return_{long,short}_2bar are the laddered+fee
+                # PnL analogs (analogous to return_long/return_short). Ladder fill
+                # uses the worst price over the next two bars (min low / max high).
+                if dual_horizon:
+                    price_return_2bar = (close.shift(-2) / close_safe - 1)
+                    low_min2 = pd.concat(
+                        [low_series.shift(-1), low_series.shift(-2)], axis=1).min(axis=1)
+                    high_max2 = pd.concat(
+                        [high_series.shift(-1), high_series.shift(-2)], axis=1).max(axis=1)
+
+                    distance_long2 = ((close_safe - low_min2) / close_safe).replace([np.inf, -np.inf], np.nan)
+                    long_layers2 = np.floor(distance_long2 / step_size)
+                    long_layers2 = long_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
+                    total_long_layers2 = 1 + long_layers2
+
+                    distance_short2 = ((high_max2 - close_safe) / close_safe).replace([np.inf, -np.inf], np.nan)
+                    short_layers2 = np.floor(distance_short2 / step_size)
+                    short_layers2 = short_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
+                    total_short_layers2 = 1 + short_layers2
+
+                    ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
+                    return_long_2bar = ((price_return_2bar - fee_cost) * total_long_layers2).rename(f"{base}_return_long_2bar")
+                    return_short_2bar = ((price_return_2bar + fee_cost) * total_short_layers2).rename(f"{base}_return_short_2bar")
+                    return_long_2bar_raw = (price_return_2bar * total_long_layers2).rename(f"{base}_return_long_2bar_raw")
+                    return_short_2bar_raw = (price_return_2bar * total_short_layers2).rename(f"{base}_return_short_2bar_raw")
 
                 # Dip/rip target columns for compound classification label (Vomir)
                 # return_dip = low[T+1]/close[T] - 1  (how far price dips next bar)
@@ -454,6 +488,15 @@ class AgamottoResearch:
                     ma2.rename(f"{base}_mvg2"),
                     ma3.rename(f"{base}_mvg3"),
                 ] + volume_features + ta_features + rolling_stats)
+
+                if dual_horizon:
+                    engineered_frames.extend([
+                        ret_2bar,
+                        return_long_2bar,
+                        return_short_2bar,
+                        return_long_2bar_raw,
+                        return_short_2bar_raw,
+                    ])
 
         feature_df = pd.concat(engineered_frames, axis=1)
 
@@ -642,6 +685,13 @@ class AgamottoResearch:
                 rename_map[short_return_raw_col] = "return_short_raw"
             if base_return_col in df.columns:
                 rename_map[base_return_col] = "return"
+
+            # Dual-horizon 2-bar target columns (present only for DH experiments)
+            for suffix in ("ret_2bar", "return_long_2bar", "return_short_2bar",
+                           "return_long_2bar_raw", "return_short_2bar_raw"):
+                col2 = f"{prefix}_{suffix}"
+                if col2 in df.columns:
+                    rename_map[col2] = suffix
 
             valid_cols = [c for c in rename_map if c in df.columns]
 
