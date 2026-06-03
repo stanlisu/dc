@@ -22,6 +22,8 @@ import pytest
 from unittest.mock import MagicMock, patch, call
 
 from agamotto.trading import AgamottoTrading
+# `symbiote` lives in the marvel repo, not dc — skip when unavailable (dc CI).
+pytest.importorskip("symbiote")
 from symbiote.kline_buffer import KlineBuffer
 
 
