@@ -1385,9 +1385,11 @@ class MjolnirResearch:
 
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
         return_long = ((price_return - fee_cost) * total_long_layers).rename("return_long")
-        return_short = ((price_return + fee_cost) * total_short_layers).rename("return_short")
+        # Short profits when price falls: negate price_return (and fee, which is paid either side).
+        # Matches features.py:449 `"return_short": -(forward_return + fee)`.
+        return_short = ((-(price_return + fee_cost)) * total_short_layers).rename("return_short")
         return_long_raw = (price_return * total_long_layers).rename("return_long_raw")
-        return_short_raw = (price_return * total_short_layers).rename("return_short_raw")
+        return_short_raw = ((-price_return) * total_short_layers).rename("return_short_raw")
 
         return pd.concat(
             [return_long, return_short, return_long_raw, return_short_raw], axis=1)
