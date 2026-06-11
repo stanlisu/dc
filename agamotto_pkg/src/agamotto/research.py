@@ -1007,7 +1007,17 @@ class AgamottoResearch:
             
             save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
             try:
-                filtered_subset.to_parquet(save_path, index=False)
+                # Narrow float64 feature columns to float32 (the rolling trainer
+                # casts to float32 on load anyway) + zstd — roughly halves the
+                # filter parquet with zero training impact. Only float64 columns
+                # are cast, so integer/timestamp columns keep full precision.
+                _f64_to_f32 = {
+                    c: "float32" for c in filtered_subset.columns
+                    if filtered_subset[c].dtype == "float64"
+                }
+                filtered_subset.astype(_f64_to_f32).to_parquet(
+                    save_path, index=False, compression="zstd",
+                )
                 # logger.info(f"Saved filtered signals for {regime_id} to {save_path}")
             except Exception as e:
                 logger.error(f"Failed to save filtered signals for {safe_name}: {e}")
