@@ -98,6 +98,35 @@ def _widen_ints_to_float(table: "pa.Table") -> "pa.Table":
     return table.cast(target, safe=False)
 
 
+def _narrow_floats_to_float32(table: "pa.Table") -> "pa.Table":
+    """Narrow every float64 column to float32 before writing filter parquets.
+
+    The rolling trainer (`_read_pq` in rolling_predict_returns.py) already casts
+    every float64 feature column to float32 on load, so float64 on disk is pure
+    wasted storage (~2x on the feature matrix, which is ~90% of the columns).
+    Narrowing at write halves the filter parquet with ZERO effect on training —
+    the trainer sees float32 either way.
+
+    Applied BEFORE `_widen_ints_to_float`, so genuine integer columns (later
+    promoted to float64 only for streaming-schema consistency) keep full
+    precision and are never narrowed — only true float64 features are cast.
+    Cross-symbol dtype drift is reconciled downstream by the writer's
+    `table.cast(state["schema"])` step, same as for int widening.
+    """
+    new_fields = []
+    needs_cast = False
+    for f in table.schema:
+        if f.type == pa.float64():
+            new_fields.append(pa.field(f.name, pa.float32()))
+            needs_cast = True
+        else:
+            new_fields.append(f)
+    if not needs_cast:
+        return table
+    target = pa.schema(new_fields)
+    return table.cast(target, safe=False)
+
+
 class MjolnirResearch:
     """Research pipeline for Mjolnir tick-data ML.
 
@@ -874,6 +903,10 @@ class MjolnirResearch:
 
             table = pa.Table.from_pandas(chunk, preserve_index=False)
             del chunk
+            # Narrow genuine float64 feature columns to float32 (the trainer
+            # casts to float32 on load anyway) — halves the filter parquet.
+            # Done BEFORE widening ints so integer columns keep full precision.
+            table = _narrow_floats_to_float32(table)
             # Pre-promote: widen any integer columns to float64 BEFORE opening
             # the writer. Reason: pandas may infer int64 on the first symbol
             # (no NaNs in that slice) but float64 on a later symbol (where
@@ -897,7 +930,7 @@ class MjolnirResearch:
                 # ParquetWriter starts fresh.
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-                writer = pq.ParquetWriter(tmp_path, table.schema, compression="snappy")
+                writer = pq.ParquetWriter(tmp_path, table.schema, compression="zstd")
                 state = {
                     "writer": writer,
                     "schema": table.schema,
