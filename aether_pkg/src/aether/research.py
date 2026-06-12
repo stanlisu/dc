@@ -87,6 +87,7 @@ class AetherResearch(OrbResearch):
             train_models as _train_models,
             build_windows,
             split_by_month,
+            _compute_train_window_top_n_ic,
         )
 
         vf = getattr(self, "vertical_features", None)
@@ -105,6 +106,17 @@ class AetherResearch(OrbResearch):
                     "rolling windows (expected from verticalize()).")
 
         feature_cols = select_feature_columns(vf.columns.tolist())
+        # Optional IC-ranked feature cap (mjolnir-style, mirrors
+        # rolling_predict_returns.py --top-n-ic). When TOP_N_IC is set (int),
+        # keep only the top-N features by |Spearman IC| vs the position's target,
+        # computed per-window on the TRAIN slice only (no leakage). When absent /
+        # None → use ALL features (existing back-compat behavior; explicit None
+        # check, not a silent fallback).
+        top_n_ic = self.config.get("TOP_N_IC")
+        if top_n_ic is not None:
+            top_n_ic = int(top_n_ic)
+            if top_n_ic <= 0:
+                raise ValueError(f"TOP_N_IC must be > 0, got {top_n_ic}")
         sweep_models = self.config.get(
             "SWEEP_MODELS", ["LightGBM", "XGBoost", "Ridge", "HistGBR"])
         # Window length is required and explicit — no silent fallback. train =
@@ -158,6 +170,13 @@ class AetherResearch(OrbResearch):
                     c for c in feature_cols
                     if not train_df[c].replace([np.inf, -np.inf], np.nan).isna().all()
                 ]
+
+                # IC cap: rank surviving features by |IC| on THIS window's train
+                # slice and keep the top-N (per-window, leakage-free — same
+                # convention as rolling_predict_returns.py).
+                if top_n_ic is not None and len(active_feature_cols) > top_n_ic:
+                    active_feature_cols = _compute_train_window_top_n_ic(
+                        train_df, active_feature_cols, target_col, top_n_ic)
 
                 results = _train_models(
                     train_df=train_df,
