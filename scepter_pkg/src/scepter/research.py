@@ -156,7 +156,12 @@ class ScepterResearch(OrbResearch):
                 logger.warning(f"Anchor return column {anchor_ret_col} not in features — skipping per-altcoin features")
                 continue
 
-            anchor_ret = self.features[anchor_ret_col]
+            # `{tf}_{sym}_return` is the FORWARD return (price_return = hist_return.shift(-1)),
+            # i.e. the prediction target. Using it in rolling corr / rel_strength leaks the
+            # future (the 2026-06-13 scepter leak: corr(rel_strength, y_true)=0.24, Sharpe→11).
+            # .shift(1) recovers the historical return (== hist_return) so these anchor
+            # features are causal — only data through bar T. (Spread uses close, already causal.)
+            anchor_ret = self.features[anchor_ret_col].shift(1)
             anchor_close = self.features[anchor_close_col] if anchor_close_col in self.features.columns else None
 
             for altcoin_sym in self._altcoin_symbols:
@@ -171,7 +176,7 @@ class ScepterResearch(OrbResearch):
                 if alt_ret_col not in self.features.columns:
                     continue
 
-                alt_ret = self.features[alt_ret_col]
+                alt_ret = self.features[alt_ret_col].shift(1)   # forward->historical (causal), see above
                 alt_close = self.features[alt_close_col] if alt_close_col in self.features.columns else None
 
                 # Rolling correlation for each window
