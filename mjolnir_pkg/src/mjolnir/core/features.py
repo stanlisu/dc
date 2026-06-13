@@ -15,7 +15,7 @@ DEFAULT_WINDOWS: List[int] = [30, 60, 300, 900]
 # TA-Lib MA periods (mirrors Agamotto default)
 MA_PERIODS = [7, 25, 99]
 # Bar-TF → seconds mapping (used for boundary-aligned target computation)
-_TF_SECONDS: dict = {"5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300}
+_TF_SECONDS: dict = {"5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900}
 
 
 class MjolnirFeatures:
