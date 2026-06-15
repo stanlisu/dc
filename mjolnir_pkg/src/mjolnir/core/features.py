@@ -56,6 +56,52 @@ class MjolnirFeatures:
         "year", "month",
     })
 
+    # Point-in-time book / snapshot / derivative feature columns that carry
+    # bar-CLOSE microstructure state but are stamped at the bar-OPEN timestamp
+    # (the aligner takes the LAST tick in each bar, or ffills the derivative
+    # ticker, then stamps the result at the bar-open index — see
+    # aligner.py _last_value / _last_value_snapshot / _ffill_derivative and
+    # _make_bar_index/floor). The forward-return target window ALSO opens at the
+    # bar-open timestamp, so a value that reflects the END of bar T leaks the
+    # first part of bar T's target window → look-ahead. These columns are shifted
+    # forward by exactly one base bar in compute() so the value at row T is the
+    # state known at/before T (the prior bar's close), mirroring the cross-TF
+    # +tf_seconds shift in multi_tf_merge.py.
+    #
+    # NOTE: this set is purely point-in-time book/snapshot/derivative state and
+    # its direct contemporaneous derivatives (incl. OFI, a depth difference).
+    # It intentionally EXCLUDES already-causal columns (pct_change/diff/rolling-
+    # of-history such as oi_velocity, oi_acceleration, basis_pct's source is OK
+    # to shift as point-in-time, ret_lagN, *_roll*), trade/OHLCV bar aggregates,
+    # and all target/meta columns.
+    _POINT_IN_TIME_PREFIXES: tuple = (
+        "bids_", "asks_",        # raw snapshot levels (price/qty)
+        "depth_bid_L", "depth_ask_L", "depth_imbalance_L",  # depth + imbalance
+        "ofi_L", "ofi_agg",      # order-flow imbalance (depth diff)
+    )
+    _POINT_IN_TIME_EXACT: frozenset = frozenset({
+        # book_ticker last-in-bar raw columns
+        "bid_price", "bid_amount", "ask_price", "ask_amount",
+        # contemporaneous book derivatives
+        "spread", "mid_price", "relative_spread", "microprice", "microprice_vs_mid",
+        # derivative_ticker ffilled raw state
+        "mark_price", "index_price", "open_interest",
+        "funding_rate", "next_funding_time", "predicted_funding_rate",
+        "basis_pct",
+        # OI velocity/acceleration are pct_change/diff of the point-in-time OI;
+        # their value at T still references OI's bar-CLOSE state at T, so one
+        # +1 shift makes them causal (OI[T-1]/OI[T-2]-1 attached to row T).
+        "oi_velocity", "oi_acceleration",
+    })
+
+    def _point_in_time_columns(self, df: pd.DataFrame) -> List[str]:
+        """Columns whose value at row T reflects bar T's CLOSE and must shift +1."""
+        cols: List[str] = []
+        for c in df.columns:
+            if c in self._POINT_IN_TIME_EXACT or c.startswith(self._POINT_IN_TIME_PREFIXES):
+                cols.append(c)
+        return cols
+
     def __init__(
         self,
         feature_windows: Optional[List[int]] = None,
@@ -95,11 +141,35 @@ class MjolnirFeatures:
         df = self._compute_book_features(df)
         df = self._compute_ofi(df)
         df = self._compute_derivative_features(df)
+
+        # WHY: base-TF point-in-time book/snapshot/derivative features carry the
+        # bar-CLOSE state (last tick in bar, or ffilled derivative) but are
+        # stamped at the bar-OPEN timestamp, where the forward-return target
+        # window also opens. So the contemporaneous value at row T "sees" the
+        # first part of bar T's target window → look-ahead leakage (empirically:
+        # corr(depth_imbalance_L1, target) peaks when the feature is pushed ~15s
+        # into the FUTURE). The cross-TF merge already corrects the analogous
+        # higher-TF case (multi_tf_merge.py shifts the higher-TF index forward by
+        # tf_seconds); apply the SAME correction to base-TF point-in-time columns
+        # by shifting them forward exactly ONE base bar so row T holds bar T-1's
+        # CLOSED state — known at/before T, the instant the target window opens.
+        # Done BEFORE rolling stats (so their rolling windows inherit causal
+        # timing) and BEFORE targets (computed from the UNSHIFTED mid below) so
+        # the target itself is never shifted. Trade/OHLC bar aggregates and
+        # already-causal columns (pct_change/diff/rolling-of-history) are NOT
+        # shifted; see _point_in_time_columns / _POINT_IN_TIME_* for the set.
+        target_mid = df.get("mid_price", df.get("close"))
+        if target_mid is not None:
+            target_mid = target_mid.copy()
+        pit_cols = self._point_in_time_columns(df)
+        if pit_cols:
+            df[pit_cols] = df[pit_cols].shift(1)
+
         df = self._compute_liquidation_features(df)
         df = self._compute_trade_flow_features(df)
         df = self._compute_price_features(df)
         df = self._compute_rolling_features(df)
-        df = self._compute_targets(df)
+        df = self._compute_targets(df, target_mid=target_mid)
         # Defragment after many column assignments before final columns
         df = df.copy()
         df = self._compute_temporal(df)
@@ -421,7 +491,9 @@ class MjolnirFeatures:
     # Target returns
     # ------------------------------------------------------------------
 
-    def _compute_targets(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_targets(
+        self, df: pd.DataFrame, target_mid: Optional[pd.Series] = None
+    ) -> pd.DataFrame:
         """Compute forward mid-price returns.
 
         When target_tf == bar_tf (same resolution), uses a fixed horizon shift
@@ -431,8 +503,13 @@ class MjolnirFeatures:
         1m close), computes variable-horizon returns to the next target_tf
         boundary.  At 05:00:05 with target_tf=1m, the target is the close at
         05:01:00; at 05:00:55 it is still the 05:01:00 close.
+
+        ``target_mid`` MUST be the UNSHIFTED contemporaneous mid (captured in
+        compute() before the point-in-time feature shift). The shifted
+        ``mid_price`` column in ``df`` is a FEATURE and must never define the
+        forward-return target, or the shift would bleed into the label.
         """
-        mid = df.get("mid_price", df.get("close"))
+        mid = target_mid if target_mid is not None else df.get("mid_price", df.get("close"))
         if mid is None:
             return df
 
