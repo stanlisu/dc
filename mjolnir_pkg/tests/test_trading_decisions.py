@@ -7,6 +7,7 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 
 from mjolnir.trading import MjolnirTrading, PredictDiag
+from mjolnir.core.research import MjolnirResearch
 
 
 def _base_config(**overrides):
@@ -89,13 +90,15 @@ def _setup_predict(inst, symbol, regime_entries, model_predictions,
             inst._scalers[model_key] = scaler
             inst._metas[model_key] = {"feature_columns": feat_cols}
 
+    # Real _apply_filter_mask returns a per-row mask aligned to the input
+    # index; mocks must mirror that (predict() reads mask.iloc[-2]).
     if mask_map is None:
         inst._research._apply_filter_mask = MagicMock(
-            return_value=pd.Series([True]))
+            side_effect=lambda df, *a, **k: pd.Series(True, index=df.index))
     else:
         def _mask_fn(df, regime_name, position):
             key = f"{regime_name}_{position}"
-            return pd.Series([mask_map.get(key, True)])
+            return pd.Series(mask_map.get(key, True), index=df.index)
         inst._research._apply_filter_mask = MagicMock(
             side_effect=_mask_fn)
 
@@ -326,6 +329,71 @@ def test_regime_filter_excludes():
 
 
 # -------------------------------------------------------------------
+# Quantile-based regime filter — window vs single-row (2026-06-15 bug)
+# -------------------------------------------------------------------
+
+
+def test_quantile_regime_filter_uses_window_not_single_row():
+    """Quantile-based regime filters (wide_spread, tight_spread,
+    high/low_liquidation_pressure) must be evaluated over the feature WINDOW,
+    not a single row.
+
+    Regression for the 2026-06-15 all-short bug: live ``predict()`` passed
+    ``feats.iloc[[-2]]`` (one row) to ``_apply_filter_mask``. ``wide_spread`` is
+    ``relative_spread > relative_spread.quantile(0.5)`` — on one row,
+    ``quantile(0.5) == that value`` so ``x > x`` is ALWAYS False, permanently
+    disabling every quantile regime live (the backtest passes the full panel,
+    so it worked there). With the only-long entry being ``wide_spread_long``,
+    this pinned ``long_count`` at 0 and forced an all-short book.
+
+    Here the -2 (last complete) bar's relative_spread is ABOVE the window
+    median, so a correct window evaluation activates wide_spread_long → 'long'.
+    Uses the REAL filter (not a mock) — the bug only shows with real quantiles.
+    """
+    inst = _make_mj()
+    sym = "BINANCE_PERP_BTC_USDT"
+    # Real filter logic: _apply_filter_mask/_named_filter use self only for
+    # recursion, so a bare instance (no __init__) is sufficient.
+    inst._research = MjolnirResearch.__new__(MjolnirResearch)
+
+    _fill_buffer(inst, sym, 200)
+    base_ts = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
+    idx = pd.DatetimeIndex(
+        [base_ts + pd.Timedelta(seconds=5 * i) for i in range(200)])
+    # relative_spread spans 0..1 across the window; the -2 row sits near the top
+    # (above the window median ~0.5) but EQUAL to itself on a single row.
+    rs = np.linspace(0.0, 1.0, 200)
+    rs[-2] = 0.99
+    feats = pd.DataFrame(
+        {"feat_a": np.zeros(200), "relative_spread": rs}, index=idx)
+    inst._feat_engine = MagicMock()
+    inst._feat_engine.compute.return_value = feats
+    inst._feat_engine.add_btc_cross_features = MagicMock(
+        side_effect=lambda f, _: f)
+
+    entry = {"regime": "wide_spread_long", "position": "long",
+             "model": "LightGBM", "threshold": 0.001}
+    inst._regime_stack = [entry]
+    mkey = "wide_spread_long_long_lightgbm"
+    model = MagicMock()
+    model.predict.return_value = np.array([0.01])   # bullish > threshold
+    scaler = MagicMock()
+    scaler.transform.side_effect = lambda X: X
+    inst._models[mkey] = model
+    inst._scalers[mkey] = scaler
+    inst._metas[mkey] = {"feature_columns": ["feat_a", "relative_spread"]}
+
+    result = inst.predict(sym)
+    # Single-row (buggy): wide_spread always False → regime skipped → None.
+    # Window (fixed): -2 row above window median → active → long fires.
+    assert result is not None, (
+        "wide_spread regime never activated — quantile evaluated on a single "
+        "row is always False (the 2026-06-15 all-short bug)")
+    assert result.side == "long"
+    assert result.regime == "wide_spread_long"
+
+
+# -------------------------------------------------------------------
 # Model key missing
 # -------------------------------------------------------------------
 
@@ -349,7 +417,7 @@ def test_model_key_missing_skipped():
         side_effect=lambda f, _: f)
     inst._regime_stack = [entry]
     inst._research._apply_filter_mask = MagicMock(
-        return_value=pd.Series([True]))
+        side_effect=lambda df, *a, **k: pd.Series(True, index=df.index))
     result = inst.predict(sym)
     assert result is None
 
@@ -389,7 +457,7 @@ def test_nan_inf_features_cleaned():
     inst._scalers["r1_long_lightgbm"] = scaler
     inst._metas["r1_long_lightgbm"] = {"feature_columns": ["feat_a", "feat_b"]}
     inst._research._apply_filter_mask = MagicMock(
-        return_value=pd.Series([True]))
+        side_effect=lambda df, *a, **k: pd.Series(True, index=df.index))
 
     result = inst.predict(sym)
     assert result is not None

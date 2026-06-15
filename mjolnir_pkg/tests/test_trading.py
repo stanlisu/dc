@@ -181,7 +181,7 @@ def _setup_predict(mj, symbol, regime_entries, model_predictions):
         mj._metas[model_key] = {"feature_columns": feat_cols}
 
     mj._research._apply_filter_mask = MagicMock(
-        return_value=pd.Series([True]))
+        side_effect=lambda df, *a, **k: pd.Series(True, index=df.index))
 
 
 def test_predict_long_signal(mj):

@@ -237,14 +237,24 @@ class MjolnirTrading:
             model_name = entry.get("model", "LightGBM").lower()
             threshold = float(entry.get("threshold", 0.001))
 
-            # Check regime condition using one-row DataFrame.
+            # Check regime condition over the FULL feature window, then read the
+            # last-complete-bar row (-2) — NOT on a one-row DataFrame.
+            # Quantile-based filters (wide_spread, tight_spread,
+            # high/low_liquidation_pressure) are panel-relative, e.g.
+            # `relative_spread > relative_spread.quantile(0.5)`. Evaluated on a
+            # single row, quantile(0.5) == that value, so `x > x` is ALWAYS
+            # False and the regime never activates live — silently disabling
+            # every quantile regime (the 2026-06-15 all-short bug: the only-long
+            # entry was wide_spread_long, so long_count was pinned at 0). The
+            # backtest passes the full panel (research.py:546/884), so it worked
+            # there. Passing the window restores that panel-relative semantics;
+            # we select iloc[-2] to mirror `row` above.
             # Instrumentation: log first occurrence of each (regime, position,
             # exception_class) so offline-replay "None for every bar" failures
-            # surface their root cause without flooding logs. continue behavior
-            # is unchanged — this is a diagnostic step, not a fix.
+            # surface their root cause without flooding logs.
             try:
-                mask = self._research._apply_filter_mask(feats.iloc[[-2]], regime_name, position)
-                if not mask.any():
+                mask = self._research._apply_filter_mask(feats, regime_name, position)
+                if not bool(mask.iloc[-2]):
                     continue
             except Exception as exc:
                 key = (regime_name, position, type(exc).__name__)

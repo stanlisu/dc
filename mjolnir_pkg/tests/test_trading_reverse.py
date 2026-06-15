@@ -87,7 +87,7 @@ def _setup_predict(inst, symbol, regime_entries, model_predictions,
             inst._metas[model_key] = {"feature_columns": feat_cols}
 
     inst._research._apply_filter_mask = MagicMock(
-        return_value=pd.Series([True]))
+        side_effect=lambda df, *a, **k: pd.Series(True, index=df.index))
 
 
 # -------------------------------------------------------------------
