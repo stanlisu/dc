@@ -65,7 +65,7 @@ _META_COLS = {
 # Default regime stack — SHORT options only
 # positive_skew: puts overpriced → sell put; negative_skew: calls overpriced → sell call
 _DEFAULT_REGIME_STACK: List[Dict] = [
-    {"regime": "baseline", "position": "short_straddle"},
+    # baseline (unconditional) removed 2026-06-18 — no-brainer, banned (CLAUDE.md)
     {"regime": "high_iv_rank", "position": "short_straddle"},
     {"regime": "low_iv_rank", "position": "short_straddle"},
     {"regime": "backwardation", "position": "short_straddle"},
@@ -379,7 +379,9 @@ class ValkyrieResearch:
             raise RuntimeError("Call verticalize() before filter_signals().")
 
         df = self.vertical_features.copy()
-        regime_name = regime.get("regime", "baseline")
+        if "regime" not in regime:
+            raise KeyError("regime row missing required 'regime' key (no baseline default)")
+        regime_name = regime["regime"]
         position = regime.get("position", "short")
 
         mask = self._apply_regime_mask(df, regime_name)
@@ -478,7 +480,9 @@ class ValkyrieResearch:
         name = str(regime_name).lower().strip()
 
         if name == "baseline":
-            return true
+            raise ValueError(
+                "baseline regime removed 2026-06-18 — unconditional fires-every-bar "
+                "no-brainer; drop it from the regime stack. See CLAUDE.md.")
 
         if name == "high_iv_rank":
             col = "iv_rank"

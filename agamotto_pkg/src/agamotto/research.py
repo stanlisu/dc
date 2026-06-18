@@ -785,7 +785,7 @@ class AgamottoResearch:
         down_trend = (df["close"] < df["mvg1"]) & (df["mvg1"] < df["mvg2"])
         
         if position == "long":
-            if filter_name == "baseline" or filter_name == "trend_aligned":
+            if filter_name == "trend_aligned":  # baseline removed 2026-06-18 (no-brainer; falls through to strict raise)
                 return up_trend
             if filter_name == "strong_trend":
                 return up_trend & (df["mvg2"] > df["mvg3"]) if "mvg3" in df.columns else up_trend
@@ -842,7 +842,7 @@ class AgamottoResearch:
             if filter_name == "roc_positive":
                 return df["roc"] > 0 if "roc" in df.columns else pd.Series(True, index=df.index)
         else:  # short
-            if filter_name == "baseline" or filter_name == "trend_aligned":
+            if filter_name == "trend_aligned":  # baseline removed 2026-06-18 (no-brainer; falls through to strict raise)
                 return down_trend
             if filter_name == "strong_trend":
                 return down_trend & (df["mvg2"] < df["mvg3"]) if "mvg3" in df.columns else down_trend
@@ -956,7 +956,9 @@ class AgamottoResearch:
 
         features_df = self.vertical_features
 
-        regime_name = regime.get("regime", "baseline")
+        if "regime" not in regime:
+            raise KeyError("regime row missing required 'regime' key (no baseline default)")
+        regime_name = regime["regime"]
         position = regime.get("position", "long")
 
         # Convert list regime to string for storage (e.g. ["high_volume", "&", "cci_reversal"] -> "high_volume_and_cci_reversal")
