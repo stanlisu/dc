@@ -534,7 +534,9 @@ class MjolnirResearch:
         if limit_timestamp is not None:
             features_df = features_df[features_df["timestamp"] >= limit_timestamp]
 
-        regime_name = regime.get("regime", "baseline")
+        if "regime" not in regime:
+            raise KeyError("regime row missing required 'regime' key (no baseline default)")
+        regime_name = regime["regime"]
         position = regime.get("position", "long")
 
         regime_name_str = regime_name
@@ -872,7 +874,9 @@ class MjolnirResearch:
         symbols MUST have the same schema or we raise (no silent column drift).
         """
         for regime in regime_stack:
-            regime_name = regime.get("regime", "baseline")
+            if "regime" not in regime:
+                raise KeyError("regime row missing required 'regime' key (no baseline default)")
+            regime_name = regime["regime"]
             position = regime.get("position", "long")
 
             regime_name_str = regime_name
@@ -1129,7 +1133,9 @@ class MjolnirResearch:
         # ---- Microstructure filters (Mjolnir-specific) ----
 
         if name == "baseline":
-            return true
+            raise ValueError(
+                "baseline regime removed 2026-06-18 — it is an unconditional "
+                "fires-every-bar no-brainer; drop it from the regime stack. See CLAUDE.md.")
 
         if name == "high_liquidation_pressure":
             col = "liq_burst_ratio"
