@@ -292,3 +292,4 @@ def test_reverse_preserves_diagnostic_fields():
     assert result.y_pred_thresh == 0.001  # preserved
     assert result.regime == "r1"  # preserved
     assert result.model_name == "r1_long_lightgbm"  # preserved
+    assert result.n_triggered == 1  # preserved across the flip
