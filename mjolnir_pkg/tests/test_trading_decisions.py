@@ -500,6 +500,7 @@ def test_strongest_signal_diagnostics():
     assert result.y_pred_thresh == 0.002
     assert result.regime == "r2"
     assert result.model_name == "r2_long_lightgbm"
+    assert result.n_triggered == 2  # both r1 and r2 voted long
 
 
 def test_strongest_signal_diagnostics_short():
@@ -528,3 +529,41 @@ def test_strongest_signal_diagnostics_short():
     assert result.y_pred_thresh == -0.002
     assert result.regime == "r2"
     assert result.model_name == "r2_short_lightgbm"
+    assert result.n_triggered == 2  # both r1 and r2 voted short
+
+
+def test_n_triggered_reflects_winning_side_count():
+    """n_triggered = number of regimes that triggered the WINNING side.
+
+    Conviction-weighted sizing reads this in the bridge. A single regime
+    yields n_triggered=1; the losing side's votes are not counted.
+    """
+    # Single triggering regime -> n_triggered == 1
+    inst = _make_mj(config_overrides={"MIN_SIGNAL_COUNT": 1})
+    sym = "BINANCE_PERP_BTC_USDT"
+    entries = [{"regime": "r1", "position": "long",
+                "model": "LightGBM", "threshold": 0.001}]
+    _setup_predict(inst, sym, entries, {"r1_long_lightgbm": 0.01})
+    result = inst.predict(sym)
+    assert result is not None and result.side == "long"
+    assert result.n_triggered == 1
+
+    # 2 long + 1 short triggering -> long wins, n_triggered == 2 (winning side)
+    inst2 = _make_mj(config_overrides={"MIN_SIGNAL_COUNT": 1})
+    entries2 = [
+        {"regime": "r1", "position": "long",
+         "model": "LightGBM", "threshold": 0.001},
+        {"regime": "r2", "position": "long",
+         "model": "LightGBM", "threshold": 0.001},
+        {"regime": "r3", "position": "short",
+         "model": "LightGBM", "threshold": -0.001},
+    ]
+    preds2 = {
+        "r1_long_lightgbm": 0.01,
+        "r2_long_lightgbm": 0.02,
+        "r3_short_lightgbm": -0.01,
+    }
+    _setup_predict(inst2, sym, entries2, preds2)
+    result2 = inst2.predict(sym)
+    assert result2 is not None and result2.side == "long"
+    assert result2.n_triggered == 2  # only the 2 winning-side regimes

@@ -36,6 +36,7 @@ class PredictDiag:
     y_pred_thresh: float  # per-model threshold of the strongest-signal model
     regime: str          # regime name of the strongest-signal model
     model_name: str      # model key (e.g. "r1_long_lightgbm")
+    n_triggered: int = 1  # regimes that triggered the winning side (conviction)
 
 _BTC = "BINANCE_PERP_BTC_USDT"
 _BTC_NATIVE = normalize_symbol(_BTC)
@@ -351,6 +352,7 @@ class MjolnirTrading:
                 side="long", threshold=best_long_thresh,
                 y_pred=pred_val, y_pred_thresh=pred_thresh,
                 regime=regime, model_name=mkey,
+                n_triggered=long_count,
             )
         elif short_count >= min_count and short_count > long_count:
             if best_short_thresh is None:
@@ -368,6 +370,7 @@ class MjolnirTrading:
                 side="short", threshold=best_short_thresh,
                 y_pred=pred_val, y_pred_thresh=pred_thresh,
                 regime=regime, model_name=mkey,
+                n_triggered=short_count,
             )
 
         # Apply REVERSE: -1 flips long→short and short→long
@@ -378,6 +381,7 @@ class MjolnirTrading:
                 threshold=result.threshold,
                 y_pred=result.y_pred, y_pred_thresh=result.y_pred_thresh,
                 regime=result.regime, model_name=result.model_name,
+                n_triggered=result.n_triggered,
             )
 
         # Note: IPC send moved to MjolnirBridge._inference_loop after Phase 6
