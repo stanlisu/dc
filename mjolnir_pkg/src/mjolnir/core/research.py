@@ -1404,25 +1404,37 @@ class MjolnirResearch:
             .iloc[::-1]
         )
 
+        # Per-1bps fill layers from each side's forward excursion, capped at
+        # LADDER. low_layers = how far price DUG DOWN below cost (long entries /
+        # short exits); high_layers = how far it RALLIED UP above cost (short
+        # entries / long exits).
+        # 2026-06-20 refinement #1: use n layers, NOT 1 + n — no free base rung,
+        # so an excursion of < 1bps fills nothing.
         distance_long = ((close_safe - low_window) / close_safe).replace(
             [np.inf, -np.inf], np.nan)
-        long_layers = np.floor(distance_long / step_size).clip(
+        low_layers = np.floor(distance_long / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
-        total_long_layers = 1 + long_layers
 
         distance_short = ((high_window - close_safe) / close_safe).replace(
             [np.inf, -np.inf], np.nan)
-        short_layers = np.floor(distance_short / step_size).clip(
+        high_layers = np.floor(distance_short / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
-        total_short_layers = 1 + short_layers
+
+        # 2026-06-20 refinement #2 (Variant A — round-trip gate): a position is
+        # realized only on the units that BOTH filled on entry AND could exit on
+        # the opposite-side excursion. LONG enters on the DIP (low_layers), exits
+        # on the RISE (high_layers); SHORT enters on the RISE, exits on the DIP —
+        # so BOTH sides realize size = min(low_layers, high_layers). Requires a
+        # >=1bps dip AND a >=1bps rise inside the horizon, else size 0 (no trade).
+        size = np.minimum(low_layers, high_layers)
 
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-        return_long = ((price_return - fee_cost) * total_long_layers).rename("return_long")
+        return_long = ((price_return - fee_cost) * size).rename("return_long")
         # Short profits when price falls: negate price_return (and fee, which is paid either side).
         # Matches features.py:449 `"return_short": -(forward_return + fee)`.
-        return_short = ((-(price_return + fee_cost)) * total_short_layers).rename("return_short")
-        return_long_raw = (price_return * total_long_layers).rename("return_long_raw")
-        return_short_raw = ((-price_return) * total_short_layers).rename("return_short_raw")
+        return_short = ((-(price_return + fee_cost)) * size).rename("return_short")
+        return_long_raw = (price_return * size).rename("return_long_raw")
+        return_short_raw = ((-price_return) * size).rename("return_short_raw")
 
         return pd.concat(
             [return_long, return_short, return_long_raw, return_short_raw], axis=1)
