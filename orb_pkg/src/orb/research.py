@@ -181,15 +181,17 @@ class OrbResearch(AgamottoResearch):
                         exit_high = self.features[exit_high_col]
                         dist_long = ((close_safe - exit_low) / close_safe).clip(lower=0)
                         long_layers = np.floor(dist_long / step_size).clip(0, ladder).fillna(0).astype(int)
-                        total_long = 1 + long_layers
                         dist_short = ((exit_high - close_safe) / close_safe).clip(lower=0)
                         short_layers = np.floor(dist_short / step_size).clip(0, ladder).fillna(0).astype(int)
-                        total_short = 1 + short_layers
+                        # 2026-06-20 refined ladder (parity with mjolnir dc 4fb9eb8): no base
+                        # rung + round-trip gate -> size = min(long_layers, short_layers),
+                        # same size both sides. <1bps dip OR rise -> 0.
+                        size = np.minimum(long_layers, short_layers)
                         fee_cost = fee * 2.0
-                        sym_cols["return_long"] = (raw - fee_cost) * total_long
-                        sym_cols["return_short"] = -(raw + fee_cost) * total_short
-                        sym_cols["return_long_raw"] = raw * total_long
-                        sym_cols["return_short_raw"] = raw * total_short
+                        sym_cols["return_long"] = (raw - fee_cost) * size
+                        sym_cols["return_short"] = -(raw + fee_cost) * size
+                        sym_cols["return_long_raw"] = raw * size
+                        sym_cols["return_short_raw"] = raw * size
                     else:
                         sym_cols["return_long"] = raw - 2 * fee
                         sym_cols["return_short"] = -(raw + 2 * fee)
@@ -426,19 +428,21 @@ class OrbResearch(AgamottoResearch):
             [np.inf, -np.inf], np.nan)
         long_layers = np.floor(distance_long / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
-        total_long_layers = 1 + long_layers
 
         distance_short = ((high_next - close_safe) / close_safe).replace(
             [np.inf, -np.inf], np.nan)
         short_layers = np.floor(distance_short / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
-        total_short_layers = 1 + short_layers
+
+        # 2026-06-20 refined ladder (parity with mjolnir dc 4fb9eb8): no base rung +
+        # round-trip gate -> size = min(long_layers, short_layers), same both sides.
+        size = np.minimum(long_layers, short_layers)
 
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-        return_long = ((price_return - fee_cost) * total_long_layers).rename("return_long")
-        return_short = ((price_return + fee_cost) * total_short_layers).rename("return_short")
-        return_long_raw = (price_return * total_long_layers).rename("return_long_raw")
-        return_short_raw = (price_return * total_short_layers).rename("return_short_raw")
+        return_long = ((price_return - fee_cost) * size).rename("return_long")
+        return_short = ((price_return + fee_cost) * size).rename("return_short")
+        return_long_raw = (price_return * size).rename("return_long_raw")
+        return_short_raw = (price_return * size).rename("return_short_raw")
 
         return pd.concat(
             [return_long, return_short, return_long_raw, return_short_raw], axis=1)

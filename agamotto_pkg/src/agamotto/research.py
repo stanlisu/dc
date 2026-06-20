@@ -279,27 +279,33 @@ class AgamottoResearch:
                 long_layers = np.floor(distance_long / step_size)
                 long_layers = long_layers.clip(lower=0, upper=ladder)
                 long_layers = long_layers.fillna(0).astype(int)
-                # Total layers = 1 initial + N ladders
-                total_long_layers = 1 + long_layers
 
                 distance_short = ((high_next - close_safe) / close_safe).replace([np.inf, -np.inf], np.nan)
                 short_layers = np.floor(distance_short / step_size)
                 short_layers = short_layers.clip(lower=0, upper=ladder)
                 short_layers = short_layers.fillna(0).astype(int)
-                # Total layers = 1 initial + N ladders
-                total_short_layers = 1 + short_layers
+
+                # 2026-06-20 refined ladder fill (parity with mjolnir dc 4fb9eb8): no free
+                # base rung (size = n, NOT 1 + n) AND a round-trip gate — a unit is realized
+                # only if it BOTH filled on entry AND could exit on the opposite excursion
+                # (LONG enters on the dip / exits on the rise; SHORT mirrors), so both sides
+                # use size = min(long_layers, short_layers). A <1bps dip OR <1bps rise -> 0
+                # (no always-on position). The old `1 + n` base rung + forward-excursion
+                # look-ahead manufactured a direction-agnostic phantom edge on a
+                # close-to-close return.
+                size = np.minimum(long_layers, short_layers)
 
                 fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
                 long_per_layer_return = price_return - fee_cost
-                price_return_long = (long_per_layer_return * total_long_layers).rename(f"{base}_return_long")
+                price_return_long = (long_per_layer_return * size).rename(f"{base}_return_long")
 
                 short_raw_per_layer = price_return + fee_cost
-                # (price_return + fee_cost) * layers, then short_subset flips it to -(...)
-                price_return_short = (short_raw_per_layer * total_short_layers).rename(f"{base}_return_short")
+                # (price_return + fee_cost) * size, then short_subset flips it to -(...)
+                price_return_short = (short_raw_per_layer * size).rename(f"{base}_return_short")
 
                 # Raw returns (no fee) for downstream Sharpe calculation
-                price_return_long_raw = (price_return * total_long_layers).rename(f"{base}_return_long_raw")
-                price_return_short_raw = (price_return * total_short_layers).rename(f"{base}_return_short_raw")
+                price_return_long_raw = (price_return * size).rename(f"{base}_return_long_raw")
+                price_return_short_raw = (price_return * size).rename(f"{base}_return_short_raw")
 
                 # Dual-horizon 2-bar target set — mirror of the 1-bar block above
                 # over a 2-bar forward hold. ret_2bar is the plain cumulative
@@ -317,18 +323,19 @@ class AgamottoResearch:
                     distance_long2 = ((close_safe - low_min2) / close_safe).replace([np.inf, -np.inf], np.nan)
                     long_layers2 = np.floor(distance_long2 / step_size)
                     long_layers2 = long_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
-                    total_long_layers2 = 1 + long_layers2
 
                     distance_short2 = ((high_max2 - close_safe) / close_safe).replace([np.inf, -np.inf], np.nan)
                     short_layers2 = np.floor(distance_short2 / step_size)
                     short_layers2 = short_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
-                    total_short_layers2 = 1 + short_layers2
+
+                    # Refined ladder (same as 1-bar block): no base rung + round-trip gate.
+                    size2 = np.minimum(long_layers2, short_layers2)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
-                    return_long_2bar = ((price_return_2bar - fee_cost) * total_long_layers2).rename(f"{base}_return_long_2bar")
-                    return_short_2bar = ((price_return_2bar + fee_cost) * total_short_layers2).rename(f"{base}_return_short_2bar")
-                    return_long_2bar_raw = (price_return_2bar * total_long_layers2).rename(f"{base}_return_long_2bar_raw")
-                    return_short_2bar_raw = (price_return_2bar * total_short_layers2).rename(f"{base}_return_short_2bar_raw")
+                    return_long_2bar = ((price_return_2bar - fee_cost) * size2).rename(f"{base}_return_long_2bar")
+                    return_short_2bar = ((price_return_2bar + fee_cost) * size2).rename(f"{base}_return_short_2bar")
+                    return_long_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_long_2bar_raw")
+                    return_short_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_short_2bar_raw")
 
                 # Dip/rip target columns for compound classification label (Vomir)
                 # return_dip = low[T+1]/close[T] - 1  (how far price dips next bar)
