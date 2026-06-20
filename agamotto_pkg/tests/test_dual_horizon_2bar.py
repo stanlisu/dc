@@ -36,8 +36,8 @@ def _base_config(dual):
     cfg = {
         "TIME_UNIT": "15m",
         "SYMBOLS": ["BTCUSDT"],
-        "LADDER": 0,          # 0 ladder layers => total layers = 1
-        "FEE": 0,             # no fee => laddered return == plain cumulative
+        "LADDER": 0,          # 0 rungs => refined model fills nothing (size=0)
+        "FEE": 0,             # no fee
         "MA_PERIODS": [7, 25, 99],
         "STATS_WINDOW": 14,
     }
@@ -64,20 +64,22 @@ def test_ret_2bar_is_cumulative_two_bar_return():
     assert pd.isna(got.iloc[-1]) and pd.isna(got.iloc[-2])
 
 
-def test_laddered_2bar_equals_plain_when_no_ladder_no_fee():
+def test_laddered_2bar_zero_when_no_ladder():
+    # Refined ladder (2026-06-20, parity with mjolnir dc 4fb9eb8): no base rung —
+    # with LADDER=0 (no rungs) size=min(low,high)=0, so NOTHING fills and
+    # return_*_2bar == 0. (The old `1 + n` model returned the plain ret_2bar here.)
     from agamotto.research import AgamottoResearch
     prefix = "BTCUSDT"
     raw = _synthetic_raw(prefix)
     r = AgamottoResearch(_base_config(dual=True), ".")
     r.raw = raw
     r.engineer_features()
-    # LADDER=0, FEE=0 => total layers = 1, fee_cost = 0 => return_*_2bar == ret_2bar
     rl = r.features[f"{prefix}_return_long_2bar"]
     rs = r.features[f"{prefix}_return_short_2bar"]
     ret2 = r.features[f"{prefix}_ret_2bar"]
     m = ret2.notna()
-    assert np.allclose(rl[m].values, ret2[m].values, atol=1e-12)
-    assert np.allclose(rs[m].values, ret2[m].values, atol=1e-12)
+    assert np.allclose(rl[m].values, 0.0, atol=1e-12)
+    assert np.allclose(rs[m].values, 0.0, atol=1e-12)
 
 
 def test_no_2bar_columns_without_dual_horizon():
