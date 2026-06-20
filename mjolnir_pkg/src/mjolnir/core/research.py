@@ -1426,21 +1426,28 @@ class MjolnirResearch:
         high_layers = np.floor(distance_short / step_size).clip(
             lower=0, upper=ladder).fillna(0).astype(int)
 
-        # 2026-06-20 refinement #2 (Variant A — round-trip gate): a position is
-        # realized only on the units that BOTH filled on entry AND could exit on
-        # the opposite-side excursion. LONG enters on the DIP (low_layers), exits
-        # on the RISE (high_layers); SHORT enters on the RISE, exits on the DIP —
-        # so BOTH sides realize size = min(low_layers, high_layers). Requires a
-        # >=1bps dip AND a >=1bps rise inside the horizon, else size 0 (no trade).
-        size = np.minimum(low_layers, high_layers)
+        # 2026-06-20 refinement #2 (Stan — mark-to-market exit): size each position
+        # by its ENTRY-side penetration and mark the WHOLE opened stack at the
+        # horizon close, i.e. force-liquidate at close[t+h] whatever did not take
+        # profit. Unclosed inventory therefore BOOKS the real directional move at
+        # the close (underwater longs in a downtrend / underwater shorts in a bull
+        # realize their loss) instead of being silently dropped — the earlier
+        # size=min(low,high) gate discarded the carried, mostly-losing, inventory
+        # and was optimistically biased. LONG accumulates on the DIP -> size_long =
+        # low_layers; SHORT accumulates on the RALLY -> size_short = high_layers.
+        # No look-ahead favorable exit is credited: selecting round-trips by
+        # min(open,close) and paying them a take-profit would re-introduce a smaller
+        # excursion-conditioned artifact, so the exit is purely liquidate-at-close.
+        size_long = low_layers
+        size_short = high_layers
 
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-        return_long = ((price_return - fee_cost) * size).rename("return_long")
+        return_long = ((price_return - fee_cost) * size_long).rename("return_long")
         # Short profits when price falls: negate price_return (and fee, which is paid either side).
         # Matches features.py:449 `"return_short": -(forward_return + fee)`.
-        return_short = ((-(price_return + fee_cost)) * size).rename("return_short")
-        return_long_raw = (price_return * size).rename("return_long_raw")
-        return_short_raw = ((-price_return) * size).rename("return_short_raw")
+        return_short = ((-(price_return + fee_cost)) * size_short).rename("return_short")
+        return_long_raw = (price_return * size_long).rename("return_long_raw")
+        return_short_raw = ((-price_return) * size_short).rename("return_short_raw")
 
         return pd.concat(
             [return_long, return_short, return_long_raw, return_short_raw], axis=1)
