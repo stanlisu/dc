@@ -1441,6 +1441,19 @@ class MjolnirResearch:
         size_long = low_layers
         size_short = high_layers
 
+        # LADDER_FILL_MODE="flat": two-way TAKER model — fixed size 1 per bar,
+        # filled at the decision (horizon-close) price, no laddered size and no
+        # maker rungs. This is what aggressive taker execution actually realizes
+        # (precise fill PRICE, fixed SIZE), as opposed to the laddered maker
+        # accumulation above. Default "ladder" keeps the mark-to-market behaviour.
+        fill_mode = str(self.config.get("LADDER_FILL_MODE", "ladder")).lower()
+        if fill_mode == "flat":
+            size_long = 1
+            size_short = 1
+        elif fill_mode != "ladder":
+            raise ValueError(
+                f"LADDER_FILL_MODE must be 'ladder' or 'flat', got {fill_mode!r}")
+
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
         return_long = ((price_return - fee_cost) * size_long).rename("return_long")
         # Short profits when price falls: negate price_return (and fee, which is paid either side).
