@@ -491,9 +491,17 @@ class MjolnirResearch:
                     feats, "close", "low", "high", horizon_bars=horizon_bars)
                 for col in ladder_cols.columns:
                     feats[col] = ladder_cols[col].values
-            # Drop rows with NaN in return columns (last target_horizon bars)
+            # Drop rows with NaN in return columns (last target_horizon bars).
+            # limit_then_taker looks 2h ahead, so its return_long/short are NaN
+            # for the final 2h bars while "return" (horizon h) is not — gate on
+            # the target columns too so NaN targets can never reach training.
             if "return" in feats.columns:
-                feats = feats[feats["return"].notna()]
+                keep = feats["return"].notna()
+                if str(self.config.get("LADDER_FILL_MODE", "ladder")).lower() == "limit_then_taker":
+                    for _tcol in ("return_long", "return_short"):
+                        if _tcol in feats.columns:
+                            keep &= feats[_tcol].notna()
+                feats = feats[keep]
             frames.append(feats.reset_index(drop=True))
         gc.collect()
 
@@ -811,8 +819,14 @@ class MjolnirResearch:
                     del ladder_cols
 
                 # Drop rows with NaN target — matches verticalize() semantics.
+                # limit_then_taker looks 2h ahead; gate on target cols too.
                 if "return" in feats.columns:
-                    feats = feats[feats["return"].notna()]
+                    keep = feats["return"].notna()
+                    if str(self.config.get("LADDER_FILL_MODE", "ladder")).lower() == "limit_then_taker":
+                        for _tcol in ("return_long", "return_short"):
+                            if _tcol in feats.columns:
+                                keep &= feats[_tcol].notna()
+                    feats = feats[keep]
                 if feats.empty:
                     logger.warning("Feature frame for %s empty after NaN-drop; skipping", native)
                     del feats
@@ -1440,14 +1454,61 @@ class MjolnirResearch:
         # excursion-conditioned artifact, so the exit is purely liquidate-at-close.
         size_long = low_layers
         size_short = high_layers
+        # Gross per-unit signed return BEFORE fee and size. Default ("ladder")
+        # marks the whole opened stack at the horizon close (close-to-close):
+        # long earns +price_return, short earns -price_return. fill_mode may
+        # override either the size (flat) or the exit price (limit_then_taker).
+        ret_long_gross = price_return
+        ret_short_gross = -price_return
+
+        fill_mode = str(self.config.get("LADDER_FILL_MODE", "ladder")).lower()
+        if fill_mode == "flat":
+            # Two-way TAKER model — fixed size 1 per bar, filled at the decision
+            # (horizon-close) price, no laddered size and no maker rungs. This is
+            # what aggressive taker execution actually realizes (precise fill
+            # PRICE, fixed SIZE), as opposed to the laddered maker accumulation.
+            size_long = 1
+            size_short = 1
+        elif fill_mode == "limit_then_taker":
+            # Two-stage maker-close-then-taker-fallback exit (Stan 2026-06-22).
+            # Open n on the entry-side penetration (size_long/size_short as
+            # above), then try to close the WHOLE position with a single limit at
+            # the next-boundary close close[t+h]. Decide the fill from the
+            # FOLLOWING horizon window (t+h, t+2h]:
+            #   LONG  (sell limit): fills if that window rallies back up to
+            #          close_h (max high >= close_h) -> exit at close_h; else
+            #          taker-close the leftover at close[t+2h].
+            #   SHORT (buy limit):  fills if that window dips to close_h
+            #          (min low <= close_h) -> exit at close_h; else taker-close
+            #          the leftover at close[t+2h].
+            # Unfilled ("leftover") inventory therefore books the real later move
+            # at close[t+2h], not the optimistic single horizon close. Both
+            # branches are charged the taker FEE (a deliberately strict
+            # assumption). Requires the full t+2 window: the final 2h bars per
+            # symbol have no close[t+2h] and are masked to NaN (dropped in
+            # verticalize, which under this mode also gates on return_long/short).
+            close_h = close.shift(-horizon_bars)
+            close_2h = close.shift(-2 * horizon_bars)
+            high_w2 = high_window.shift(-horizon_bars)   # max high over (t+h, t+2h]
+            low_w2 = low_window.shift(-horizon_bars)      # min low over (t+h, t+2h]
+            full = close_2h.notna()                       # full t+2 window observed
+            exit_long = close_h.where(high_w2 >= close_h, close_2h)
+            exit_short = close_h.where(low_w2 <= close_h, close_2h)
+            ret_long_gross = (exit_long / close_safe - 1.0).where(full)
+            ret_short_gross = (-(exit_short / close_safe - 1.0)).where(full)
+        elif fill_mode != "ladder":
+            raise ValueError(
+                "LADDER_FILL_MODE must be 'ladder', 'flat' or 'limit_then_taker', "
+                f"got {fill_mode!r}")
 
         fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-        return_long = ((price_return - fee_cost) * size_long).rename("return_long")
-        # Short profits when price falls: negate price_return (and fee, which is paid either side).
-        # Matches features.py:449 `"return_short": -(forward_return + fee)`.
-        return_short = ((-(price_return + fee_cost)) * size_short).rename("return_short")
-        return_long_raw = (price_return * size_long).rename("return_long_raw")
-        return_short_raw = ((-price_return) * size_short).rename("return_short_raw")
+        # return_X = (signed gross return − round-trip fee) × size. Short's gross
+        # is already negated above; fee is paid either side. Matches features.py
+        # `"return_short": -(forward_return + fee)` (i.e. -price_return - fee).
+        return_long = ((ret_long_gross - fee_cost) * size_long).rename("return_long")
+        return_short = ((ret_short_gross - fee_cost) * size_short).rename("return_short")
+        return_long_raw = (ret_long_gross * size_long).rename("return_long_raw")
+        return_short_raw = (ret_short_gross * size_short).rename("return_short_raw")
 
         return pd.concat(
             [return_long, return_short, return_long_raw, return_short_raw], axis=1)
