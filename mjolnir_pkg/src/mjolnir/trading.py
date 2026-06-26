@@ -150,22 +150,69 @@ class MjolnirTrading:
         bufs[symbol].append(bar)
         tss[symbol].append(timestamp)
 
-    def predict(self, symbol: str) -> Optional[PredictDiag]:
-        """Predict signal for symbol using the latest complete bar.
+    def snapshot_inputs(self, symbol: str) -> Optional[dict]:
+        """Grab an immutable, picklable copy of every buffer ``predict`` reads
+        for *symbol*: its own base buffer + the BTC buffer (cross-features) +
+        each cross-TF buffer. MUST be called on the bridge's event loop — that
+        is the only race-free point vs ``add_bar``'s deque mutation. Returns
+        ``None`` if the symbol's own buffer is below warmup.
 
-        Returns:
-            PredictDiag(side, threshold, y_pred, y_pred_thresh, regime,
-            model_name) if signal, else None.
+        Bar dicts are appended immutably (never mutated in place), so copying
+        their references is safe; a process pool deep-copies them at pickle
+        time anyway. The conditional BTC / cross-TF inclusion gates mirror the
+        original ``predict`` exactly.
         """
         if symbol not in self._buffers:
             return None
         buf = self._buffers[symbol]
         if len(buf) < self.MIN_WARMUP_BARS:
             return None
+        inp: dict = {
+            "buf": list(buf),
+            "ts": list(self._timestamps[symbol]),
+            "btc_buf": None,
+            "btc_ts": None,
+            "tf": {},
+        }
+        if (symbol != _BTC
+                and _BTC in self._buffers
+                and len(self._buffers[_BTC]) >= self.MIN_WARMUP_BARS):
+            inp["btc_buf"] = list(self._buffers[_BTC])
+            inp["btc_ts"] = list(self._timestamps[_BTC])
+        for cross_tf in self._multi_tfs:
+            tf_buf = self._tf_buffers[cross_tf].get(symbol)
+            tf_ts = self._tf_timestamps[cross_tf].get(symbol)
+            if not tf_buf or len(tf_buf) < 2:
+                continue
+            inp["tf"][cross_tf] = (list(tf_buf), list(tf_ts))
+        return inp
 
-        # Build DataFrame from buffer
-        df = pd.DataFrame(list(buf))
-        idx = pd.DatetimeIndex(list(self._timestamps[symbol]), name=None)
+    def predict(self, symbol: str) -> Optional[PredictDiag]:
+        """Snapshot + compute in one call (back-compat / single-process path).
+
+        Equivalent to ``predict_from_inputs(symbol, snapshot_inputs(symbol))``.
+        The bridge splits the two so the snapshot runs on the event loop
+        (race-free vs ``add_bar``) while ``predict_from_inputs`` runs in a
+        worker pool.
+        """
+        inp = self.snapshot_inputs(symbol)
+        if inp is None:
+            return None
+        return self.predict_from_inputs(symbol, inp)
+
+    def predict_from_inputs(
+        self, symbol: str, inputs: dict,
+    ) -> Optional[PredictDiag]:
+        """Pure compute half of ``predict``: build features from an ``inputs``
+        snapshot (from :meth:`snapshot_inputs`) and run the regime stack.
+
+        Reads ONLY read-only model / feature-engine / research / config state,
+        so it is safe to run in a worker process whose own buffers are empty —
+        all bar data arrives via ``inputs``.
+        """
+        # Build DataFrame from the snapshot
+        df = pd.DataFrame(inputs["buf"])
+        idx = pd.DatetimeIndex(inputs["ts"], name=None)
         if idx.tz is None:
             idx = idx.tz_localize("UTC")
         df.index = idx
@@ -177,12 +224,11 @@ class MjolnirTrading:
             logger.error("Feature computation failed for %s: %s", symbol, exc)
             return None
 
-        # Inject BTC cross-features for non-BTC symbols
-        if (symbol != _BTC
-                and _BTC in self._buffers
-                and len(self._buffers[_BTC]) >= self.MIN_WARMUP_BARS):
-            btc_df = pd.DataFrame(list(self._buffers[_BTC]))
-            btc_idx = pd.DatetimeIndex(list(self._timestamps[_BTC]))
+        # Inject BTC cross-features for non-BTC symbols. The warmup / non-BTC
+        # gates live in snapshot_inputs (btc_buf is only set when eligible).
+        if inputs.get("btc_buf"):
+            btc_df = pd.DataFrame(inputs["btc_buf"])
+            btc_idx = pd.DatetimeIndex(inputs["btc_ts"])
             if btc_idx.tz is None:
                 btc_idx = btc_idx.tz_localize("UTC")
             btc_df.index = btc_idx
@@ -198,13 +244,9 @@ class MjolnirTrading:
         # silently drop them (pre-Bug 5) or raise (post-Bug 5). Cross-TF bars
         # are pushed into per-TF buffers by the bridge.
         tf_feats_map: Dict[str, pd.DataFrame] = {}
-        for cross_tf in self._multi_tfs:
-            tf_buf = self._tf_buffers[cross_tf].get(symbol)
-            tf_ts = self._tf_timestamps[cross_tf].get(symbol)
-            if not tf_buf or len(tf_buf) < 2:
-                continue
-            tf_df = pd.DataFrame(list(tf_buf))
-            tf_idx = pd.DatetimeIndex(list(tf_ts))
+        for cross_tf, (tf_buf, tf_ts) in inputs.get("tf", {}).items():
+            tf_df = pd.DataFrame(tf_buf)
+            tf_idx = pd.DatetimeIndex(tf_ts)
             if tf_idx.tz is None:
                 tf_idx = tf_idx.tz_localize("UTC")
             tf_df.index = tf_idx

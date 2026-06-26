@@ -216,3 +216,50 @@ def test_predict_no_signal(mj):
     _setup_predict(mj, sym, [entry], {"r1_long_lightgbm": 0.001})
     result = mj.predict(sym)
     assert result is None
+
+
+# -------------------------------------------------------------------
+# snapshot_inputs / predict_from_inputs split (parallel-inference path)
+# -------------------------------------------------------------------
+
+
+def test_snapshot_inputs_none_below_warmup(mj):
+    sym = "BINANCE_PERP_BTC_USDT"
+    _fill_buffer(mj, sym, 50)  # < MIN_WARMUP_BARS (120)
+    assert mj.snapshot_inputs(sym) is None
+
+
+def test_snapshot_inputs_none_unknown_symbol(mj):
+    assert mj.snapshot_inputs("NOPE") is None
+
+
+def test_predict_equals_snapshot_then_from_inputs(mj):
+    """predict(sym) must equal predict_from_inputs(sym, snapshot_inputs(sym))
+    — the bridge calls the split form across a worker pool."""
+    sym = "BINANCE_PERP_BTC_USDT"
+    entry = {"regime": "r1", "position": "long",
+             "model": "LightGBM", "threshold": 0.001}
+    _setup_predict(mj, sym, [entry], {"r1_long_lightgbm": 0.01})
+
+    direct = mj.predict(sym)
+    via_split = mj.predict_from_inputs(sym, mj.snapshot_inputs(sym))
+    assert direct is not None
+    assert via_split == direct
+
+
+def test_snapshot_is_frozen_against_later_add_bar(mj):
+    """The snapshot is a copy: mutating the live buffer afterward must not
+    change what predict_from_inputs sees (the race-safety guarantee)."""
+    sym = "BINANCE_PERP_BTC_USDT"
+    entry = {"regime": "r1", "position": "long",
+             "model": "LightGBM", "threshold": 0.001}
+    _setup_predict(mj, sym, [entry], {"r1_long_lightgbm": 0.01})
+
+    snap = mj.snapshot_inputs(sym)
+    n_before = len(snap["buf"])
+    # Mutate the live deque after snapshotting.
+    _fill_buffer(mj, sym, 10, base_close=60000.0)
+    assert len(snap["buf"]) == n_before               # snapshot unchanged
+    assert len(mj._buffers[sym]) != n_before          # live buffer grew
+    # And it still computes a result off the frozen snapshot.
+    assert mj.predict_from_inputs(sym, snap) is not None
