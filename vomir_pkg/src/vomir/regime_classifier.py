@@ -40,6 +40,13 @@ from vomir.classifier import (
 
 logger = logging.getLogger(__name__)
 
+
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from vomir._obf.codec import default
+    return default()
+
+
 # ---------------------------------------------------------------------------
 # Regime group definitions — order determines group_id (0-3)
 # ---------------------------------------------------------------------------
@@ -55,8 +62,11 @@ def _regime_to_group(regime: str) -> int:
     """Map a regime string to its group_id (0-3).
 
     Uses prefix matching: 'high_volume_and_macd_bullish_long' → 1.
-    Unrecognised regimes fall back to 'baseline' (0).
+    Unrecognised regimes fall back to 'baseline' (0). The incoming regime is
+    obfuscated (coded) at research time — decode it first so the group prefixes
+    (real names, private) still match (code->real; real passes through).
     """
+    regime = _obf().decode_regime_tolerant(str(regime))
     for name in REGIME_GROUP_NAMES:
         if regime.startswith(name):
             return REGIME_GROUP_ID[name]
@@ -434,13 +444,15 @@ class VomirRegimeClassifier(VomirClassifier):
         joblib.dump(scaler, os.path.join(out_dir, "scaler.pkl"))
         joblib.dump(clf, os.path.join(out_dir, "lgbm_model.pkl"))
 
+        # Per-group artifacts keyed on group_id (not the real group name) so the
+        # weight filenames carry no real regime names on S3/NAS.
         for gid, gname in enumerate(REGIME_GROUP_NAMES):
             pca_g = fitted_pcas[gid]
             km_g = fitted_kms[gid]
             if pca_g is not None:
-                joblib.dump(pca_g, os.path.join(out_dir, f"pca_{gname}.pkl"))
+                joblib.dump(pca_g, os.path.join(out_dir, f"pca_g{gid}.pkl"))
             if km_g is not None:
-                joblib.dump(km_g, os.path.join(out_dir, f"kmeans_{gname}.pkl"))
+                joblib.dump(km_g, os.path.join(out_dir, f"kmeans_g{gid}.pkl"))
 
         meta = {
             "feature_cols": feature_cols,
@@ -452,7 +464,7 @@ class VomirRegimeClassifier(VomirClassifier):
             "train_period": window.train_label,
             "test_month": window.test_label,
             "class_map": {"SHORT": CLASS_SHORT, "NEUTRAL": CLASS_NEUTRAL, "LONG": CLASS_LONG},
-            "regime_groups": REGIME_GROUP_NAMES,
+            "regime_groups": [f"g{i}" for i in range(len(REGIME_GROUP_NAMES))],
             "classifier_type": "VomirRegimeClassifier",
         }
         with open(os.path.join(out_dir, "meta.json"), "w") as f:
@@ -479,10 +491,10 @@ class VomirRegimeClassifier(VomirClassifier):
             "clf": joblib.load(os.path.join(weights_path, "lgbm_model.pkl")),
             "meta": meta,
         }
-        for gname in REGIME_GROUP_NAMES:
-            pca_path = os.path.join(weights_path, f"pca_{gname}.pkl")
-            km_path = os.path.join(weights_path, f"kmeans_{gname}.pkl")
-            artifacts[f"pca_{gname}"] = joblib.load(pca_path) if os.path.exists(pca_path) else None
-            artifacts[f"kmeans_{gname}"] = joblib.load(km_path) if os.path.exists(km_path) else None
+        for gid in range(len(REGIME_GROUP_NAMES)):
+            pca_path = os.path.join(weights_path, f"pca_g{gid}.pkl")
+            km_path = os.path.join(weights_path, f"kmeans_g{gid}.pkl")
+            artifacts[f"pca_g{gid}"] = joblib.load(pca_path) if os.path.exists(pca_path) else None
+            artifacts[f"kmeans_g{gid}"] = joblib.load(km_path) if os.path.exists(km_path) else None
 
         return artifacts
