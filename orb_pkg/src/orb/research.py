@@ -89,13 +89,11 @@ _ORB_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
 
 def _orb_has_baseline(regime_name: str) -> bool:
-    """True if any conjunct of a (TF-prefixed, _and_-joined) regime is baseline."""
-    for part in regime_name.split("_and_"):
-        toks = part.split("_")
-        base = "_".join(toks[1:]) if toks and toks[0] in ("15m", "1h", "4h", "1d") else part
-        if base == "baseline":
-            return True
-    return False
+    """True if any conjunct of a regime is the banned baseline.
+
+    Delegates to the single shared, suffix-/TF-/_or_-aware codec predicate so the
+    baseline-ban logic has one home (see CLAUDE.md, 2026-06-18)."""
+    return _obf().has_baseline(regime_name)
 
 
 class OrbResearch(AgamottoResearch):

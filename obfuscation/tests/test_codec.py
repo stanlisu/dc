@@ -93,6 +93,27 @@ def test_tolerant_decode_accepts_code_and_real(codec, data):
     assert codec.decode_regime_tolerant(mixed) == real
 
 
+def test_or_regime_roundtrip(codec, data):
+    a, b = list(data["regimes"])[:2]
+    name = f"{a}_or_{b}"
+    enc = codec.encode_regime(name)
+    assert "_or_" in enc and codec.encode_atom(a) in enc and codec.encode_atom(b) in enc
+    assert codec.decode_regime(enc) == name
+    # mixed _and_/_or_ with TF prefixes + position
+    mixed = f"1d_{a}_and_1h_{b}_or_4h_{a}_long"
+    assert codec.decode_regime(codec.encode_regime(mixed)) == mixed
+
+
+def test_has_baseline(codec, data):
+    a = next(iter(data["regimes"]))
+    assert codec.has_baseline("baseline")
+    assert codec.has_baseline("1d_baseline_long")
+    assert codec.has_baseline(f"{a}_and_baseline")
+    assert codec.has_baseline(f"{a}_or_4h_baseline")
+    assert not codec.has_baseline(a)
+    assert not codec.has_baseline(codec.encode_regime(a))   # coded never baseline
+
+
 def test_no_short_long_false_split(codec, data):
     # An atom whose name merely ends in a non-position word must not be mangled.
     for name in data["regimes"]:

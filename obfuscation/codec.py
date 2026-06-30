@@ -28,6 +28,10 @@ _MAP_PATH = Path(__file__).resolve().parent / "map.json"
 _TF_PREFIX = re.compile(r"^(\d+[smhd])_(.+)$")
 _POSITION = re.compile(r"_(long|short)$")
 _AND = "_and_"
+# Conjunction/disjunction separators between regime atoms. Capturing group so
+# re.split keeps them, letting _map_regime map atoms and pass separators through.
+# No regime atom contains the substring `_and_`/`_or_`, so this never false-splits.
+_SEP_RE = re.compile(r"(_and_|_or_)")
 
 
 class Codec:
@@ -88,9 +92,14 @@ class Codec:
         Per atom token: decode if it is a known code, else leave as-is. Used at
         dc filter-mask entry during the rename rollout so the same method accepts
         both coded (new) and real-name (existing tests / in-flight callers) input.
-        NOT a silent fallback: a token that is neither a valid code nor a valid
-        real filter still falls through to the existing strict raise in
-        _apply_filter_mask (`unknown filter_name`). See marvel CLAUDE.md.
+
+        A token that is neither a valid code nor a valid real filter is passed
+        through unchanged here and rejected downstream by _apply_filter_mask —
+        which raises ``ValueError("Unknown filter name")`` ONLY when
+        ``self._strict_filters`` is True (the default). With strict filters off,
+        that path instead logs and returns an all-False mask, so an unknown token
+        yields zero signal rather than an error. Keep strict filters on for the
+        obfuscation entry points.
         """
         return self._map_regime(
             regime, lambda b: self.decode_atom(b) if self.is_regime_code(b) else b
@@ -102,12 +111,30 @@ class Codec:
         if m:
             pos = regime[m.start():]
             regime = regime[: m.start()]
-        parts = regime.split(_AND)
         out = []
-        for part in parts:
-            tf, base = self._split_tf(part)
-            out.append(tf + fn(base))
-        return _AND.join(out) + pos
+        # Split on both _and_ and _or_, preserving the separators (mixed grammars
+        # like a_and_b_or_c reassemble correctly).
+        for tok in _SEP_RE.split(regime):
+            if tok in ("_and_", "_or_") or tok == "":
+                out.append(tok)
+            else:
+                tf, base = self._split_tf(tok)
+                out.append(tf + fn(base))
+        return "".join(out) + pos
+
+    def has_baseline(self, regime: str) -> bool:
+        """True if any conjunct of a (positioned, TF-prefixed, _and_/_or_-joined)
+        regime is the banned ``baseline``. Operates on REAL names; coded regimes
+        always return False because `baseline` is never in the map. Single shared
+        home for the baseline-ban predicate (see CLAUDE.md, 2026-06-18)."""
+        body = _POSITION.sub("", regime)
+        for tok in _SEP_RE.split(body):
+            if tok in ("_and_", "_or_") or tok == "":
+                continue
+            _, base = self._split_tf(tok)
+            if base == "baseline":
+                return True
+        return False
 
     # ---- structure-preserving feature names ---------------------------------
     def encode_feature(self, col: str) -> str:
