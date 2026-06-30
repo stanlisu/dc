@@ -14,8 +14,48 @@ from orb.research import OrbResearch
 logger = logging.getLogger(__name__)
 
 
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from ._obf.codec import default
+    return default()
+
+
+# Regime definitions moved out of the public marvel generator (real names live
+# only here). Scepter regime = own-state × BTC-state, "{own}_and_{btc}".
+_SCEPTER_OWN_STATE = [
+    "above_all_mas", "high_volume", "low_volume", "adx_trend", "vol_breakout",
+    "low_vol", "high_vol", "strong_trend", "ma_momentum",
+    "rsi_oversold", "rsi_overbought", "macd_bullish", "macd_bearish",
+    "stoch_bullish", "bb_rebound", "mom_positive",
+]
+_SCEPTER_BTC_STATE = [
+    "btc_trending_up", "btc_trending_down", "btc_high_vol", "btc_low_vol",
+]
+
+
 class ScepterResearch(OrbResearch):
     """OrbResearch + BTC/ETH cross-symbol anchor features."""
+
+    @classmethod
+    def generate_regime_stack(cls) -> list[dict]:
+        """Coded [{regime, position}] for own-state × BTC-state crossed regimes.
+
+        Position is determined by own-state alone (anchors are directionally
+        neutral). Regime names returned OBFUSCATED (structure preserved).
+        """
+        c = _obf()
+        seen, out = set(), []
+        for own in _SCEPTER_OWN_STATE:
+            positions = cls.allowed_positions(own)
+            for btc in _SCEPTER_BTC_STATE:
+                name = f"{own}_and_{btc}"
+                for pos in positions:
+                    key = (name, pos)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"regime": c.encode_regime(name), "position": pos})
+        return out
 
     def __init__(self, config: Dict, home_root: str) -> None:
         if "ANCHOR_SYMBOLS" not in config:
@@ -55,6 +95,9 @@ class ScepterResearch(OrbResearch):
     ) -> pd.Series:
         """Override: check ANCHOR_REGIMES before falling through to OrbResearch."""
         if isinstance(filter_name, str):
+            # Accept coded regimes: decode to real before matching anchor names
+            # against the real-name ANCHOR_REGIMES dict (code->real, real->real).
+            filter_name = _obf().decode_regime_tolerant(filter_name)
             # Handle _and_ compounds that may include anchor regime components
             if "_and_" in filter_name:
                 parts = filter_name.split("_and_")

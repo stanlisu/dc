@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 # Don't add handlers here - let it propagate to root logger
 # This ensures it uses the same handler configuration as the main process
 
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from ._obf.codec import default
+    return default()
+
+
 # Use relative import for internal module
 try:
     from .lib_binance import fetch_futures_klines, klines_to_dataframe
@@ -88,6 +94,9 @@ class AgamottoResearch:
         Splits compound names on '_and_' and checks each component.
         Contradictory combos (long-only + short-only) return [] (skip).
         """
+        # Accept coded regimes (rename rollout): decode code→real, real passes through.
+        if isinstance(filter_name, str):
+            filter_name = _obf().decode_regime_tolerant(filter_name)
         parts = filter_name.split("_and_") if "_and_" in filter_name else [filter_name]
         needs_long = False
         needs_short = False
@@ -108,6 +117,44 @@ class AgamottoResearch:
         if needs_short:
             return ["short"]
         return ["long", "short"]
+
+    # Canonical base regime list (moved out of the public marvel generator so
+    # the real names live only in the obfuscated package). `baseline` excluded —
+    # removed 2026-06-18 (see CLAUDE.md). NOTE: `_and_` composites are built from
+    # the atoms in _apply_filter_mask; allowed_positions enforces directionality.
+    BASE_REGIMES = [
+        "vol_breakout",
+        "vol_breakout_and_strong_trend", "vol_breakout_and_ma_momentum",
+        "vol_breakout_and_above_all_mas", "vol_breakout_and_rsi_oversold",
+        "vol_breakout_and_rsi_overbought", "vol_breakout_and_macd_bullish",
+        "vol_breakout_and_macd_bearish", "vol_breakout_and_cci_reversal",
+        "vol_breakout_and_adx_trend", "vol_breakout_and_bb_rebound",
+        "vol_breakout_and_mom_positive", "vol_breakout_and_strong_candle",
+        "vol_breakout_and_near_ma", "vol_breakout_and_stoch_bullish",
+        "high_volume_and_strong_trend", "high_volume_and_ma_momentum",
+        "high_volume_and_above_all_mas", "high_volume_and_rsi_oversold",
+        "high_volume_and_rsi_overbought", "high_volume_and_macd_bullish",
+        "high_volume_and_macd_bearish", "high_volume_and_cci_reversal",
+        "high_volume_and_adx_trend", "high_volume_and_bb_rebound",
+        "high_volume_and_mom_positive", "high_volume_and_strong_candle",
+        "low_volume_and_strong_trend", "low_volume_and_ma_momentum",
+        "low_volume_and_above_all_mas", "low_volume_and_rsi_oversold",
+        "low_volume_and_bb_rebound", "low_volume_and_cci_reversal",
+    ]
+
+    @classmethod
+    def regime_stack(cls) -> list[dict]:
+        """Coded [{regime, position}] for every base regime × allowed position.
+
+        Regime names are returned OBFUSCATED (structure preserved) so the public
+        marvel generator that writes regime_stack.csv never handles real names.
+        """
+        c = _obf()
+        rows = []
+        for regime in cls.BASE_REGIMES:
+            for pos in cls.allowed_positions(regime):
+                rows.append({"regime": c.encode_regime(regime), "position": pos})
+        return rows
 
     def __init__(self, config: Dict[str, object], home_root: str) -> None:
         self.config = config
@@ -750,6 +797,11 @@ class AgamottoResearch:
             if filter_name.startswith("__"):
                 return pd.Series(True, index=df.index)
 
+            # Accept coded regimes (rename rollout): decode code→real before the
+            # real-name `filter_name == "..."` chain. Real names pass through;
+            # genuinely-unknown tokens still hit the strict raise below.
+            filter_name = _obf().decode_regime_tolerant(filter_name)
+
             # Support complex strings like "filterA_and_filterB" or "filterA_or_filterB"
             if "_and_" in filter_name:
                 parts = filter_name.split("_and_")
@@ -1016,15 +1068,23 @@ class AgamottoResearch:
             
             save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
             try:
+                # Obfuscation: persist feature columns under opaque codes (real
+                # name -> code, TF prefix preserved). Targets / metadata / OHLCV
+                # are not in the feature map and pass through unchanged. Done at
+                # write only — the in-memory frame keeps real names. Downstream
+                # (select_feature_columns, training, meta.pkl, preds) inherits the
+                # coded schema, so the public marvel repo never sees real names.
+                _to_save = filtered_subset.rename(
+                    columns=_obf().encode_columns(filtered_subset.columns))
                 # Narrow float64 feature columns to float32 (the rolling trainer
                 # casts to float32 on load anyway) + zstd — roughly halves the
                 # filter parquet with zero training impact. Only float64 columns
                 # are cast, so integer/timestamp columns keep full precision.
                 _f64_to_f32 = {
-                    c: "float32" for c in filtered_subset.columns
-                    if filtered_subset[c].dtype == "float64"
+                    c: "float32" for c in _to_save.columns
+                    if _to_save[c].dtype == "float64"
                 }
-                filtered_subset.astype(_f64_to_f32).to_parquet(
+                _to_save.astype(_f64_to_f32).to_parquet(
                     save_path, index=False, compression="zstd",
                 )
                 # logger.info(f"Saved filtered signals for {regime_id} to {save_path}")

@@ -58,8 +58,170 @@ _RETURN_COLUMNS = [
 _TF_PREFIXES = ("15m_", "1h_", "4h_", "1d_")
 
 
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from ._obf.codec import default
+    return default()
+
+
+# ── Regime definitions (moved out of the public marvel generator so real names
+#    live only in the obfuscated package). generate_regime_stack() returns coded,
+#    structure-preserving regime names. `baseline` banned (see CLAUDE.md). ──────
+_ORB_BASE_FILTERS = [
+    "strong_trend", "ma_momentum", "above_all_mas",
+    "low_vol", "high_vol", "strong_candle", "near_ma",
+    "rsi_oversold", "rsi_overbought",
+    "macd_bullish", "macd_bearish",
+    "stoch_bullish", "cci_reversal", "adx_trend",
+    "bb_rebound", "mom_positive",
+    "low_volume", "high_volume", "vol_breakout",
+    "buy_pressure", "sar_aligned",
+    "mfi_oversold", "mfi_overbought",
+    "bop_bullish", "bop_bearish",
+    "roc_positive", "roc_negative",
+]
+_ORB_SAME_TF_VOL_DIR = [
+    ("vol_breakout", "mfi_oversold"), ("vol_breakout", "mfi_overbought"),
+    ("high_volume", "bop_bullish"), ("high_volume", "bop_bearish"),
+    ("low_volume", "roc_positive"), ("low_volume", "roc_negative"),
+]
+_ORB_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+
+def _orb_has_baseline(regime_name: str) -> bool:
+    """True if any conjunct of a (TF-prefixed, _and_-joined) regime is baseline."""
+    for part in regime_name.split("_and_"):
+        toks = part.split("_")
+        base = "_".join(toks[1:]) if toks and toks[0] in ("15m", "1h", "4h", "1d") else part
+        if base == "baseline":
+            return True
+    return False
+
+
 class OrbResearch(AgamottoResearch):
     """Cross-timeframe research: merges 4 TF features into one wide matrix."""
+
+    @classmethod
+    def generate_regime_stack(cls) -> list[dict]:
+        """Coded [{regime, position}] for all Orb cross-TF regimes.
+
+        Builds regimes internally with real atom names (reusing allowed_positions
+        for directionality), drops any baseline conjunct, dedups, then returns
+        OBFUSCATED, structure-preserving regime names so the public marvel
+        generator never handles real names.
+        """
+        def allowed(filters):
+            return cls.allowed_positions("_and_".join(filters))
+
+        regimes: list[dict] = []
+
+        # 1. Single-TF filters on cross-TF data
+        for tf in _ORB_TIMEFRAMES:
+            for filt in _ORB_BASE_FILTERS:
+                for pos in allowed((f"{tf}_{filt}",)):
+                    regimes.append({"regime": f"{tf}_{filt}", "position": pos})
+
+        # 2. Cross-TF compounds (>=1 unidirectional leg)
+        cross_tf_combos = [
+            ("1d_strong_trend", "1h_macd_bullish"), ("1d_strong_trend", "1h_macd_bearish"),
+            ("1d_strong_trend", "1h_rsi_oversold"), ("1d_strong_trend", "1h_rsi_overbought"),
+            ("1d_ma_momentum", "1h_macd_bullish"), ("1d_ma_momentum", "1h_macd_bearish"),
+            ("1d_ma_momentum", "1h_rsi_oversold"), ("1d_ma_momentum", "1h_rsi_overbought"),
+            ("1d_above_all_mas", "1h_macd_bullish"), ("1d_above_all_mas", "1h_macd_bearish"),
+            ("1d_above_all_mas", "1h_rsi_oversold"), ("1d_above_all_mas", "1h_rsi_overbought"),
+            ("4h_strong_trend", "1h_macd_bullish"), ("4h_strong_trend", "1h_macd_bearish"),
+            ("4h_strong_trend", "1h_rsi_oversold"), ("4h_strong_trend", "1h_rsi_overbought"),
+            ("4h_adx_trend", "1h_macd_bullish"), ("4h_adx_trend", "1h_macd_bearish"),
+            ("4h_adx_trend", "1h_rsi_oversold"), ("4h_adx_trend", "1h_rsi_overbought"),
+            ("4h_macd_bullish", "1h_rsi_oversold"), ("4h_macd_bullish", "1h_rsi_overbought"),
+            ("1d_strong_trend", "4h_macd_bullish"), ("1d_strong_trend", "4h_macd_bearish"),
+            ("1d_strong_trend", "4h_rsi_oversold"), ("1d_strong_trend", "4h_rsi_overbought"),
+            ("1d_ma_momentum", "4h_macd_bullish"), ("1d_ma_momentum", "4h_macd_bearish"),
+            ("1d_vol_breakout", "4h_macd_bullish"), ("1d_vol_breakout", "4h_macd_bearish"),
+            ("1d_vol_breakout", "4h_rsi_oversold"), ("1d_vol_breakout", "4h_rsi_overbought"),
+            ("1d_vol_breakout", "1h_macd_bullish"), ("1d_vol_breakout", "1h_macd_bearish"),
+            ("1d_vol_breakout", "1h_rsi_oversold"), ("1d_vol_breakout", "1h_rsi_overbought"),
+            ("4h_vol_breakout", "1h_macd_bullish"), ("4h_vol_breakout", "1h_macd_bearish"),
+            ("4h_vol_breakout", "1h_rsi_oversold"), ("4h_vol_breakout", "1h_rsi_overbought"),
+            ("1d_strong_trend", "4h_vol_breakout", "1h_macd_bullish"),
+            ("1d_strong_trend", "4h_vol_breakout", "1h_macd_bearish"),
+            ("1d_vol_breakout", "4h_vol_breakout", "1h_macd_bullish"),
+            ("1d_vol_breakout", "4h_vol_breakout", "1h_macd_bearish"),
+        ]
+        # 3. Same-TF volume × directional cross products
+        same_tf = [(f"{tf}_{v}", f"{tf}_{d}") for tf in _ORB_TIMEFRAMES
+                   for (v, d) in _ORB_SAME_TF_VOL_DIR]
+        # 4. Cross-TF vol/volatility context + directional signal
+        cross_tf_vol_directional = [
+            ("1d_low_volume", "4h_macd_bullish"), ("1d_low_volume", "4h_macd_bearish"),
+            ("1d_low_volume", "4h_rsi_oversold"), ("1d_low_volume", "4h_rsi_overbought"),
+            ("1d_low_volume", "4h_bop_bullish"), ("1d_low_volume", "4h_bop_bearish"),
+            ("1d_low_volume", "1h_macd_bullish"), ("1d_low_volume", "1h_macd_bearish"),
+            ("1d_low_volume", "1h_rsi_oversold"), ("1d_low_volume", "1h_rsi_overbought"),
+            ("1d_low_volume", "1h_bop_bullish"), ("1d_low_volume", "1h_bop_bearish"),
+            ("1d_low_volume", "1h_mfi_oversold"), ("1d_low_volume", "1h_mfi_overbought"),
+            ("1d_high_volume", "4h_macd_bullish"), ("1d_high_volume", "4h_macd_bearish"),
+            ("1d_high_volume", "4h_rsi_oversold"), ("1d_high_volume", "4h_rsi_overbought"),
+            ("1d_high_volume", "4h_bop_bullish"), ("1d_high_volume", "4h_bop_bearish"),
+            ("1d_high_volume", "1h_macd_bullish"), ("1d_high_volume", "1h_macd_bearish"),
+            ("1d_high_volume", "1h_rsi_oversold"), ("1d_high_volume", "1h_rsi_overbought"),
+            ("1d_high_volume", "1h_bop_bullish"), ("1d_high_volume", "1h_bop_bearish"),
+            ("1d_high_volume", "1h_mfi_oversold"), ("1d_high_volume", "1h_mfi_overbought"),
+            ("4h_low_volume", "1h_macd_bullish"), ("4h_low_volume", "1h_macd_bearish"),
+            ("4h_low_volume", "1h_rsi_oversold"), ("4h_low_volume", "1h_rsi_overbought"),
+            ("4h_low_volume", "1h_bop_bullish"), ("4h_low_volume", "1h_bop_bearish"),
+            ("4h_low_volume", "1h_mfi_oversold"), ("4h_low_volume", "1h_mfi_overbought"),
+            ("4h_low_volume", "1h_stoch_bullish"),
+            ("4h_high_volume", "1h_macd_bullish"), ("4h_high_volume", "1h_macd_bearish"),
+            ("4h_high_volume", "1h_rsi_oversold"), ("4h_high_volume", "1h_rsi_overbought"),
+            ("4h_high_volume", "1h_bop_bullish"), ("4h_high_volume", "1h_bop_bearish"),
+            ("4h_high_volume", "1h_mfi_oversold"), ("4h_high_volume", "1h_mfi_overbought"),
+            ("1d_low_vol", "4h_macd_bullish"), ("1d_low_vol", "4h_macd_bearish"),
+            ("1d_low_vol", "4h_rsi_oversold"), ("1d_low_vol", "4h_rsi_overbought"),
+            ("1d_low_vol", "4h_bop_bullish"), ("1d_low_vol", "4h_bop_bearish"),
+            ("1d_low_vol", "1h_macd_bullish"), ("1d_low_vol", "1h_macd_bearish"),
+            ("1d_low_vol", "1h_rsi_oversold"), ("1d_low_vol", "1h_rsi_overbought"),
+            ("1d_low_vol", "1h_bop_bullish"), ("1d_low_vol", "1h_bop_bearish"),
+            ("1d_low_vol", "1h_mfi_oversold"), ("1d_low_vol", "1h_mfi_overbought"),
+            ("1d_low_vol", "1h_stoch_bullish"),
+            ("1d_high_vol", "4h_macd_bullish"), ("1d_high_vol", "4h_macd_bearish"),
+            ("1d_high_vol", "4h_rsi_oversold"), ("1d_high_vol", "4h_rsi_overbought"),
+            ("1d_high_vol", "1h_macd_bullish"), ("1d_high_vol", "1h_macd_bearish"),
+            ("1d_high_vol", "1h_rsi_oversold"), ("1d_high_vol", "1h_rsi_overbought"),
+            ("1d_high_vol", "1h_bop_bullish"), ("1d_high_vol", "1h_bop_bearish"),
+            ("4h_low_vol", "1h_macd_bullish"), ("4h_low_vol", "1h_macd_bearish"),
+            ("4h_low_vol", "1h_rsi_oversold"), ("4h_low_vol", "1h_rsi_overbought"),
+            ("4h_low_vol", "1h_bop_bullish"), ("4h_low_vol", "1h_bop_bearish"),
+            ("4h_low_vol", "1h_mfi_oversold"), ("4h_low_vol", "1h_mfi_overbought"),
+            ("4h_low_vol", "1h_stoch_bullish"),
+            ("4h_high_vol", "1h_macd_bullish"), ("4h_high_vol", "1h_macd_bearish"),
+            ("4h_high_vol", "1h_rsi_oversold"), ("4h_high_vol", "1h_rsi_overbought"),
+            ("4h_high_vol", "1h_bop_bullish"), ("4h_high_vol", "1h_bop_bearish"),
+        ]
+        # 5. Cross-TF TA-lab combos
+        cross_tf_talab = [
+            ("1d_strong_trend", "1h_bop_bullish"), ("1d_strong_trend", "1h_bop_bearish"),
+            ("1d_vol_breakout", "1h_mfi_oversold"), ("1d_vol_breakout", "1h_mfi_overbought"),
+            ("4h_vol_breakout", "1h_bop_bullish"), ("4h_vol_breakout", "1h_bop_bearish"),
+            ("4h_vol_breakout", "1h_mfi_oversold"), ("4h_vol_breakout", "1h_mfi_overbought"),
+        ]
+        for combo in cross_tf_combos + same_tf + cross_tf_vol_directional + cross_tf_talab:
+            name = "_and_".join(combo)
+            for pos in allowed(combo):
+                regimes.append({"regime": name, "position": pos})
+
+        # Dedup + enforce no-baseline, then obfuscate
+        c = _obf()
+        seen, out = set(), []
+        for r in regimes:
+            if _orb_has_baseline(r["regime"]):
+                continue
+            key = (r["regime"], r["position"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"regime": c.encode_regime(r["regime"]), "position": r["position"]})
+        return out
 
     def __init__(self, config: Dict[str, object], home_root: str) -> None:
         super().__init__(config, home_root)

@@ -106,6 +106,13 @@ echo "==============================================="
 echo "Algos: ${ALGOS[*]}"
 echo ""
 
+# Refresh the vendored obfuscation codec+map inside each package before building,
+# so a deploy never ships a stale map. Single source of truth: obfuscation/.
+echo "Syncing vendored obfuscation codec+map into packages..."
+python "$SCRIPT_DIR/obfuscation/build_map.py"
+python "$SCRIPT_DIR/obfuscation/sync_vendor.py"
+echo ""
+
 # Build phase
 for algo in "${ALGOS[@]}"; do
     build_algo "$algo"
