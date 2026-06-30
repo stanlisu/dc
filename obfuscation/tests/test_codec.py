@@ -79,6 +79,23 @@ def test_feature_structure_preserved(codec, data):
     assert codec.decode_feature(codec.encode_feature(f"15m_{f}")) == f"15m_{f}"
 
 
+def test_feature_roll_suffix_preserved(codec, data):
+    f = next(iter(data["features"]))
+    code = codec.encode_feature_base(f)
+    # roll-stat transform suffix is preserved; only the base is coded
+    for col, want in [
+        (f"{f}_roll30_mean", f"{code}_roll30_mean"),
+        (f"5s_{f}_roll300_std", f"5s_{code}_roll300_std"),
+        (f"30s_{f}", f"30s_{code}"),
+    ]:
+        assert codec.encode_feature(col) == want
+        assert codec.decode_feature(want) == col
+    # encode_columns rename-map handles roll columns + leaves unknown/targets alone
+    cols = [f"5s_{f}_roll30_mean", "ret", "return_long", "timestamp"]
+    m = codec.encode_columns(cols)
+    assert m == {f"5s_{f}_roll30_mean": f"5s_{code}_roll30_mean"}
+
+
 def test_tolerant_decode_accepts_code_and_real(codec, data):
     atoms = list(data["regimes"])
     a, b = atoms[0], atoms[1]

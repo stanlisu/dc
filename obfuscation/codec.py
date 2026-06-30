@@ -28,6 +28,11 @@ _MAP_PATH = Path(__file__).resolve().parent / "map.json"
 _TF_PREFIX = re.compile(r"^(\d+[smhd])_(.+)$")
 _POSITION = re.compile(r"_(long|short)$")
 _AND = "_and_"
+# Generic transform suffix on tick feature columns: a rolling-window stat applied
+# to a base signal, e.g. relative_spread_roll30_mean. The window/stat is a generic
+# transform (not IP), so it is PRESERVED like a TF prefix; only the base signal is
+# coded. <tf>_<base>_roll<w>_<mean|std>  ->  <tf>_<code>_roll<w>_<mean|std>.
+_ROLL_SUFFIX = re.compile(r"(_roll\d+_(?:mean|std))$")
 # Conjunction/disjunction separators between regime atoms. Capturing group so
 # re.split keeps them, letting _map_regime map atoms and pass separators through.
 # No regime atom contains the substring `_and_`/`_or_`, so this never false-splits.
@@ -137,13 +142,22 @@ class Codec:
         return False
 
     # ---- structure-preserving feature names ---------------------------------
+    def _split_feature(self, col: str) -> tuple[str, str, str]:
+        """Split a feature column into (tf_prefix, base, roll_suffix), preserving
+        the generic TF prefix and rolling-stat transform suffix; only `base` maps."""
+        tf, rest = self._split_tf(col)
+        m = _ROLL_SUFFIX.search(rest)
+        if m:
+            return tf, rest[: m.start()], m.group(1)
+        return tf, rest, ""
+
     def encode_feature(self, col: str) -> str:
-        tf, base = self._split_tf(col)
-        return tf + self.encode_feature_base(base)
+        tf, base, suf = self._split_feature(col)
+        return tf + self.encode_feature_base(base) + suf
 
     def decode_feature(self, col: str) -> str:
-        tf, base = self._split_tf(col)
-        return tf + self.decode_feature_base(base)
+        tf, base, suf = self._split_feature(col)
+        return tf + self.decode_feature_base(base) + suf
 
     def encode_columns(self, columns) -> dict[str, str]:
         """Rename-map for a DataFrame: {real_col: coded_col} for KNOWN feature
@@ -153,18 +167,18 @@ class Codec:
         """
         out = {}
         for col in columns:
-            tf, base = self._split_tf(col)
+            tf, base, suf = self._split_feature(col)
             if base in self.features:
-                out[col] = tf + self.features[base]
+                out[col] = tf + self.features[base] + suf
         return out
 
     def decode_columns(self, columns) -> dict[str, str]:
         """Inverse of encode_columns — {coded_col: real_col} for known codes."""
         out = {}
         for col in columns:
-            tf, base = self._split_tf(col)
+            tf, base, suf = self._split_feature(col)
             if base in self._features_rev:
-                out[col] = tf + self._features_rev[base]
+                out[col] = tf + self._features_rev[base] + suf
         return out
 
 

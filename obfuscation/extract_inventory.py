@@ -139,7 +139,7 @@ _HARD_PASSTHROUGH = {
     "quote_volume", "number_of_trades", "taker_buy_base_volume",
     "taker_buy_quote_volume", "regime", "position", "position_type",
     "year", "month", "bar", "type", "asset", "amount", "price", "expiration_dt",
-    "mvg1", "mvg2", "mvg3", "bid_price", "ask_price",
+    "mvg1", "mvg2", "mvg3", "bid_price", "ask_price", "close_timestamp",
 }
 
 
@@ -180,6 +180,20 @@ def main():
     }
     for c in _OPTIONS_PROMOTE:
         feats.setdefault(c, "valkyrie (options IP, promoted)")
+
+    # Tick (mjolnir) IP feature bases that the AST misses because they are
+    # produced via f-string targets (depth_imbalance_L{n}) or only appear as
+    # regime-filter atoms (trade_imbalance). The rolling-stat transforms
+    # (<base>_roll{w}_{mean,std}) are handled structurally by the codec and are
+    # NOT mapped. See codec._ROLL_SUFFIX.
+    _TICK_PROMOTE = {
+        "depth_imbalance_L1", "depth_imbalance_L3", "depth_imbalance_L5",
+        "trade_imbalance", "liq_long_notional", "liq_short_notional",
+    }
+    for c in _TICK_PROMOTE:
+        feats.setdefault(c, "mjolnir (tick IP, promoted)")
+    # Raw / exchange-standard tick columns (never IP) -> passthrough.
+    _HARD_PASSTHROUGH.update({"ask_amount", "bid_amount", "index_price", "n_trades"})
 
     drop = (passthrough | _HARD_PASSTHROUGH) - _OPTIONS_PROMOTE
     feat_names = sorted(k for k in feats if k not in drop)
