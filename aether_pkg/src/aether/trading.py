@@ -15,6 +15,7 @@ from agamotto.utils import (
 )
 
 from .research import AetherResearch
+from agamotto.research import _obf
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,9 @@ class AetherTrading(AetherResearch):
         target_ts = self.vertical_features["timestamp"].max()
         latest = self.vertical_features[
             self.vertical_features["timestamp"] == target_ts].copy()
+        # Obfuscation: add coded aliases so the feature_columns selection + scaler
+        # name-check match either coded (new) or real (old) weights.
+        latest = _obf().add_feature_aliases(latest)
 
         y_pred: Dict[str, Dict[str, float]] = {"long": {}, "short": {}}
         for position in ["long", "short"]:

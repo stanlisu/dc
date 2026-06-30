@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from .utils import _symbol_to_native, _timeframe_to_seconds, _round_down_to_timeframe_boundary
-from .research import AgamottoResearch
+from .research import AgamottoResearch, _obf
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
@@ -576,6 +576,12 @@ class AgamottoTrading(AgamottoResearch):
         if target_row.empty:
             # logger.debug(f"No data found for target timestamp {target_ts} in regime {regime.get('id')}")
             return pd.DataFrame()
+
+        # Obfuscation: live features are computed with REAL names; the model's
+        # meta.feature_columns + scaler are CODED (or REAL for pre-rollout
+        # weights). Add coded aliases so the selection + scaler name-check match
+        # either namespace.
+        target_row = _obf().add_feature_aliases(target_row)
 
         # 2. Run prediction
         try:

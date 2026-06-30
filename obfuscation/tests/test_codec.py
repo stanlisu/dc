@@ -96,6 +96,22 @@ def test_feature_roll_suffix_preserved(codec, data):
     assert m == {f"5s_{f}_roll30_mean": f"5s_{code}_roll30_mean"}
 
 
+def test_add_feature_aliases_both_namespaces(codec, data):
+    import pandas as pd
+    f = next(iter(data["features"]))
+    code = codec.encode_feature_base(f)
+    df = pd.DataFrame({f: [1.0, 2.0], "ret": [0.1, 0.2], "timestamp": [1, 2]})
+    out = codec.add_feature_aliases(df)
+    # both real and coded selectable; non-feature cols untouched; values aliased
+    assert f in out.columns and code in out.columns
+    assert "ret" in out.columns and "timestamp" in out.columns
+    assert list(out[code]) == list(out[f]) == [1.0, 2.0]
+    # Series (mjolnir per-bar row) path
+    s = df.iloc[0]
+    so = codec.add_feature_aliases(s)
+    assert f in so.index and code in so.index and so[code] == so[f]
+
+
 def test_tolerant_decode_accepts_code_and_real(codec, data):
     atoms = list(data["regimes"])
     a, b = atoms[0], atoms[1]

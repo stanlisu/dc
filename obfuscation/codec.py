@@ -181,6 +181,40 @@ class Codec:
                 out[col] = tf + self._features_rev[base] + suf
         return out
 
+    def add_feature_aliases(self, obj):
+        """Add coded-name ALIAS columns alongside the real feature columns so a
+        predict can select EITHER coded (new weights) or real (old weights)
+        feature_columns during the rename rollout — and the scaler's name-check
+        (feature_names_in_) matches whichever namespace meta uses. Accepts a
+        DataFrame (columns) or a Series (index, e.g. mjolnir's per-bar row).
+        Returns a copy; real columns + non-feature columns are left untouched.
+        """
+        import pandas as pd
+        is_series = isinstance(obj, pd.Series)
+        names = obj.index if is_series else obj.columns
+        mapping = self.encode_columns(names)
+        if not mapping:
+            return obj
+        obj = obj.copy()
+        have = set(obj.index if is_series else obj.columns)
+        for real, coded in mapping.items():
+            if coded not in have:
+                obj[coded] = obj[real]
+        return obj
+
+    def decode_feature_columns(self, columns) -> list[str]:
+        """Real-name list for a coded feature_columns list, ORDER PRESERVED.
+
+        Known codes -> real; unknown / passthrough names pass through unchanged.
+        Use at the LIVE / reproduction predict boundary to reconcile a coded
+        meta.feature_columns against a freshly-computed REAL-named feature frame:
+        select these columns from the real frame, then scale/predict (the scaler
+        and model use values in this order, so names don't matter past selection).
+        Do NOT use on the research path — there the frame is already coded.
+        """
+        m = self.decode_columns(columns)
+        return [m.get(c, c) for c in columns]
+
 
 _DEFAULT: Codec | None = None
 
