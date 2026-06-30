@@ -142,8 +142,33 @@ class AgamottoResearch:
         "low_volume_and_bb_rebound", "low_volume_and_cci_reversal",
     ]
 
+    # Comprehensive IC-sweep filter set (moved out of the public research_sweep.py
+    # so real names live only here). `baseline` excluded (see CLAUDE.md).
+    _SWEEP_VOL_FILTERS = ["low_volume", "high_volume", "vol_breakout"]
+    _SWEEP_TECH_FILTERS = [
+        "above_all_mas", "rsi_oversold", "rsi_overbought",
+        "cci_reversal", "bb_rebound", "macd_bullish", "macd_bearish",
+        "stoch_bullish", "adx_trend", "mom_positive", "strong_trend",
+        "ma_momentum", "near_ma", "strong_candle",
+    ]
+
     @classmethod
-    def regime_stack(cls) -> list[dict]:
+    def comprehensive_sweep_regimes(cls) -> list[str]:
+        """Coded regime names for the 'comprehensive' alpha sweep: each vol and
+        tech atom plus every vol×tech `_and_` combo. Obfuscated (structure
+        preserved) so the public sweep driver never holds real names.
+        """
+        c = _obf()
+        names = (
+            cls._SWEEP_VOL_FILTERS
+            + cls._SWEEP_TECH_FILTERS
+            + [f"{v}_and_{t}" for v in cls._SWEEP_VOL_FILTERS
+               for t in cls._SWEEP_TECH_FILTERS]
+        )
+        return [c.encode_regime(n) for n in names]
+
+    @classmethod
+    def generate_regime_stack(cls) -> list[dict]:
         """Coded [{regime, position}] for every base regime × allowed position.
 
         Regime names are returned OBFUSCATED (structure preserved) so the public
