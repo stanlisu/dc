@@ -12,6 +12,12 @@ from __future__ import annotations
 import pandas as pd
 
 
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from .._obf.codec import default
+    return default()
+
+
 def apply_filter_mask(
     df: pd.DataFrame,
     filter_name,
@@ -46,6 +52,9 @@ def apply_filter_mask(
     # --- String composition ---
     if isinstance(filter_name, str):
         name = filter_name.lower().strip()
+        # Accept coded regimes (rename rollout): decode code->real before the
+        # real-name named_filter() chain; real names pass through unchanged.
+        name = _obf().decode_regime_tolerant(name)
         if "_and_" in name:
             parts = name.split("_and_")
             mask = None

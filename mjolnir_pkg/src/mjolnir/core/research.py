@@ -71,6 +71,12 @@ _META_COLS = {
 _DEFAULT_FEATURE_WINDOWS = (30, 60, 300, 900)
 
 
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from .._obf.codec import default
+    return default()
+
+
 class MjolnirResearch:
     """Research pipeline for Mjolnir tick-data ML.
 
@@ -82,6 +88,54 @@ class MjolnirResearch:
         config:    Dictionary loaded from setting.json.
         home_root: Repository root directory.
     """
+
+    # Regime definitions moved out of the public marvel generator so real names
+    # live only here. `baseline` deliberately excluded (banned, and the most
+    # expensive parquet — every bar). See CLAUDE.md.
+    _BASE_REGIMES = [
+        "high_liquidation_pressure", "funding_positive", "funding_negative",
+        "deep_book", "trade_imbalance", "basis_premium", "basis_discount",
+        "oi_expansion", "oi_contraction", "ofi_positive", "tight_spread",
+        "wide_spread",
+    ]
+    # Directional regimes: condition is position-independent AND already encodes a
+    # market direction, so only the matching side is built (e.g. funding_negative
+    # -> short only). Regimes absent here keep BOTH sides.
+    _REGIME_SIDES = {
+        "funding_positive": ["long"], "funding_negative": ["short"],
+        "basis_premium": ["long"], "basis_discount": ["short"],
+        "oi_expansion": ["long"], "oi_contraction": ["short"],
+    }
+
+    @classmethod
+    def generate_regime_stack(cls, config: Optional[Dict] = None) -> List[Dict]:
+        """Coded [{regime, position}] for the Mjolnir regime stack.
+
+        Optional subset (real names): the MJOLNIR_REGIME_SUBSET env var takes
+        precedence; otherwise config['REGIME_SUBSET'] (the durable form written
+        by /deploy). Each is validated against the base set. Regime names are
+        returned OBFUSCATED so the public generator never handles real names.
+        """
+        base = list(cls._BASE_REGIMES)
+        env = os.environ.get("MJOLNIR_REGIME_SUBSET")
+        if env:
+            sub, src = [r.strip() for r in env.split(",") if r.strip()], "MJOLNIR_REGIME_SUBSET"
+        elif config and config.get("REGIME_SUBSET"):
+            sub = [r.strip() for r in str(config["REGIME_SUBSET"]).split(",") if r.strip()]
+            src = "REGIME_SUBSET (setting.json)"
+        else:
+            sub = None
+        if sub is not None:
+            unknown = [r for r in sub if r not in base]
+            if unknown:
+                raise ValueError(f"{src} has unknown regimes {unknown!r}; valid: {base}")
+            base = sub
+        c = _obf()
+        rows = []
+        for regime in base:
+            for pos in cls._REGIME_SIDES.get(regime, ["long", "short"]):
+                rows.append({"regime": c.encode_regime(regime), "position": pos})
+        return rows
 
     def __init__(self, config: Dict, home_root: str) -> None:
         self.config = config
@@ -540,6 +594,9 @@ class MjolnirResearch:
                     chunk["ret"] = chunk[ret_col]
                     if ret_raw_col in chunk.columns:
                         chunk["ret_raw"] = chunk[ret_raw_col]
+                    # Obfuscation: code feature columns before write (mirrors the
+                    # streaming path; targets/metadata pass through unchanged).
+                    chunk = chunk.rename(columns=_obf().encode_columns(chunk.columns))
                     table = pa.Table.from_pandas(chunk, preserve_index=False)
                     if writer is None:
                         writer = pq.ParquetWriter(save_path, table.schema)

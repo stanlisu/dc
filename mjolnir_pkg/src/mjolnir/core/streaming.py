@@ -23,6 +23,12 @@ from .features import MjolnirFeatures, _TF_SECONDS
 from .multi_tf_merge import merge_cross_tf_features
 from .regime_filters import apply_filter_mask
 from .ladder import compute_ladder_returns
+
+
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from .._obf.codec import default
+    return default()
 from .utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -378,6 +384,11 @@ def write_symbol_to_filters(
         chunk["ret"] = chunk[ret_col]
         if ret_raw_col in chunk.columns:
             chunk["ret_raw"] = chunk[ret_raw_col]
+
+        # Obfuscation: persist feature columns under opaque codes (TF prefix +
+        # rolling-stat suffix preserved). Targets/metadata/OHLCV aren't in the
+        # feature map and pass through unchanged. Coded schema flows to meta/preds.
+        chunk = chunk.rename(columns=_obf().encode_columns(chunk.columns))
 
         table = pa.Table.from_pandas(chunk, preserve_index=False)
         del chunk
