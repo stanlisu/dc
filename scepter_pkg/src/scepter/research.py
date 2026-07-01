@@ -62,7 +62,13 @@ class ScepterResearch(OrbResearch):
             raise KeyError("ANCHOR_SYMBOLS is required in config but not set")
         self.anchor_symbols: list[str] = config["ANCHOR_SYMBOLS"]
         self.anchor_windows: list[int] = config.get("ANCHOR_WINDOWS", [14, 28])
-        self.anchor_regimes: dict = config.get("ANCHOR_REGIMES", {})
+        # Anchor keys may be given as CODES or real names; normalise to real
+        # (code->real, real->real) so _apply_filter_mask's real base_name lookup
+        # works while committed configs can use obfuscated codes.
+        self.anchor_regimes: dict = {
+            _obf().decode_regime_tolerant(k): v
+            for k, v in config.get("ANCHOR_REGIMES", {}).items()
+        }
 
         # Expand SYMBOLS to include anchors for loading/feature engineering.
         # Anchors are excluded from verticalization (not prediction targets).

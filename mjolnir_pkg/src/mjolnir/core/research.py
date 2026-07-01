@@ -125,12 +125,16 @@ class MjolnirResearch:
             src = "REGIME_SUBSET (setting.json)"
         else:
             sub = None
+        c = _obf()
         if sub is not None:
+            # Accept subsets given as CODES or real names: decode tolerantly
+            # (code->real, real->real) so committed configs/scripts can use
+            # obfuscated codes while validation stays against the real base set.
+            sub = [c.decode_regime_tolerant(r) for r in sub]
             unknown = [r for r in sub if r not in base]
             if unknown:
                 raise ValueError(f"{src} has unknown regimes {unknown!r}; valid: {base}")
             base = sub
-        c = _obf()
         rows = []
         for regime in base:
             for pos in cls._REGIME_SIDES.get(regime, ["long", "short"]):
