@@ -280,6 +280,12 @@ class StreamAligner:
         df["amount"] = pd.to_numeric(df.get("amount", pd.Series(np.nan)), errors="coerce")
         df["notional"] = df["price"] * df["amount"]
 
+        # CANONICAL liquidation-side convention (DO NOT FLIP): Tardis side==buy -> long
+        # liquidation, side==sell -> short. This is the definition every historical bar
+        # and every trained model was built on; flipping it desyncs the entire bar corpus
+        # and breaks live inference until ALL bars are rebuilt and ALL models retrained.
+        # (Note: opposite of the Binance forceOrder textbook meaning; intentional, verified
+        # against the prod corpus 2026-07-02.)
         is_long_liq = df["side"].str.lower().isin(["buy", "b"]) if "side" in df.columns else pd.Series(False, index=df.index)
 
         agg = df.groupby("bar").agg(liq_total_count=("amount", "count"))
