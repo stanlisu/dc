@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 from .features import MjolnirFeatures, _TF_SECONDS
@@ -34,6 +35,64 @@ logger = logging.getLogger(__name__)
 # 100_000 here means newly-produced filter parquets skip the rewrite
 # step entirely. Keep these two constants aligned.
 _FILTER_ROW_GROUP_SIZE = 100_000
+
+# Bucket region for s3:// filter writes (Route B). The `tardis-stan-data`
+# bucket lives in ap-northeast-1; overridable via env for a moved/mirrored
+# bucket. This is a bucket-location constant, not a strategy/PnL config, so a
+# named default here does not violate the CLAUDE.md "no magic-number config
+# defaults" rule (which targets FEE/CAPITAL/thresholds).
+_S3_REGION = os.environ.get("MJOLNIR_S3_REGION", "ap-northeast-1")
+
+
+def _is_s3(path) -> bool:
+    """True if ``path`` is an ``s3://`` URI (Route B direct-to-S3 filter write)."""
+    return str(path).startswith("s3://")
+
+
+def _s3_key(uri: str) -> str:
+    """``s3://bucket/prefix`` -> ``bucket/prefix``.
+
+    pyarrow's ``S3FileSystem`` addresses objects by a bucket-qualified key
+    (``bucket/key``), NOT a bare key — mirrors stan_sim/scripts/build_bars.py.
+    """
+    return uri[len("s3://"):].rstrip("/")
+
+
+def _open_s3fs() -> "pafs.S3FileSystem":
+    """Open an ``S3FileSystem`` using the DEFAULT AWS credential chain.
+
+    No creds file (unlike build_bars.py's ``s3_fs()``): the ``stan`` user's
+    default AWS creds (``us-s3-rw-user``) already grant write to
+    ``tardis-stan-data``. Fails LOUDLY on any init/credential/region error —
+    per CLAUDE.md there is NO fallback to the local filesystem for an s3://
+    request; a broken S3 config must abort the run, not silently write local.
+    """
+    try:
+        fs = pafs.S3FileSystem(region=_S3_REGION)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to init S3FileSystem(region={_S3_REGION!r}) for s3:// filter "
+            f"writes via the default AWS credential chain: {exc!r}. Refusing to "
+            "fall back to local (CLAUDE.md: no silent fallbacks)."
+        ) from exc
+    return fs
+
+
+def _s3_delete_quiet(s3fs: "pafs.S3FileSystem", key: str) -> None:
+    """Best-effort delete of an S3 object (used only on the abort/empty paths).
+
+    Guarded so a missing object is a no-op. WHY (swallow is safe): this runs
+    only in cleanup — either the streaming loop already raised (that exception
+    is what callers must see, not a secondary delete failure) or we are dropping
+    a legitimately-empty 0-row filter. A delete failure here leaves at most a
+    stray object; it never masks the primary error.
+    """
+    try:
+        info = s3fs.get_file_info(key)
+        if info.type != pafs.FileType.NotFound:
+            s3fs.delete_file(key)
+    except Exception as exc:
+        logger.warning("failed to delete s3 object %s: %s", key, exc)
 
 
 def _widen_ints_to_float(table: pa.Table) -> pa.Table:
@@ -177,8 +236,19 @@ def stream_filter_parquets(
 
     reverse = int(config.get("REVERSE", 1))
 
-    save_dir = os.path.join(out_dir, "filter")
-    os.makedirs(save_dir, exist_ok=True)
+    # Route B: write filter parquets DIRECTLY to S3 via S3FileSystem when
+    # out_dir is an s3:// URI (bypasses the read-only s3fs mount). Local paths
+    # keep the byte-for-byte-unchanged local-FS path below.
+    if _is_s3(out_dir):
+        s3fs = _open_s3fs()
+        # S3 has no directories — nothing to mkdir. save_dir is a bucket-
+        # qualified key prefix ("bucket/prefix/filter").
+        save_dir = f"{_s3_key(out_dir)}/filter"
+        logger.info("Route B: streaming filters directly to s3://%s", save_dir)
+    else:
+        s3fs = None
+        save_dir = os.path.join(out_dir, "filter")
+        os.makedirs(save_dir, exist_ok=True)
 
     # Per-(regime, position) writer state. Keys are (regime_name_str, position).
     # Value is a dict: {writer, schema, tmp_path, final_path, n_rows}.
@@ -301,6 +371,7 @@ def stream_filter_parquets(
                 reverse=reverse,
                 apply_mask_fn=apply_mask_fn,
                 config=config,
+                s3fs=s3fs,
             )
 
             del feats
@@ -340,12 +411,18 @@ def write_symbol_to_filters(
     reverse: int,
     apply_mask_fn: Callable,
     config: Dict,
+    s3fs: Optional["pafs.S3FileSystem"] = None,
 ) -> None:
     """For one symbol's vertical features, append a row group per regime.
 
     Lazily opens a ParquetWriter per (regime_name_str, position) on first
     non-empty slice. Schema is captured from that first table; subsequent
     symbols MUST have the same schema or we raise (no silent column drift).
+
+    When ``s3fs`` is provided (Route B), ``save_dir`` is a bucket-qualified S3
+    key prefix and each writer targets the FINAL key directly (S3 multipart
+    upload is atomic — the object only becomes visible on ``close()``), so the
+    ``.tmp``->rename dance used for the local FS is unnecessary.
     """
     for regime in regime_stack:
         if "regime" not in regime:
@@ -402,13 +479,25 @@ def write_symbol_to_filters(
                 c if c.isalnum() or c == "_" else "_"
                 for c in f"{clean}_{position}"
             )
-            final_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
-            tmp_path = final_path + ".tmp"
-            # If a prior aborted run left a stale .tmp, clear it so the
-            # ParquetWriter starts fresh.
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            writer = pq.ParquetWriter(tmp_path, table.schema, compression="zstd")
+            if s3fs is not None:
+                # Write DIRECTLY to the final S3 key. The multipart upload is
+                # atomic: the object appears only on a successful close(), so no
+                # partial/torn parquet can be picked up mid-write and no .tmp
+                # staging is needed. Abort/empty cleanup deletes the final key
+                # (see finalise_writers).
+                final_path = f"{save_dir}/filter_{safe_name}.parquet"
+                tmp_path = None
+                writer = pq.ParquetWriter(
+                    final_path, table.schema, compression="zstd", filesystem=s3fs,
+                )
+            else:
+                final_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
+                tmp_path = final_path + ".tmp"
+                # If a prior aborted run left a stale .tmp, clear it so the
+                # ParquetWriter starts fresh.
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                writer = pq.ParquetWriter(tmp_path, table.schema, compression="zstd")
             state = {
                 "writer": writer,
                 "schema": table.schema,
@@ -416,6 +505,7 @@ def write_symbol_to_filters(
                 "final_path": final_path,
                 "n_rows": 0,
                 "safe_name": safe_name,
+                "s3fs": s3fs,
             }
             writers[key] = state
         else:
@@ -466,7 +556,15 @@ def finalise_writers(
     Called from the streaming loop's ``finally`` so no tmp files leak.
 
     On ``success=True``:
-      - Close each writer.
+      - Close each writer. A ``close()`` failure here is FATAL: on S3 it means
+        the CompleteMultipartUpload never published the object (so n_rows>0 but
+        nothing landed); on local it means the ``.tmp`` lacks a valid footer.
+        Publishing/renaming either would promote a failed write to canonical and
+        make the downstream merge silently miss that regime's rows. So a
+        success-path close() failure is collected, the artifact is best-effort
+        deleted (never published), and a RuntimeError is re-raised after
+        finalising the remaining writers so ``run_research`` exits non-zero and
+        the sharded driver aborts before merge.
       - Rename the .tmp to its canonical ``filter_*.parquet`` path.
       - Drop the .tmp if zero rows were ever written (legitimate empty filter).
 
@@ -480,26 +578,67 @@ def finalise_writers(
         "no silent fallbacks", a torn write must fail loudly -- and the
         simplest "loud" signal is for the canonical file to simply not exist.
     """
+    # Success-path close() failures collected here and re-raised at the end so
+    # every writer is finalised first (no leaked open handles) but the run still
+    # fails loud.
+    close_failures: List[Tuple[str, Exception]] = []
     for key, state in list(writers.items()):
+        close_ok = True
         try:
             state["writer"].close()
         except Exception as exc:
-            # WHY: best-effort cleanup; if we are in the failure branch the
-            # original exception is what callers care about, and even on
-            # the success branch a close failure here just leaves a .tmp
-            # we will handle below. Logging at warning is enough — do not
-            # re-raise (we still need to process the rest of the writers).
-            logger.warning(
-                "Failed to close ParquetWriter for %s: %s",
-                state["safe_name"], exc,
-            )
+            close_ok = False
+            if success:
+                # SUCCESS PATH: close() failure is FATAL — the object was NOT
+                # published (S3 multipart not completed) / the local footer was
+                # not written. Do NOT log "Saved", do NOT rename/publish. Record
+                # it, drop any partial artifact below, and re-raise after the loop.
+                logger.error(
+                    "FATAL: ParquetWriter.close() failed for %s on the success "
+                    "path — refusing to publish this filter (unpublished/torn "
+                    "write): %s",
+                    state["safe_name"], exc,
+                )
+                close_failures.append((state["safe_name"], exc))
+            else:
+                # WHY: abort branch — the original exception is what callers care
+                # about; we delete the (unpublished/torn) artifact below anyway,
+                # so a secondary close failure must NOT mask the primary error.
+                logger.warning(
+                    "Failed to close ParquetWriter for %s: %s",
+                    state["safe_name"], exc,
+                )
 
         tmp_path = state["tmp_path"]
         final_path = state["final_path"]
+        s3fs = state.get("s3fs")
+
+        if success and not close_ok:
+            # Success path but this writer's close() failed: never publish. Best-
+            # effort delete of any partial/unpublished artifact so a torn write
+            # can't masquerade as real data, then move on (we re-raise below).
+            if s3fs is not None:
+                _s3_delete_quiet(s3fs, final_path)
+            elif tmp_path is not None and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError as exc:
+                    # WHY: cleanup is best-effort; the RuntimeError we re-raise
+                    # at the end of the loop is what fails the run loud.
+                    logger.warning(
+                        "Failed to remove partial tmp %s: %s", tmp_path, exc,
+                    )
+            continue
 
         if not success:
-            # Failure path: discard partial tmp, never rename to canonical.
-            if os.path.exists(tmp_path):
+            # Failure path: never leave a canonical filter behind.
+            if s3fs is not None:
+                # close() above completed the multipart, so a truncated-but-
+                # valid parquet now exists at the final key — delete it so a
+                # torn write can't masquerade as real data (CLAUDE.md: no
+                # silent fallbacks; a torn write must fail loudly / not exist).
+                _s3_delete_quiet(s3fs, final_path)
+            elif os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError as exc:
@@ -511,17 +650,29 @@ def finalise_writers(
                     )
             logger.warning(
                 "crashed mid-write — discarded partial filter %s",
-                tmp_path,
+                final_path if s3fs is not None else tmp_path,
             )
             continue
 
         if state["n_rows"] == 0:
-            # No rows ever written — drop the tmp file.
-            if os.path.exists(tmp_path):
+            # No rows ever written — drop the empty artifact.
+            if s3fs is not None:
+                # close() wrote an empty (0-row) parquet object; remove it.
+                _s3_delete_quiet(s3fs, final_path)
+            elif os.path.exists(tmp_path):
                 os.remove(tmp_path)
             logger.info(
                 "Filter %s produced 0 rows; not writing parquet.",
                 state["safe_name"],
+            )
+            continue
+
+        if s3fs is not None:
+            # S3 multipart already finalised the object atomically on close();
+            # nothing to rename.
+            logger.info(
+                "Saved filter %s (%d rows) -> s3://%s",
+                state["safe_name"], state["n_rows"], final_path,
             )
             continue
         try:
@@ -535,3 +686,15 @@ def finalise_writers(
                 "Failed to rename %s -> %s: %s",
                 tmp_path, final_path, exc,
             )
+
+    if close_failures:
+        names = ", ".join(n for n, _ in close_failures)
+        raise RuntimeError(
+            f"ParquetWriter.close() failed on the success path for "
+            f"{len(close_failures)} filter(s) [{names}] — these regimes were NOT "
+            "published (S3 CompleteMultipartUpload not completed / local parquet "
+            "footer not written) and their partial artifacts were deleted. "
+            "Failing the run so run_research exits non-zero and the sharded "
+            "driver aborts before merge (CLAUDE.md: no silent fallbacks — a "
+            "failed write must never be reported as a saved filter)."
+        ) from close_failures[0][1]

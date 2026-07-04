@@ -516,6 +516,18 @@ class MjolnirResearch:
             ret_col, ret_raw_col = "return_short", "return_short_raw"
 
         if save and out_dir:
+            # Route B (s3://) is implemented ONLY on the per-symbol streaming
+            # path (stream_filter_parquets), which is what create() — and thus
+            # the sharded regen — uses. This chunked filter_signals(save=True)
+            # path is the separate gauntlet/regenerate_filter.py route and is
+            # local-FS only. Fail LOUD rather than silently mis-writing a
+            # local-FS parquet to an s3:// key (CLAUDE.md: no silent fallbacks).
+            if str(out_dir).startswith("s3://"):
+                raise NotImplementedError(
+                    "filter_signals(save=True) does not support s3:// out_dir; "
+                    "use the streaming create() path (run_research.py) for Route B "
+                    f"S3 writes. Got out_dir={out_dir!r}."
+                )
             clean = regime_name_str.replace("_long", "").replace("_short", "")
             safe_name = "".join(
                 c if c.isalnum() or c == "_" else "_"
@@ -577,7 +589,11 @@ class MjolnirResearch:
             self.load()
 
         out_dir = self._resolve_out_dir()
-        os.makedirs(out_dir, exist_ok=True)
+        # Route B: an s3:// OUTPUT_DIR has no directories to create — the
+        # streaming writer opens objects directly via S3FileSystem. Only mkdir
+        # for local paths (prod ubuntu-on-mount is unchanged).
+        if not str(out_dir).startswith("s3://"):
+            os.makedirs(out_dir, exist_ok=True)
 
         # Load regime stack BEFORE engineering — fail fast on misconfig.
         regime_stack = self._load_regime_stack(out_dir)
@@ -637,7 +653,11 @@ class MjolnirResearch:
         else:
             project = self.config.get("PROJECT", "mjolnir/gauntlet")
             out_dir = os.path.join(project, f"pred_{version}")
-        if not os.path.isabs(out_dir):
+        # Route B: an s3:// URI is already absolute (bucket-qualified) — do NOT
+        # prepend home_root (os.path.isabs("s3://...") is False, which would
+        # otherwise mangle it into "<home_root>/s3://..." and drop it back onto
+        # the local FS).
+        if not str(out_dir).startswith("s3://") and not os.path.isabs(out_dir):
             out_dir = os.path.join(self.home_root, out_dir)
         return out_dir
 
