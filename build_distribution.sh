@@ -73,10 +73,12 @@ build_algo() {
         echo "  Copied _obf/map.json"
     fi
 
-    # Copy setup.py and patch it to include binary files
+    # Copy setup.py and patch it to include binary files + the _obf/map.json
+    # codec data (pip drops non-listed data files; without "*.json" the vendored
+    # map never reaches site-packages and codec.py fails to load).
     echo "  Copying setup files..."
     cp "$pkg_dir/setup.py" "$build_dir/"
-    sed -i '' 's/python_requires=">=3.7",/python_requires=">=3.7", package_data={"": ["*.so", "*.dylib", "*.dll"]}, zip_safe=False,/g' "$build_dir/setup.py"
+    sed -i '' 's/python_requires=">=3.7",/python_requires=">=3.7", package_data={"": ["*.so", "*.dylib", "*.dll", "*.json"]}, zip_safe=False,/g' "$build_dir/setup.py"
 
     # Copy README if exists
     if [ -f "$pkg_dir/README.md" ]; then
