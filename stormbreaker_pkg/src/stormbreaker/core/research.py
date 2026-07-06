@@ -23,6 +23,12 @@ import pandas as pd
 from mjolnir.core.research import MjolnirResearch
 from stormbreaker.core.filters import apply_filter, is_tick_filter
 
+
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from .._obf.codec import default
+    return default()
+
 logger = logging.getLogger(__name__)
 
 # TF strings in longest-first order so "15s" is tried before "5s"
@@ -40,6 +46,54 @@ class StormBreakerResearch(MjolnirResearch):
         config:    Dictionary loaded from setting.json.
         home_root: Repository root directory.
     """
+
+    # Bar frequencies + cross-TF context/signal pairs (moved out of the public
+    # marvel generator so real regime names live only here).
+    _ALL_TFS = ["5s", "15s", "30s", "1m", "5m", "15m"]
+    _TF_PAIRS = [
+        ("15s", "5s"), ("1m", "5s"), ("1m", "15s"), ("5m", "15s"),
+        ("5m", "30s"), ("15m", "30s"), ("5m", "1m"), ("15m", "1m"),
+    ]
+
+    @classmethod
+    def generate_regime_stack(cls, config: Optional[Dict] = None) -> list[dict]:
+        """Coded [{regime, position}] for the Stormbreaker tick-native cross-TF
+        stack (single-TF + the 3 cross-TF section families). Regime names are
+        returned OBFUSCATED so the public generator never holds real names."""
+        from stormbreaker.core.filters import (
+            allowed_positions, _LONG_ONLY, _SHORT_ONLY, _BOTH,
+        )
+        longs, shorts, both = sorted(_LONG_ONLY), sorted(_SHORT_ONLY), sorted(_BOTH)
+        all_f = longs + shorts + both
+        combos: list[tuple] = []
+        for tf in cls._ALL_TFS:                                  # 1. single-TF
+            combos += [(f"{tf}_{f}",) for f in all_f]
+        for ctx_tf, sig_tf in cls._TF_PAIRS:                     # 2. BOTH ctx + dir sig
+            for cf in both:
+                for sf in longs + shorts:
+                    combos.append((f"{ctx_tf}_{cf}", f"{sig_tf}_{sf}"))
+        for ctx_tf, sig_tf in cls._TF_PAIRS:                     # 3. same-side dir x dir
+            for side in (longs, shorts):
+                for cf in side:
+                    for sf in side:
+                        if cf != sf:
+                            combos.append((f"{ctx_tf}_{cf}", f"{sig_tf}_{sf}"))
+        for ctx_tf, sig_tf in cls._TF_PAIRS:                     # 4. dir ctx + BOTH sig
+            for cf in longs + shorts:
+                for sf in both:
+                    combos.append((f"{ctx_tf}_{cf}", f"{sig_tf}_{sf}"))
+
+        c = _obf()
+        seen, out = set(), []
+        for combo in combos:
+            name = "_and_".join(combo)
+            for pos in allowed_positions(name):
+                key = (name, pos)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"regime": c.encode_regime(name), "position": pos})
+        return out
 
     def __init__(self, config: Dict, home_root: str) -> None:
         config = self._resolve_context_bar_dirs(config)
@@ -147,6 +201,9 @@ class StormBreakerResearch(MjolnirResearch):
             return super()._apply_filter_mask(df, filter_name, position)
 
         name = str(filter_name).lower().strip()
+        # Accept coded regimes: decode code->real before tick-filter routing
+        # (TF prefixes preserved; real names pass through; recursion re-decodes).
+        name = _obf().decode_regime_tolerant(name)
 
         # Compound: must split here so recursion passes through our override
         if "_and_" in name:

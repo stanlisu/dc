@@ -21,7 +21,7 @@ import pandas as pd
 
 from mjolnir.core.features import MjolnirFeatures, _TF_SECONDS
 from mjolnir.core.multi_tf_merge import merge_cross_tf_features
-from mjolnir.core.research import MjolnirResearch, _DEFAULT_FEATURE_WINDOWS
+from mjolnir.core.research import MjolnirResearch, _DEFAULT_FEATURE_WINDOWS, _obf
 from mjolnir.core.utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -264,6 +264,12 @@ class MjolnirTrading:
         if len(feats) < 2:
             return None
         row = feats.iloc[-2]
+        # Obfuscation: the regime filter above runs on REAL-named `feats`; the
+        # model's feature_columns + scaler are CODED (or REAL for pre-rollout
+        # weights). Add coded aliases on the prediction row (a Series indexed by
+        # column name) so the selection + scaler name-check match either
+        # namespace. `feats` itself is left real for the filter.
+        row = _obf().add_feature_aliases(row)
 
         # Run each regime entry in the stack
         long_count = 0
@@ -326,11 +332,11 @@ class MjolnirTrading:
             # to `available` produced a feature-count mismatch at scaler.transform
             # which was swallowed at debug, causing the regime to emit zero
             # signals forever with no operator-visible warning.
-            missing = [c for c in feat_cols if c not in feats.columns]
+            missing = [c for c in feat_cols if c not in row.index]
             assert not missing, (
                 f"regime {regime_name!r} ({position}) missing features: "
                 f"{sorted(missing)} (model expected {len(feat_cols)} cols, "
-                f"live feats has {len(feats.columns)} cols)"
+                f"live row has {len(row.index)} cols)"
             )
             X = row[feat_cols].values.reshape(1, -1).astype(float)
             X = np.where(np.isinf(X), np.nan, X)

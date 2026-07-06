@@ -23,7 +23,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from agamotto.research import AgamottoResearch
+from agamotto.research import AgamottoResearch, _obf
 from agamotto.trading import AgamottoTrading
 from vomir.classifier import VomirClassifier, CLASS_LONG, CLASS_SHORT
 
@@ -137,6 +137,9 @@ class VomirTrading(AgamottoTrading):
 
         target_ts = vf["timestamp"].max()
         latest = vf[vf["timestamp"] == target_ts].copy().reset_index(drop=True)
+        # Obfuscation: add coded aliases so the feature_cols selection + scaler
+        # name-check match either coded (new) or real (old) weights.
+        latest = _obf().add_feature_aliases(latest)
         if latest.empty:
             logger.warning("No rows at target_ts %s", target_ts)
             return self.decisions

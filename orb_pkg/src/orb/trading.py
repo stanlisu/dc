@@ -17,6 +17,7 @@ from agamotto.utils import (
     _timeframe_to_seconds,
     _round_down_to_timeframe_boundary,
 )
+from agamotto.research import _obf
 
 try:
     from agamotto.lib_binance import fetch_futures_klines, klines_to_dataframe
@@ -495,6 +496,10 @@ class OrbTrading(OrbResearch):
             filtered_signals["timestamp"] == target_ts].copy()
         if target_row.empty:
             return pd.DataFrame()
+
+        # Obfuscation: add coded aliases so the meta.feature_columns selection +
+        # scaler name-check match either coded (new) or real (old) weights.
+        target_row = _obf().add_feature_aliases(target_row)
 
         try:
             artifact = regime["artifact"]

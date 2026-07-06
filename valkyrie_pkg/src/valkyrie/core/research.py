@@ -15,6 +15,12 @@ from .features import DailyFeatureBuilder
 from .loader import ValkyrieLoader
 from .utils import get_dates_in_range
 
+
+def _obf():
+    """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
+    from .._obf.codec import default
+    return default()
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +97,18 @@ class ValkyrieResearch:
         config:    Experiment config dict (from setting.json).
         home_root: Repository root directory.
     """
+
+    @classmethod
+    def generate_regime_stack(cls) -> List[Dict]:
+        """Coded [{regime, position}] for the canonical Valkyrie regime set.
+
+        Options-specific positions (short_straddle/short_put/short_call) are not
+        long/short suffixes and pass through unchanged; only the regime name is
+        obfuscated. Real names live only here (private package).
+        """
+        c = _obf()
+        return [{"regime": c.encode_regime(r["regime"]), "position": r["position"]}
+                for r in _DEFAULT_REGIME_STACK]
 
     def __init__(self, config: Dict, home_root: str) -> None:
         self.config = config
@@ -408,7 +426,10 @@ class ValkyrieResearch:
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
             try:
-                filtered.to_parquet(save_path, index=False, row_group_size=200_000)
+                # Obfuscation: code feature columns before write (greeks/IV/straddle
+                # bases are in the feature map; targets/metadata pass through).
+                _to_save = filtered.rename(columns=_obf().encode_columns(filtered.columns))
+                _to_save.to_parquet(save_path, index=False, row_group_size=200_000)
                 logger.info(
                     "Saved filter %s: %d rows (DOWN=%d, FLAT=%d, UP=%d)",
                     safe_name,
@@ -478,6 +499,8 @@ class ValkyrieResearch:
             return pd.Series(dtype=bool)
 
         name = str(regime_name).lower().strip()
+        # Accept coded regimes: decode code->real before the real-name chain.
+        name = _obf().decode_regime_tolerant(name)
 
         if name == "baseline":
             raise ValueError(

@@ -64,6 +64,15 @@ build_algo() {
     echo "  Obfuscating ${algo} (target: linux.x86_64)..."
     pyarmor gen --platform linux.x86_64 -O "$build_dir/src" -r "$pkg_dir/src/$algo"
 
+    # Carry the vendored obfuscation codec map (a DATA file — pyarmor gen only
+    # processes .py and drops it). codec.py loads map.json from next to itself,
+    # so it must sit beside the obfuscated codec in the build output.
+    _obf_map="$pkg_dir/src/$algo/_obf/map.json"
+    if [ -f "$_obf_map" ]; then
+        cp "$_obf_map" "$build_dir/src/$algo/_obf/map.json"
+        echo "  Copied _obf/map.json"
+    fi
+
     # Copy setup.py and patch it to include binary files
     echo "  Copying setup files..."
     cp "$pkg_dir/setup.py" "$build_dir/"
@@ -104,6 +113,13 @@ deploy_algo() {
 echo "PyArmor Algo Package Builder (local -> remote)"
 echo "==============================================="
 echo "Algos: ${ALGOS[*]}"
+echo ""
+
+# Refresh the vendored obfuscation codec+map inside each package before building,
+# so a deploy never ships a stale map. Single source of truth: obfuscation/.
+echo "Syncing vendored obfuscation codec+map into packages..."
+python "$SCRIPT_DIR/obfuscation/build_map.py"
+python "$SCRIPT_DIR/obfuscation/sync_vendor.py"
 echo ""
 
 # Build phase
