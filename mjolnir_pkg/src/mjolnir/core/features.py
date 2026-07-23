@@ -25,7 +25,7 @@ class MjolnirFeatures:
     - Trade flow:   trade_imbalance, dollar_tsi, trade_intensity, kyle_lambda
     - Order book:   depth_imbalance_L1/L3/L5, relative_spread, microprice_vs_mid
     - OFI:          Multi-level Order Flow Imbalance (Cont et al. 2023)
-    - Derivative:   basis_pct, funding_rate, oi_velocity, oi_acceleration
+    - Derivative:   basis_pct, funding_rate
     - Liquidation:  liq_burst_ratio, liq_directional_imbalance, pre_funding
     - Price:        Same TA-Lib indicators as Agamotto (MA, RSI, ATR, MACD, BB)
     - Rolling stats on key signals at each window in feature_windows
@@ -71,9 +71,8 @@ class MjolnirFeatures:
     # NOTE: this set is purely point-in-time book/snapshot/derivative state and
     # its direct contemporaneous derivatives (incl. OFI, a depth difference).
     # It intentionally EXCLUDES already-causal columns (pct_change/diff/rolling-
-    # of-history such as oi_velocity, oi_acceleration, basis_pct's source is OK
-    # to shift as point-in-time, ret_lagN, *_roll*), trade/OHLCV bar aggregates,
-    # and all target/meta columns.
+    # of-history, ret_lagN, *_roll*; basis_pct's source is OK to shift as
+    # point-in-time), trade/OHLCV bar aggregates, and all target/meta columns.
     _POINT_IN_TIME_PREFIXES: tuple = (
         "bids_", "asks_",        # raw snapshot levels (price/qty)
         "depth_bid_L", "depth_ask_L", "depth_imbalance_L",  # depth + imbalance
@@ -88,10 +87,6 @@ class MjolnirFeatures:
         "mark_price", "index_price", "open_interest",
         "funding_rate", "next_funding_time", "predicted_funding_rate",
         "basis_pct",
-        # OI velocity/acceleration are pct_change/diff of the point-in-time OI;
-        # their value at T still references OI's bar-CLOSE state at T, so one
-        # +1 shift makes them causal (OI[T-1]/OI[T-2]-1 attached to row T).
-        "oi_velocity", "oi_acceleration",
     })
 
     def _point_in_time_columns(self, df: pd.DataFrame) -> List[str]:
@@ -268,9 +263,13 @@ class MjolnirFeatures:
                 (df["mark_price"] - df["index_price"]) / (df["index_price"] + 1e-10) * 100
             )
 
-        if "open_interest" in df.columns:
-            df["oi_velocity"] = df["open_interest"].pct_change(fill_method=None)
-            df["oi_acceleration"] = df["oi_velocity"].diff()
+        # oi_velocity/oi_acceleration REMOVED 2026-07-24: pct_change of the
+        # REST-polled OI counter is not replicable live — live (5s poll) vs
+        # offline (Tardis's poller) step timings disagree in SIGN on ~10% of
+        # 30s bars (corr as low as 0.42 per symbol, measured 2026-07-22).
+        # Raw open_interest LEVEL stays: live-vs-built swap-rescore of the
+        # deployed model = 0 threshold flips (marvel tesseract/
+        # portfolio_2026-07-22/oi_swap_summary_2026-07-22.json).
 
         # Pre-funding-settlement flag: 0–2h before 00:00 / 08:00 / 16:00 UTC
         if df.index.tz is not None:

@@ -51,7 +51,6 @@ filter/*.parquet → rolling_predict → daily_pnl → optimize → filter_regim
 | SHORT | `ofi_negative` | `ofi_agg < 0` |
 | SHORT | `long_liq_spike` | `liq_burst_ratio > 2× avg` AND `liq_directional_imbalance < 0` |
 | BOTH | `liq_spike` | `liq_burst_ratio > 2× avg` |
-| BOTH | `oi_expanding` | `oi_velocity > 0.005` |
 | BOTH | `high_spread` | `relative_spread > rolling_median × 1.5` |
 | BOTH | `low_spread` | `relative_spread < rolling_median × 0.7` |
 
