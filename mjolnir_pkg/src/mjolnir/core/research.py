@@ -95,8 +95,7 @@ class MjolnirResearch:
     _BASE_REGIMES = [
         "high_liquidation_pressure", "funding_positive", "funding_negative",
         "deep_book", "trade_imbalance", "basis_premium", "basis_discount",
-        "oi_expansion", "oi_contraction", "ofi_positive", "tight_spread",
-        "wide_spread",
+        "ofi_positive", "tight_spread", "wide_spread",
     ]
     # Directional regimes: condition is position-independent AND already encodes a
     # market direction, so only the matching side is built (e.g. funding_negative
@@ -104,7 +103,6 @@ class MjolnirResearch:
     _REGIME_SIDES = {
         "funding_positive": ["long"], "funding_negative": ["short"],
         "basis_premium": ["long"], "basis_discount": ["short"],
-        "oi_expansion": ["long"], "oi_contraction": ["short"],
     }
 
     @classmethod

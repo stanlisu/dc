@@ -8,7 +8,7 @@ Directional filters (unidirectional):
   SHORT-only: sell_flow, ask_heavy, ofi_negative, long_liq_spike
 
 Bidirectional filters (context only — pair with a directional):
-  BOTH: liq_spike, oi_expanding, high_spread, low_spread
+  BOTH: liq_spike, high_spread, low_spread
 """
 
 from __future__ import annotations
@@ -20,13 +20,12 @@ import pandas as pd
 _FLOW_THRESH = 0.2           # 20% net buy/sell imbalance
 _BOOK_THRESH = 0.2           # 20% net bid/ask book imbalance
 _LIQ_BURST_THRESH = 2.0      # liquidation 2× rolling-60-bar average
-_OI_VEL_THRESH = 0.005       # 0.5% OI change per bar
 _SPREAD_WINDOW = 300         # bars for rolling spread median
 
 # ── Position taxonomy ─────────────────────────────────────────────────────────
 _LONG_ONLY = frozenset({"buy_flow", "bid_heavy", "ofi_positive", "short_liq_spike"})
 _SHORT_ONLY = frozenset({"sell_flow", "ask_heavy", "ofi_negative", "long_liq_spike"})
-_BOTH = frozenset({"liq_spike", "oi_expanding", "high_spread", "low_spread"})
+_BOTH = frozenset({"liq_spike", "high_spread", "low_spread"})
 _ALL_TICK_FILTERS = _LONG_ONLY | _SHORT_ONLY | _BOTH
 
 
@@ -124,11 +123,8 @@ def apply_filter(df: pd.DataFrame, filter_name: str) -> pd.Series:
             return true_mask
         return df["liq_burst_ratio"] > _LIQ_BURST_THRESH
 
-    # ── Open-interest filters ─────────────────────────────────────────────────
-    if filter_name == "oi_expanding":
-        if "oi_velocity" not in df.columns:
-            return true_mask
-        return df["oi_velocity"] > _OI_VEL_THRESH
+    # oi_expanding REMOVED 2026-07-24 (with mjolnir oi_velocity): the gate
+    # read oi_velocity, whose live-vs-offline step timing is unreplicable.
 
     # ── Spread filters ────────────────────────────────────────────────────────
     if filter_name == "high_spread":

@@ -150,17 +150,11 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
             return true
         return df[col] > 0
 
-    if name == "oi_expansion":
-        col = "oi_velocity"
-        if col not in df.columns:
-            return true
-        return df[col] > 0
-
-    if name == "oi_contraction":
-        col = "oi_velocity"
-        if col not in df.columns:
-            return true
-        return df[col] < 0
+    # oi_expansion/oi_contraction REMOVED 2026-07-24: they gated on the SIGN
+    # of oi_velocity, which live (5s REST poll) and offline (Tardis poller)
+    # disagree on for ~10% of 30s bars — an unreplicable regime gate. A stale
+    # stack referencing them now hits the Unknown-filter raise below (never a
+    # silent all-True mask).
 
     if name == "ofi_positive":
         col = "ofi_agg"
