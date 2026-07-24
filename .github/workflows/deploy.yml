@@ -23,6 +23,12 @@ jobs:
 
       - name: Build obfuscated packages
         run: |
+          # _obf/ (vendored obfuscation codec + map.json) is gitignored — a
+          # fresh checkout has none. Regenerate before building, exactly like
+          # build_distribution.sh, or the shipped packages crash on
+          # `from .._obf.codec import default`.
+          python obfuscation/build_map.py
+          python obfuscation/sync_vendor.py
           ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
           for algo in "${ALGOS[@]}"; do
             echo "Building $algo..."
@@ -30,10 +36,18 @@ jobs:
             rm -rf "$build_dir"
             mkdir -p "$build_dir"
             pyarmor gen -O "$build_dir/src" -r "${algo}_pkg/src/$algo"
+            # map.json is DATA — pyarmor gen only processes .py and drops it;
+            # codec.py loads it from next to itself.
+            if [ -f "${algo}_pkg/src/$algo/_obf/map.json" ]; then
+              cp "${algo}_pkg/src/$algo/_obf/map.json" "$build_dir/src/$algo/_obf/map.json"
+            fi
             cp "${algo}_pkg/setup.py" "$build_dir/"
-            sed -i 's/python_requires=">=3.7",/python_requires=">=3.7", package_data={"": ["*.so", "*.dylib", "*.dll"]}, zip_safe=False,/g' "$build_dir/setup.py"
-            [ -f "${algo}_pkg/README.md" ] && cp "${algo}_pkg/README.md" "$build_dir/"
-            [ -f "${algo}_pkg/requirements.txt" ] && cp "${algo}_pkg/requirements.txt" "$build_dir/"
+            sed -i 's/python_requires=">=3.7",/python_requires=">=3.7", package_data={"": ["*.so", "*.dylib", "*.dll", "*.json"]}, zip_safe=False,/g' "$build_dir/setup.py"
+            # if-form, not `[ -f ] && cp`: a missing optional file on the LAST
+            # loop iteration made the step's exit status 1 and failed every
+            # Deploy run at build time (vomir has neither file).
+            if [ -f "${algo}_pkg/README.md" ]; then cp "${algo}_pkg/README.md" "$build_dir/"; fi
+            if [ -f "${algo}_pkg/requirements.txt" ]; then cp "${algo}_pkg/requirements.txt" "$build_dir/"; fi
           done
 
       - name: Setup SSH
@@ -43,6 +57,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 13.115.134.141 >> ~/.ssh/known_hosts 2>/dev/null
           ssh-keyscan -H 192.168.72.135 >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H 3.112.232.77 >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Deploy to Hydra
         run: |
@@ -53,9 +68,22 @@ jobs:
           ssh stan@13.115.134.141 '~/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
 
       - name: Deploy to Shield
+        # Shield is a LAN address (192.168.72.135) — unreachable from
+        # GitHub-hosted runners. Fail fast + continue so Shield2 still runs;
+        # deploy Shield manually via build_distribution.sh until a
+        # self-hosted/VPN runner exists.
+        continue-on-error: true
         run: |
           ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
           for algo in "${ALGOS[@]}"; do
-            rsync -az --delete "build_dist/${algo}_pkg/" "stan@192.168.72.135:/home/stan/sandbox/marvel/${algo}_pkg/"
+            rsync -az --delete -e "ssh -o ConnectTimeout=15" "build_dist/${algo}_pkg/" "stan@192.168.72.135:/home/stan/sandbox/marvel/${algo}_pkg/"
           done
-          ssh stan@192.168.72.135 '/opt/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+          ssh -o ConnectTimeout=15 stan@192.168.72.135 '/opt/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+
+      - name: Deploy to Shield2
+        run: |
+          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
+          for algo in "${ALGOS[@]}"; do
+            rsync -az --delete "build_dist/${algo}_pkg/" "stan@3.112.232.77:/home/stan/sandbox/marvel/${algo}_pkg/"
+          done
+          ssh stan@3.112.232.77 '~/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
