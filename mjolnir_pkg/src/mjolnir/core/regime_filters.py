@@ -18,6 +18,32 @@ def _obf():
     return default()
 
 
+# Every name named_filter() implements. Membership is checked BEFORE any
+# missing-column guard so an unknown/retired name raises on ANY frame —
+# including degenerate/warmup frames lacking mvg1/mvg2/close, which previously
+# fell into the all-True price-column guard and silently fired on every bar.
+# "baseline" is listed so it reaches its dedicated removal raise below.
+KNOWN_FILTERS = frozenset({
+    "baseline",
+    # microstructure (Mjolnir-specific)
+    "high_liquidation_pressure", "low_liquidation_pressure",
+    "funding_positive", "funding_negative",
+    "deep_book", "trade_imbalance",
+    "basis_premium", "basis_discount",
+    "pre_funding_settlement",
+    "ofi_positive",
+    "tight_spread", "wide_spread",
+    # standard price filters (shared with Agamotto)
+    "trend_aligned", "strong_trend", "ma_momentum",
+    "rsi_oversold", "rsi_overbought",
+    "macd_bullish", "macd_bearish",
+    "adx_trend", "bb_rebound",
+    "high_volume", "vol_breakout", "low_volume",
+    "high_vol", "low_vol",
+    "mom_positive",
+})
+
+
 def apply_filter_mask(
     df: pd.DataFrame,
     filter_name,
@@ -82,7 +108,14 @@ def apply_filter_mask(
 
 
 def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
-    """Dispatch to a named filter implementation."""
+    """Dispatch to a named filter implementation.
+
+    Raises ValueError for unknown names regardless of df contents; the
+    per-branch missing-column all-True guards apply to KNOWN names only.
+    """
+    if name not in KNOWN_FILTERS:
+        raise ValueError(f"Unknown filter: {name!r}")
+
     true = pd.Series(True, index=df.index)
 
     # ---- Microstructure filters (Mjolnir-specific) ----
@@ -277,4 +310,7 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
             return true
         return df[col] > 0 if position == "long" else df[col] < 0
 
-    raise ValueError(f"Unknown filter: {name!r}")
+    # Unreachable for unknown names (rejected at the top); firing here means
+    # KNOWN_FILTERS drifted out of sync with the branches above.
+    raise ValueError(
+        f"Filter {name!r} is in KNOWN_FILTERS but has no implementation")
