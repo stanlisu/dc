@@ -55,9 +55,20 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 13.115.134.141 >> ~/.ssh/known_hosts 2>/dev/null
-          ssh-keyscan -H 192.168.72.135 >> ~/.ssh/known_hosts 2>/dev/null
-          ssh-keyscan -H 3.112.232.77 >> ~/.ssh/known_hosts 2>/dev/null
+          # Fail loud if the secret is unset/empty — otherwise the deploy
+          # steps die later with opaque auth errors (run 30084051919 wrote an
+          # empty key file because DEPLOY_SSH_KEY was never configured).
+          if [ ! -s ~/.ssh/id_ed25519 ]; then
+            echo "::error::DEPLOY_SSH_KEY secret is empty or unset — add it in repo Settings → Secrets → Actions"
+            exit 1
+          fi
+          # keyscans: shield (192.168.72.135) is LAN-only and unreachable from
+          # GitHub-hosted runners; under bash -e a failed keyscan killed the
+          # whole step. Tolerate per-host scan failures — unreachable hosts
+          # fail later in their own (continue-on-error where appropriate) step.
+          ssh-keyscan -T 10 -H 13.115.134.141 >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -T 10 -H 192.168.72.135 >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -T 10 -H 3.112.232.77 >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Deploy to Hydra
         run: |
