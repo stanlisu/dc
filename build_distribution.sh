@@ -16,6 +16,7 @@ BUILD_ROOT="$SCRIPT_DIR/build_dist"
 # Remote hosts (edit user/host as needed)
 HYDRA_HOST="hydra"
 SHIELD_HOST="shield"
+SHIELD2_HOST="shield2"
 
 # Remote base path
 REMOTE_BASE="/home/stan/sandbox/marvel"
@@ -144,10 +145,11 @@ echo ""
 echo "Deploy targets:"
 echo "  1) hydra ($HYDRA_HOST)"
 echo "  2) shield ($SHIELD_HOST)"
-echo "  3) both"
-echo "  4) skip"
+echo "  3) shield2 ($SHIELD2_HOST)"
+echo "  4) all"
+echo "  5) skip"
 echo ""
-read -p "Choose [1-4]: " choice
+read -p "Choose [1-5]: " choice
 
 case "$choice" in
     1)
@@ -157,12 +159,16 @@ case "$choice" in
         for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$SHIELD_HOST"; done
         ;;
     3)
+        for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$SHIELD2_HOST"; done
+        ;;
+    4)
         for algo in "${ALGOS[@]}"; do
             deploy_algo "$algo" "$HYDRA_HOST"
             deploy_algo "$algo" "$SHIELD_HOST"
+            deploy_algo "$algo" "$SHIELD2_HOST"
         done
         ;;
-    4|*)
+    5|*)
         echo "Skipping deploy."
         ;;
 esac
