@@ -557,6 +557,23 @@ class MjolnirFeatures:
     # BTC cross-asset features
     # ------------------------------------------------------------------
 
+    # The ONLY columns of the BTC feature frame (compute() output) that
+    # add_btc_cross_features reads. MUST stay in sync with the column guards
+    # in that method. Live inference ships exactly this slim frame to the
+    # non-BTC predict workers (compute-once-per-cycle, 2026-07-26) instead of
+    # the raw 1000-bar BTC buffer — a new consumer column added below without
+    # extending this tuple would silently vanish from live cross-features.
+    BTC_CROSS_INPUT_COLS = (
+        "mid_price",
+        "bid_amount",
+        "ask_amount",
+        "trade_imbalance",
+        "volume",
+        "ofi_L1",
+        "relative_spread",
+        "liq_directional_imbalance",
+    )
+
     def add_btc_cross_features(
         self,
         df: pd.DataFrame,

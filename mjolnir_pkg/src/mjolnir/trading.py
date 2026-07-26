@@ -40,6 +40,11 @@ class PredictDiag:
 
 _BTC = "BINANCE_PERP_BTC_USDT"
 _BTC_NATIVE = normalize_symbol(_BTC)
+# Public alias for callers that must know the cross-feature anchor symbol
+# (the knull bridge's two-stage inference cycle imports this — an older
+# mjolnir_pkg without it fails the bridge's import, loudly flagging a
+# bridge/pkg version skew).
+BTC_SYMBOL = _BTC
 
 # Dedup set for the regime-filter silent-except warning in predict().
 # Keyed by (regime_name, position, exception_class_name). Lives for the
@@ -152,15 +157,22 @@ class MjolnirTrading:
 
     def snapshot_inputs(self, symbol: str) -> Optional[dict]:
         """Grab an immutable, picklable copy of every buffer ``predict`` reads
-        for *symbol*: its own base buffer + the BTC buffer (cross-features) +
-        each cross-TF buffer. MUST be called on the bridge's event loop — that
-        is the only race-free point vs ``add_bar``'s deque mutation. Returns
-        ``None`` if the symbol's own buffer is below warmup.
+        for *symbol*: its own base buffer + each cross-TF buffer. MUST be
+        called on the bridge's event loop — that is the only race-free point
+        vs ``add_bar``'s deque mutation. Returns ``None`` if the symbol's own
+        buffer is below warmup.
+
+        BTC cross-features (2026-07-26 compute-once refactor): the snapshot no
+        longer carries the raw BTC buffer. The caller computes the BTC feature
+        frame ONCE per cycle (``compute_btc_features`` on BTC's own snapshot)
+        and injects it as ``inputs["btc_feats"]`` into every non-BTC snapshot
+        before ``predict_from_inputs`` — previously each of the 27 non-BTC
+        workers recomputed the full 1000-bar BTC frame and the raw buffer was
+        pickled to every one of them (the 2026-07-24 latency forensics).
 
         Bar dicts are appended immutably (never mutated in place), so copying
         their references is safe; a process pool deep-copies them at pickle
-        time anyway. The conditional BTC / cross-TF inclusion gates mirror the
-        original ``predict`` exactly.
+        time anyway.
         """
         if symbol not in self._buffers:
             return None
@@ -170,15 +182,8 @@ class MjolnirTrading:
         inp: dict = {
             "buf": list(buf),
             "ts": list(self._timestamps[symbol]),
-            "btc_buf": None,
-            "btc_ts": None,
             "tf": {},
         }
-        if (symbol != _BTC
-                and _BTC in self._buffers
-                and len(self._buffers[_BTC]) >= self.MIN_WARMUP_BARS):
-            inp["btc_buf"] = list(self._buffers[_BTC])
-            inp["btc_ts"] = list(self._timestamps[_BTC])
         for cross_tf in self._multi_tfs:
             tf_buf = self._tf_buffers[cross_tf].get(symbol)
             tf_ts = self._tf_timestamps[cross_tf].get(symbol)
@@ -190,26 +195,84 @@ class MjolnirTrading:
     def predict(self, symbol: str) -> Optional[PredictDiag]:
         """Snapshot + compute in one call (back-compat / single-process path).
 
-        Equivalent to ``predict_from_inputs(symbol, snapshot_inputs(symbol))``.
-        The bridge splits the two so the snapshot runs on the event loop
-        (race-free vs ``add_bar``) while ``predict_from_inputs`` runs in a
-        worker pool.
+        Recomposes the split pipeline the bridge runs across processes:
+        snapshot, compute BTC features once, inject, predict. Offline replay
+        tooling calling predict() therefore exercises the exact live
+        semantics.
         """
         inp = self.snapshot_inputs(symbol)
         if inp is None:
             return None
+        if symbol != _BTC:
+            btc_snap = self.snapshot_inputs(_BTC)
+            inp["btc_feats"] = (self.compute_btc_features(btc_snap)
+                                if btc_snap is not None else None)
         return self.predict_from_inputs(symbol, inp)
+
+    def compute_btc_features(self, inputs: dict) -> pd.DataFrame:
+        """Compute the slim BTC feature frame shared by every non-BTC predict.
+
+        ``inputs`` is BTC's own :meth:`snapshot_inputs` dict. Returns the
+        ``compute()`` output restricted to
+        ``MjolnirFeatures.BTC_CROSS_INPUT_COLS`` — exactly the columns
+        ``add_btc_cross_features`` reads — with the DatetimeIndex preserved
+        (the per-symbol timestamp reindex stays inside
+        ``add_btc_cross_features``). Called ONCE per inference cycle; the
+        result is injected as ``inputs["btc_feats"]`` into each non-BTC
+        snapshot. Exceptions propagate — the caller decides whether a failed
+        BTC compute degrades the cycle (bridge: cross-features skipped, so
+        stacks whose models need btc_* columns crash on the missing-feature
+        assert, matching legacy semantics).
+        """
+        btc_df = pd.DataFrame(inputs["buf"])
+        btc_idx = pd.DatetimeIndex(inputs["ts"])
+        if btc_idx.tz is None:
+            btc_idx = btc_idx.tz_localize("UTC")
+        btc_df.index = btc_idx
+        feats = self._feat_engine.compute(btc_df)
+        cols = [c for c in MjolnirFeatures.BTC_CROSS_INPUT_COLS
+                if c in feats.columns]
+        return feats[cols]
 
     def predict_from_inputs(
         self, symbol: str, inputs: dict,
-    ) -> Optional[PredictDiag]:
+        return_btc_features: bool = False,
+    ) -> "Optional[PredictDiag] | Tuple[Optional[PredictDiag], Optional[pd.DataFrame]]":
         """Pure compute half of ``predict``: build features from an ``inputs``
         snapshot (from :meth:`snapshot_inputs`) and run the regime stack.
 
         Reads ONLY read-only model / feature-engine / research / config state,
         so it is safe to run in a worker process whose own buffers are empty —
         all bar data arrives via ``inputs``.
+
+        Contract (2026-07-26 compute-once refactor):
+          * non-BTC snapshots MUST carry ``inputs["btc_feats"]`` — the slim
+            frame from :meth:`compute_btc_features`, or ``None`` when BTC is
+            below warmup (the legacy eligibility gate). A missing key raises:
+            it means the caller skipped stage-1 injection (version skew).
+          * a legacy ``btc_buf`` key raises — old-bridge/new-pkg skew.
+          * ``return_btc_features=True`` (BTC only) also returns the slim
+            frame sliced from the ALREADY-computed own feature frame, so BTC's
+            own predict doubles as the per-cycle BTC feature compute — never
+            a second ``compute()`` of the same buffer. Return shape becomes
+            ``(diag_or_None, slim_frame_or_None)`` on EVERY path.
         """
+        if "btc_buf" in inputs:
+            raise RuntimeError(
+                "legacy snapshot contract: 'btc_buf' in inputs — the bridge "
+                "and mjolnir_pkg are version-skewed (bridge predates the "
+                "2026-07-26 compute-once refactor). Deploy both together.")
+        if return_btc_features and symbol != _BTC:
+            raise ValueError(
+                f"return_btc_features=True is only valid for {_BTC} "
+                f"(got {symbol!r}) — the slim frame is sliced from BTC's own "
+                f"feature frame.")
+        if symbol != _BTC and "btc_feats" not in inputs:
+            raise KeyError(
+                "non-BTC snapshot missing 'btc_feats' — the caller must "
+                "inject the stage-1 BTC feature frame (None only when BTC is "
+                "below warmup). Bridge/mjolnir_pkg version skew?")
+
         # Build DataFrame from the snapshot
         df = pd.DataFrame(inputs["buf"])
         idx = pd.DatetimeIndex(inputs["ts"], name=None)
@@ -222,20 +285,30 @@ class MjolnirTrading:
             feats = self._feat_engine.compute(df)
         except Exception as exc:
             logger.error("Feature computation failed for %s: %s", symbol, exc)
-            return None
+            return (None, None) if return_btc_features else None
 
-        # Inject BTC cross-features for non-BTC symbols. The warmup / non-BTC
-        # gates live in snapshot_inputs (btc_buf is only set when eligible).
-        if inputs.get("btc_buf"):
-            btc_df = pd.DataFrame(inputs["btc_buf"])
-            btc_idx = pd.DatetimeIndex(inputs["btc_ts"])
-            if btc_idx.tz is None:
-                btc_idx = btc_idx.tz_localize("UTC")
-            btc_df.index = btc_idx
+        # BTC's own compute() output IS the per-cycle BTC feature frame —
+        # slice the slim share BEFORE cross-TF merge (the legacy per-symbol
+        # recompute was compute(btc_df) alone, never cross-TF-merged).
+        btc_slim: Optional[pd.DataFrame] = None
+        if return_btc_features:
+            cols = [c for c in MjolnirFeatures.BTC_CROSS_INPUT_COLS
+                    if c in feats.columns]
+            btc_slim = feats[cols]
+
+        # Inject BTC cross-features for non-BTC symbols from the shared
+        # stage-1 frame. btc_feats is None only below BTC warmup (the same
+        # eligibility gate snapshot_inputs used to apply to btc_buf).
+        btc_feats = inputs.get("btc_feats") if symbol != _BTC else None
+        if btc_feats is not None:
             try:
-                btc_feats = self._feat_engine.compute(btc_df)
                 feats = self._feat_engine.add_btc_cross_features(feats, btc_feats)
             except Exception as exc:
+                # WHY: swallow is safe — matches legacy semantics: models that
+                # use btc_* columns hit the hard missing-feature assert below
+                # (crash), stacks that don't proceed unaffected. Raising here
+                # instead would let the bridge degrade the symbol to a silent
+                # CLOSE (the 2026-05-06 incident class).
                 logger.warning("BTC cross-features failed for %s: %s", symbol, exc)
 
         # Bug 2 (audit A1) — merge cross-TF features into the base frame using
@@ -262,7 +335,7 @@ class MjolnirTrading:
 
         # Predict on the last complete bar (second-to-last row: -2)
         if len(feats) < 2:
-            return None
+            return (None, btc_slim) if return_btc_features else None
         row = feats.iloc[-2]
         # Obfuscation: the regime filter above runs on REAL-named `feats`; the
         # model's feature_columns + scaler are CODED (or REAL for pre-rollout
@@ -435,7 +508,7 @@ class MjolnirTrading:
         # Note: IPC send moved to MjolnirBridge._inference_loop after Phase 6
         # so the bridge can attach a per-symbol qty (computed from
         # CAPITAL + exchange-info step/precision) to the payload.
-        return result
+        return (result, btc_slim) if return_btc_features else result
 
     # ------------------------------------------------------------------
     # Private: model loading
