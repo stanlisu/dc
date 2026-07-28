@@ -1,0 +1,18 @@
+2026-07-24 12:55 [local] rebuild+redeploy mjolnir+stormbreaker (named_filter fail-loud fix, PR #19, main@7cdf186)
+  - built via ./build_distribution.sh --build-only {mjolnir,stormbreaker} (pyarmor 9.2.3, linux.x86_64)
+  - rsync build_dist/{mjolnir,stormbreaker}_pkg/ -> hydra, shield, shield2 :/home/stan/sandbox/marvel/<algo>_pkg/ (6/6 OK)
+  - verified on all 3 hosts: named_filter('oi_expansion') + apply_filter('oi_expanding') raise on degenerate/empty frames; known-name guard (trend_aligned all-True) intact
+  - note: shield python env is /opt/miniconda3/envs/py313 (not ~/miniconda3)
+
+2026-07-28 14:29 [local] rebuild+redeploy ALL 9 algo pkgs -> hydra, shield2 (main@2f0920c, incl PR #22 BTC compute-once)
+  - built via ./build_distribution.sh --build-only (pyarmor 9.2.3 trial, linux.x86_64); all 9 obfuscated OK, no "out of license"
+  - rsync -az --delete build_dist/<algo>_pkg/ -> {hydra,shield2}:/home/stan/sandbox/marvel/<algo>_pkg/  (18/18 OK)
+  - algos: agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir
+  - deployed to hydra + shield2 ONLY (shield NOT updated this round — user scope)
+  - both hosts idle at deploy time (pgrep python = 0), so no running bot imported a package mid-rsync
+  - verified on BOTH hosts (py313): obfuscated mjolnir imports; MjolnirTrading.predict_from_inputs
+    exposes return_btc_features; compute_btc_features present; MjolnirFeatures.BTC_CROSS_INPUT_COLS = 8 cols
+  - verified _obf codec imports + map.json present (4 entries) on both hosts
+  - vibranium_pkg intentionally has NO _obf/map.json (sync_vendor._TARGETS excludes it) — not a build failure
+  - PENDING: xmen/mjolnir_pkg NOT synced (separate target); hydra ops.log deploy prereq requires
+    rsync marvel/mjolnir_pkg -> xmen/mjolnir_pkg before relaunching the knull bridge
