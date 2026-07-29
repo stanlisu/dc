@@ -46,10 +46,11 @@ add_library(mjolnir_core SHARED
     src/bar_builder.cpp
     src/feature_engine.cpp
     src/talib_block.cpp
+    src/regime_gate.cpp
     # M1 TODO — the IP modules, added as each lands:
 
 
-    #   src/regime_gate.cpp
+
     #   src/model_runner.cpp
 )
 
