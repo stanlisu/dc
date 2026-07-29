@@ -43,8 +43,9 @@ endif()
 
 add_library(mjolnir_core SHARED
     src/core_impl.cpp
+    src/bar_builder.cpp
     # M1 TODO — the IP modules, added as each lands:
-    #   src/bar_builder.cpp
+
     #   src/feature_engine.cpp
     #   src/regime_gate.cpp
     #   src/model_runner.cpp
