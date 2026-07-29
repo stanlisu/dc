@@ -35,3 +35,26 @@ RUN printf '#include <ta-lib/ta_libc.h>\n#include <stdio.h>\nint main(void){prin
     case "$VER" in ${TALIB_VERSION}*) echo "TALIB VERSION OK" ;; \
       *) echo "FAIL: expected ${TALIB_VERSION}, got $VER" && exit 1 ;; esac && \
     rm -f /tmp/tv /tmp/tv.c
+
+# LightGBM C API — the core loads model.txt via LGBM_BoosterCreateFromModelfile
+# and predicts with LGBM_BoosterPredictForMat, i.e. the SAME inference kernel the
+# Python wrapper calls, so predictions are identical rather than reimplemented.
+ARG LIGHTGBM_VERSION=4.6.0
+# Rocky 8 ships CMake 3.26.5 but LightGBM 4.6.0 requires >= 3.28. Install the
+# official binary rather than dropping to an older LightGBM: the version must
+# match production, for the same reason ta-lib does.
+ARG CMAKE_VERSION=3.31.6
+RUN cd /tmp && \
+    wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && \
+    tar xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz -C /opt && \
+    ln -sf /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake /usr/local/bin/cmake && \
+    rm -f cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && \
+    cmake --version | head -1
+RUN dnf -q install -y git && \
+    cd /tmp && git clone --depth 1 --branch v${LIGHTGBM_VERSION} --recursive \
+        https://github.com/microsoft/LightGBM.git && \
+    cd LightGBM && mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_LIB=OFF .. >/dev/null && \
+    make -j"$(nproc)" >/dev/null && make install >/dev/null && \
+    ldconfig && cd / && rm -rf /tmp/LightGBM && dnf clean all
+RUN test -f /usr/local/include/LightGBM/c_api.h || (echo "lightgbm headers missing" && exit 1)

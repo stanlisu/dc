@@ -15,7 +15,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SENTINEL_REPO="${SENTINEL_REPO:-$(cd "$HERE/../../sentinel" && pwd)}"
-IMAGE="mjolnir-core-build:0.6.4"
+IMAGE="mjolnir-core-build:latest"
 OUT="$HERE/build-linux/libmjolnir_core.so"
 
 DEPLOY_HOST=""

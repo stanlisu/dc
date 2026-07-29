@@ -20,6 +20,7 @@ class FeaturePanel {
                  const std::vector<std::vector<double>>& cols);
     bool has(const std::string& name) const;
     const std::vector<double>& get(const std::string& name) const;
+    const std::vector<std::string>& names() const { return mNames; }
     size_t rows() const { return mRows; }
 
   private:

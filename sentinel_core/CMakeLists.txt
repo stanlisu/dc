@@ -47,11 +47,11 @@ add_library(mjolnir_core SHARED
     src/feature_engine.cpp
     src/talib_block.cpp
     src/regime_gate.cpp
+    src/model_runner.cpp
     # M1 TODO — the IP modules, added as each lands:
 
 
 
-    #   src/model_runner.cpp
 )
 
 target_include_directories(mjolnir_core PRIVATE ${CONTRACT_DIR} src)
@@ -67,7 +67,16 @@ if(NOT TALIB_LIB OR NOT TALIB_INC)
 endif()
 message(STATUS "mjolnir_core: ta-lib ${TALIB_LIB}")
 target_include_directories(mjolnir_core PRIVATE ${TALIB_INC})
-target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} m)
+# LightGBM C API — pinned to the version PRODUCTION runs (see Dockerfile.build);
+# the same reasoning as ta-lib, a different version is a silent parity risk.
+find_library(LGBM_LIB NAMES _lightgbm lightgbm HINTS /usr/local/lib /usr/lib)
+find_path(LGBM_INC LightGBM/c_api.h HINTS /usr/local/include /usr/include)
+if(NOT LGBM_LIB OR NOT LGBM_INC)
+    message(FATAL_ERROR "LightGBM not found. Build inside Dockerfile.build.")
+endif()
+message(STATUS "mjolnir_core: lightgbm ${LGBM_LIB}")
+target_include_directories(mjolnir_core PRIVATE ${LGBM_INC})
+target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} ${LGBM_LIB} m)
 
 target_compile_options(mjolnir_core PRIVATE -Wall -Wextra)
 
