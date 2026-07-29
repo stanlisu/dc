@@ -60,7 +60,8 @@ target_compile_definitions(mjolnir_core PRIVATE
 # TA-Lib must be the SAME version production runs (pinned in Dockerfile.build);
 # a different version changes indicator internals and silently breaks parity.
 # -lm is required: libta-lib references asin/exp/log/sqrt and does not pull it in.
-find_library(TALIB_LIB NAMES ta-lib ta_lib HINTS /usr/local/lib /opt/homebrew/lib)
+# Prefer STATIC: the shipped .so must not depend on /usr/local/lib at runtime.
+find_library(TALIB_LIB NAMES libta-lib.a ta-lib ta_lib HINTS /usr/local/lib /opt/homebrew/lib)
 find_path(TALIB_INC ta-lib/ta_libc.h HINTS /usr/local/include /opt/homebrew/include)
 if(NOT TALIB_LIB OR NOT TALIB_INC)
     message(FATAL_ERROR "ta-lib not found. Build inside Dockerfile.build, which pins 0.6.4.")
@@ -69,14 +70,17 @@ message(STATUS "mjolnir_core: ta-lib ${TALIB_LIB}")
 target_include_directories(mjolnir_core PRIVATE ${TALIB_INC})
 # LightGBM C API — pinned to the version PRODUCTION runs (see Dockerfile.build);
 # the same reasoning as ta-lib, a different version is a silent parity risk.
-find_library(LGBM_LIB NAMES _lightgbm lightgbm HINTS /usr/local/lib /usr/lib)
+find_library(LGBM_LIB NAMES lib_lightgbm.a _lightgbm lightgbm HINTS /usr/local/lib /usr/lib)
 find_path(LGBM_INC LightGBM/c_api.h HINTS /usr/local/include /usr/include)
 if(NOT LGBM_LIB OR NOT LGBM_INC)
     message(FATAL_ERROR "LightGBM not found. Build inside Dockerfile.build.")
 endif()
 message(STATUS "mjolnir_core: lightgbm ${LGBM_LIB}")
 target_include_directories(mjolnir_core PRIVATE ${LGBM_INC})
-target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} ${LGBM_LIB} m)
+# gomp/pthread: LightGBM static pulls in OpenMP; -static-libstdc++/-libgcc so the
+# artifact does not depend on the build image's newer runtime either.
+target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} ${LGBM_LIB} gomp pthread m)
+target_link_options(mjolnir_core PRIVATE -static-libstdc++ -static-libgcc)
 
 target_compile_options(mjolnir_core PRIVATE -Wall -Wextra)
 

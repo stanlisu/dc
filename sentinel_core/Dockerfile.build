@@ -54,7 +54,13 @@ RUN dnf -q install -y git && \
     cd /tmp && git clone --depth 1 --branch v${LIGHTGBM_VERSION} --recursive \
         https://github.com/microsoft/LightGBM.git && \
     cd LightGBM && mkdir build && cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_LIB=OFF .. >/dev/null && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_LIB=ON .. >/dev/null && \
     make -j"$(nproc)" >/dev/null && make install >/dev/null && \
     ldconfig && cd / && rm -rf /tmp/LightGBM && dnf clean all
 RUN test -f /usr/local/include/LightGBM/c_api.h || (echo "lightgbm headers missing" && exit 1)
+# Static libs are what make libmjolnir_core.so SELF-CONTAINED. Without them the
+# core carries runtime deps on /usr/local/lib, which exist in THIS image but not
+# in the SDK build container or on the deploy host — so the strategy would fail
+# to link, or link and then fail to load.
+RUN test -f /usr/local/lib/lib_lightgbm.a || (echo "lib_lightgbm.a missing — static build did not produce it" && exit 1)
+RUN test -f /usr/local/lib/libta-lib.a || (echo "libta-lib.a missing" && exit 1)
