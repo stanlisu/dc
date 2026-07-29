@@ -519,12 +519,22 @@ class MjolnirFeatures:
             h = self.target_horizon
             forward_return = mid.pct_change(h, fill_method=None).shift(-h)
 
+        # Targets are UNSIGNED market returns — NOT the trade's P&L. A short is
+        # profitable when these are NEGATIVE; the consumer applies the direction
+        # (marvel generate_daily_pnl books `signal * y_true_raw`, signal = -1 for a
+        # short). Fee is subtracted for the long and ADDED for the short: a long
+        # needs the move above +fee, a short below -fee. Identical to agamotto
+        # (agamotto/research.py:370-380) so the SHARED marvel PnL engine is correct
+        # for both algos. Until 2026-07-29 the short rows here were negated, making
+        # mjolnir's target position-signed under the same column names agamotto uses
+        # unsigned; the engine signed it again and every short leg booked
+        # +forward_return. See tasks/lessons.md 2026-07-29.
         new_cols = pd.DataFrame({
             "return": forward_return,
             "return_long": forward_return - fee,
-            "return_short": -(forward_return + fee),
+            "return_short": forward_return + fee,
             "return_long_raw": forward_return,
-            "return_short_raw": -forward_return,
+            "return_short_raw": forward_return,
         }, index=df.index)
         return pd.concat([df, new_cols], axis=1)
 
