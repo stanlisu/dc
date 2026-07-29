@@ -23,6 +23,7 @@
 #include "model_runner.hpp"
 
 #include <algorithm>
+#include <cmath>    // std::fabs — gcc 8 does not pull this in transitively
 #include <deque>
 #include <fstream>
 #include <map>
