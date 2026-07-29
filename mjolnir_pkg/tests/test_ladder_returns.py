@@ -41,7 +41,8 @@ def _call(df, mode, horizon_bars=1, ladder=LADDER, fee=FEE):
 #   idx 0: LONG penetrated  — dip 3.5bp (n=3), close_h=100.02, high[t+2]=100.05
 #          >= close_h -> exit at close_h=100.02 -> ret_long = +0.0002.
 #          SHORT penetrated — rise 3.5bp (n=3), low[t+2]=99.93 <= close_h ->
-#          exit at close_h -> ret_short = -0.0002.
+#          exit at close_h -> ret_short = +0.0002 (UNSIGNED market move; the
+#          short LOST here, which the consumer books via signal = -1).
 #   idx 3: LONG leftover    — dip 3.5bp (n=3), close_h=99.98, high[t+2]=99.97
 #          < close_h -> NOT penetrated -> taker exit at close_2h=close[5]=99.95
 #          -> ret_long = -0.0005 (strictly worse than the penetrated -0.0002).
@@ -62,14 +63,17 @@ def test_entry_sizing_unchanged(df):
     # idx0: dip & rise both 3.5bp -> 3 layers each, capped at LADDER=3.
     # per-unit gross long at idx0 = +0.0002 -> raw = 0.0002 * 3.
     assert out["return_long_raw"].iloc[0] == pytest.approx(0.0002 * 3, rel=1e-6)
-    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.0002 * 3, rel=1e-6)
+    # UNSIGNED (2026-07-29): the short's own exit path moved +0.0002. It is NOT
+    # negated here — marvel's engine applies signal = -1. Matches agamotto.
+    assert out["return_short_raw"].iloc[0] == pytest.approx(0.0002 * 3, rel=1e-6)
 
 
 def test_limit_then_taker_penetrated_long(df):
     out = _call(df, "limit_then_taker")
     # exit at close_h=100.02 -> gross +0.0002, fee 0.00035, size 3.
     assert out["return_long"].iloc[0] == pytest.approx((0.0002 - FEE_COST) * 3, rel=1e-6)
-    assert out["return_short"].iloc[0] == pytest.approx((-0.0002 - FEE_COST) * 3, rel=1e-6)
+    # Fee is ADDED on the short (unsigned target): it must fall below -fee to pay.
+    assert out["return_short"].iloc[0] == pytest.approx((0.0002 + FEE_COST) * 3, rel=1e-6)
 
 
 def test_limit_then_taker_leftover_long(df):
@@ -108,7 +112,7 @@ def test_ladder_mode_is_close_to_close(df):
     n_long = np.floor(((df["close"] - low_next) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
     n_short = np.floor(((high_next - df["close"]) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
     exp_long = (price_return - FEE_COST) * n_long
-    exp_short = (-price_return - FEE_COST) * n_short
+    exp_short = (price_return + FEE_COST) * n_short
     pd.testing.assert_series_equal(
         out["return_long"], exp_long.rename("return_long"), check_names=True)
     pd.testing.assert_series_equal(

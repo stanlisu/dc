@@ -122,12 +122,22 @@ def compute_ladder_returns(
     # excursion-conditioned artifact, so the exit is purely liquidate-at-close.
     size_long = low_layers
     size_short = high_layers
-    # Gross per-unit signed return BEFORE fee and size. Default ("ladder")
-    # marks the whole opened stack at the horizon close (close-to-close):
-    # long earns +price_return, short earns -price_return. fill_mode may
-    # override either the size (flat) or the exit price (limit_then_taker).
-    ret_long_gross = price_return
-    ret_short_gross = -price_return
+    # Per-unit UNSIGNED price return on each side's own exit path, BEFORE fee and
+    # size. Default ("ladder") marks the whole opened stack at the horizon close
+    # (close-to-close), so both sides see the same close-to-close move; fill_mode
+    # may override either the size (flat) or the exit price (limit_then_taker),
+    # which is why the two are tracked separately.
+    #
+    # UNSIGNED, i.e. the MARKET move, NOT the trade's P&L: a short is profitable
+    # when this is NEGATIVE. This matches agamotto (agamotto/research.py:379-380,
+    # `return_{long,short}_raw = price_return * size`) so the shared marvel PnL
+    # engine — which books `signal * y_true_raw`, with signal = -1 for a short —
+    # is correct for BOTH algos. Until 2026-07-29 mjolnir negated the short here,
+    # making its target position-SIGNED while agamotto's stayed unsigned under the
+    # SAME column names; the engine then signed mjolnir's a second time and every
+    # short leg booked +price_return. See tasks/lessons.md 2026-07-29.
+    ret_long_px = price_return
+    ret_short_px = price_return
 
     fill_mode = str(config.get("LADDER_FILL_MODE", "ladder")).lower()
     if fill_mode == "flat":
@@ -162,21 +172,27 @@ def compute_ladder_returns(
         full = close_2h.notna()                       # full t+2 window observed
         exit_long = close_h.where(high_w2 >= close_h, close_2h)
         exit_short = close_h.where(low_w2 <= close_h, close_2h)
-        ret_long_gross = (exit_long / close_safe - 1.0).where(full)
-        ret_short_gross = (-(exit_short / close_safe - 1.0)).where(full)
+        # Both UNSIGNED (see ret_{long,short}_px above): each side's own realized
+        # price move on its own exit path. The short is NOT negated here — the
+        # consumer applies the direction.
+        ret_long_px = (exit_long / close_safe - 1.0).where(full)
+        ret_short_px = (exit_short / close_safe - 1.0).where(full)
     elif fill_mode != "ladder":
         raise ValueError(
             "LADDER_FILL_MODE must be 'ladder', 'flat' or 'limit_then_taker', "
             f"got {fill_mode!r}")
 
     fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-    # return_X = (signed gross return - round-trip fee) x size. Short's gross
-    # is already negated above; fee is paid either side. Matches features.py
-    # `"return_short": -(forward_return + fee)` (i.e. -price_return - fee).
-    return_long = ((ret_long_gross - fee_cost) * size_long).rename("return_long")
-    return_short = ((ret_short_gross - fee_cost) * size_short).rename("return_short")
-    return_long_raw = (ret_long_gross * size_long).rename("return_long_raw")
-    return_short_raw = (ret_short_gross * size_short).rename("return_short_raw")
+    # Targets are UNSIGNED market returns (the trade direction is applied by the
+    # consumer). The round-trip fee is therefore SUBTRACTED for the long and ADDED
+    # for the short: a long needs the move above +fee to profit, a short needs it
+    # below -fee. Identical to agamotto (agamotto/research.py:370-380
+    # `long: price_return - fee_cost`, `short: price_return + fee_cost`) and to
+    # features.py's non-ladder path.
+    return_long = ((ret_long_px - fee_cost) * size_long).rename("return_long")
+    return_short = ((ret_short_px + fee_cost) * size_short).rename("return_short")
+    return_long_raw = (ret_long_px * size_long).rename("return_long_raw")
+    return_short_raw = (ret_short_px * size_short).rename("return_short_raw")
 
     return pd.concat(
         [return_long, return_short, return_long_raw, return_short_raw], axis=1)
