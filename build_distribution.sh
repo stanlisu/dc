@@ -9,6 +9,9 @@ set -e
 #   ./build_distribution.sh               # build + deploy all algos
 #   ./build_distribution.sh orb           # build + deploy single algo
 #   ./build_distribution.sh --build-only  # build without deploying
+#   ./build_distribution.sh --xmen        # build mjolnir + sync into the local
+#                                         #   xmen clone (then commit + PR + pull;
+#                                         #   xmen is git-deployed, never rsynced)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_ROOT="$SCRIPT_DIR/build_dist"
@@ -23,25 +26,63 @@ REMOTE_BASE="/home/stan/sandbox/marvel"
 
 # Deploy target: marvel root only (algo_pkg dirs live at REMOTE_BASE/)
 
+# ---- xmen (private Knull mirror with the real Mjolnir grafted in) ----
+# xmen vendors ONLY mjolnir_pkg, and — unlike marvel — it TRACKS that build IN GIT
+# (imported via PYTHONPATH="$XROOT:$XROOT/mjolnir_pkg/src", see launch_xmen_bot.sh).
+# So xmen is deployed by `git pull` on the host, NOT by rsync.
+#
+# We therefore sync into the LOCAL xmen clone and stop: rsyncing straight into a
+# host's ~/sandbox/xmen would leave the live checkout permanently dirty, bypass
+# review, and be silently reverted by the next `git pull`. Commit + PR + pull is
+# the deploy path. See xmen README "Refreshing the vendored mjolnir build".
+#
+# The refresh went undocumented for a release once already: xmen sat on a dc #22
+# build until 2026-07-29 while dc had moved to #23 (the UNSIGNED-target fix), and
+# nothing in this script pointed at xmen. That is why this target exists.
+XMEN_LOCAL="${XMEN_LOCAL:-$HOME/Documents/sandbox/xmen}"
+XMEN_ALGO="mjolnir"
+
 # All algo packages
 ALL_ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
 
 BUILD_ONLY=false
+XMEN_ONLY=false
 ALGOS=("${ALL_ALGOS[@]}")
+ALGOS_EXPLICIT=false
 
 # Parse args
 for arg in "$@"; do
     if [ "$arg" = "--build-only" ]; then
         BUILD_ONLY=true
+    elif [ "$arg" = "--xmen" ]; then
+        XMEN_ONLY=true
     elif [[ " ${ALL_ALGOS[*]} " =~ " ${arg} " ]]; then
         ALGOS=("$arg")
+        ALGOS_EXPLICIT=true
     else
         echo "Unknown argument: $arg"
-        echo "Usage: $0 [--build-only] [algo_name]"
+        echo "Usage: $0 [--build-only] [--xmen] [algo_name]"
         echo "Algos: ${ALL_ALGOS[*]}"
         exit 1
     fi
 done
+
+if [ "$BUILD_ONLY" = true ] && [ "$XMEN_ONLY" = true ]; then
+    echo "ERROR: --build-only and --xmen are mutually exclusive"
+    echo "       (--xmen exists to place the build into the xmen clone)"
+    exit 1
+fi
+
+# xmen vendors ONLY mjolnir_pkg — building the other 8 algos for it is pure waste,
+# so --xmen narrows the build unless an algo was named explicitly (in which case
+# an explicit non-mjolnir choice is a mistake worth failing on, not overriding).
+if [ "$XMEN_ONLY" = true ]; then
+    if [ "$ALGOS_EXPLICIT" = true ] && [ "${ALGOS[0]}" != "$XMEN_ALGO" ]; then
+        echo "ERROR: --xmen only vendors '$XMEN_ALGO', but '${ALGOS[0]}' was requested"
+        exit 1
+    fi
+    ALGOS=("$XMEN_ALGO")
+fi
 
 build_algo() {
     local algo="$1"
@@ -112,6 +153,62 @@ deploy_algo() {
 
 }
 
+# Sync the mjolnir build into the LOCAL xmen clone (git-tracked — see XMEN_LOCAL
+# above). Does NOT commit: the change is left staged for review, because this
+# replaces a live trading dependency and every file changes on every rebuild
+# (PyArmor obfuscation is not deterministic), so the diff itself proves nothing.
+# The verify step is what proves the build is correct.
+deploy_xmen() {
+    local build_dir="$BUILD_ROOT/${XMEN_ALGO}_pkg"
+
+    if [ ! -d "$build_dir" ]; then
+        echo "ERROR: no build for $XMEN_ALGO at $build_dir — build it first"
+        echo "       (xmen vendors ONLY ${XMEN_ALGO}_pkg; run: $0 $XMEN_ALGO)"
+        return 1
+    fi
+    if [ ! -d "$XMEN_LOCAL/.git" ]; then
+        echo "ERROR: no xmen git clone at $XMEN_LOCAL"
+        echo "       set XMEN_LOCAL=/path/to/xmen (it must be a git checkout —"
+        echo "       xmen is deployed by 'git pull', not rsync)"
+        return 1
+    fi
+
+    echo "  Syncing ${XMEN_ALGO}_pkg -> $XMEN_LOCAL (local clone) ..."
+    rsync -a --delete "$build_dir/" "$XMEN_LOCAL/${XMEN_ALGO}_pkg/"
+    echo "    -> $XMEN_LOCAL/${XMEN_ALGO}_pkg/"
+
+    # Prove the build carries the current target convention BEFORE it can be
+    # committed. Obfuscated builds cannot be grepped, so the checker calls the
+    # real function and reads the sign; it exits non-zero on a stale build.
+    local verifier="$XMEN_LOCAL/scripts/verify_mjolnir_build.py"
+    if [ ! -f "$verifier" ]; then
+        echo "  WARNING: $verifier missing — cannot verify the vendored build."
+    elif [ "$(uname -s)" != "Linux" ]; then
+        # The build targets linux.x86_64, so importing it here would die on the
+        # .so ("slice is not valid mach-o file"). We deliberately do NOT run it
+        # and swallow the error: a traceback followed by "expected on a Mac"
+        # trains you to ignore exactly the output that would flag a STALE build.
+        echo "  Verify SKIPPED — build is linux.x86_64, this host is $(uname -s)."
+        echo "    Run it on the target host after 'git pull' (this is the gate):"
+        echo "      PYTHONPATH=mjolnir_pkg/src python3 scripts/verify_mjolnir_build.py"
+    else
+        echo "  Verifying vendored build ..."
+        if PYTHONPATH="$XMEN_LOCAL/${XMEN_ALGO}_pkg/src" python3 "$verifier"; then
+            echo "    verify OK — target is UNSIGNED"
+        else
+            echo "    VERIFY FAILED — do NOT commit this build. See the output above."
+            return 1
+        fi
+    fi
+
+    echo ""
+    echo "  xmen is NOT deployed by this script. Next steps:"
+    echo "    cd $XMEN_LOCAL && git checkout -b chore/refresh-mjolnir && git add -A ${XMEN_ALGO}_pkg"
+    echo "    git commit && git push github <branch>   # then PR -> master"
+    echo "    ssh <host> 'cd ~/sandbox/xmen && git pull --ff-only'"
+    echo "    ssh <host> 'cd ~/sandbox/xmen && PYTHONPATH=mjolnir_pkg/src python3 scripts/verify_mjolnir_build.py'"
+}
+
 # ---- Main ----
 echo "PyArmor Algo Package Builder (local -> remote)"
 echo "==============================================="
@@ -142,14 +239,31 @@ if [ "$BUILD_ONLY" = true ]; then
 fi
 
 echo ""
+if [ "$XMEN_ONLY" = true ]; then
+    deploy_xmen
+    echo ""
+    echo "Done."
+    exit $?
+fi
+
 echo "Deploy targets:"
 echo "  1) hydra ($HYDRA_HOST)"
 echo "  2) shield ($SHIELD_HOST)"
 echo "  3) shield2 ($SHIELD2_HOST)"
-echo "  4) all"
-echo "  5) skip"
+echo "  4) all marvel hosts"
+echo "  5) xmen local clone ($XMEN_LOCAL) — ${XMEN_ALGO}_pkg only, commit+PR to deploy"
+echo "  6) all marvel hosts + xmen local clone"
+echo "  7) skip"
 echo ""
-read -p "Choose [1-5]: " choice
+read -p "Choose [1-7]: " choice
+
+deploy_marvel_all() {
+    for algo in "${ALGOS[@]}"; do
+        deploy_algo "$algo" "$HYDRA_HOST"
+        deploy_algo "$algo" "$SHIELD_HOST"
+        deploy_algo "$algo" "$SHIELD2_HOST"
+    done
+}
 
 case "$choice" in
     1)
@@ -162,13 +276,16 @@ case "$choice" in
         for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$SHIELD2_HOST"; done
         ;;
     4)
-        for algo in "${ALGOS[@]}"; do
-            deploy_algo "$algo" "$HYDRA_HOST"
-            deploy_algo "$algo" "$SHIELD_HOST"
-            deploy_algo "$algo" "$SHIELD2_HOST"
-        done
+        deploy_marvel_all
         ;;
-    5|*)
+    5)
+        deploy_xmen
+        ;;
+    6)
+        deploy_marvel_all
+        deploy_xmen
+        ;;
+    7|*)
         echo "Skipping deploy."
         ;;
 esac
