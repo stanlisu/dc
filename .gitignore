@@ -15,3 +15,7 @@ obfuscation/inventory.err
 # regenerated on failure and carries local paths. deploy.log is the record we
 # keep, not this.
 pyarmor.bug.log
+
+# sentinel_core cross-build output (artifact, never source-controlled)
+sentinel_core/build-linux/
+sentinel_core/build/

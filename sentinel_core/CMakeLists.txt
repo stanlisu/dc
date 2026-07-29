@@ -23,13 +23,22 @@ if(NOT EXISTS "${CONTRACT_DIR}/mjolnir_core.hpp")
 endif()
 
 # Build tag so any run can be traced to the exact core that produced it.
-execute_process(
-    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
-    OUTPUT_VARIABLE MJOLNIR_CORE_GITSHA
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
+# Prefer an explicitly passed sha: the containerised cross-build mounts only
+# sentinel_core/, so dc's .git is absent and an in-container `git rev-parse`
+# silently yields "unknown" — losing the trace from a running bot back to the
+# core that produced its signals. build_linux.sh computes it on the host.
 if(NOT MJOLNIR_CORE_GITSHA)
-    set(MJOLNIR_CORE_GITSHA "unknown")
+    execute_process(
+        COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+        OUTPUT_VARIABLE MJOLNIR_CORE_GITSHA
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+if(NOT MJOLNIR_CORE_GITSHA)
+    message(FATAL_ERROR
+        "MJOLNIR_CORE_GITSHA is empty and git is unavailable here.\n"
+        "  Pass -DMJOLNIR_CORE_GITSHA=<sha> (build_linux.sh does this).\n"
+        "  Refusing to build an untraceable core.")
 endif()
 
 add_library(mjolnir_core SHARED
