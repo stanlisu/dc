@@ -330,10 +330,13 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
         t.put("high_open_pct", hop); t.put("low_open_pct", lop);
     }
 
-    // NOTE: TA-Lib indicators are added by a later stage (linked against the
-    // same libta-lib the reference uses, so values are identical rather than
-    // reimplemented). Not present yet — the parity harness reports them as
-    // missing rather than pretending they pass.
+    // ---- TA-Lib indicators ------------------------------------------------
+    {
+        std::vector<std::pair<std::string, std::vector<double>>> ta;
+        talib_block::compute(t.get("close"), t.get("high"), t.get("low"),
+                             t.get("volume"), ta);
+        for (auto& kv : ta) t.put(kv.first, std::move(kv.second));
+    }
 
     // ---- rolling stats on key signals -------------------------------------
     {

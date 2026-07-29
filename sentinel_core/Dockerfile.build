@@ -1,0 +1,37 @@
+# Build environment for libmjolnir_core (linux/amd64).
+#
+# Rocky 8 pins glibc 2.28 / gcc 8.5 — the oldest deploy target — so the produced
+# .so also loads on newer-glibc hosts.
+#
+# TA-Lib is pinned to 0.6.4 because that is what PRODUCTION runs (verified on the
+# live host). TA-Lib has changed indicator internals across releases, so a
+# different version is a silent parity break rather than a rounding difference —
+# do not float this to "latest".
+FROM rockylinux/rockylinux:8
+
+ARG TALIB_VERSION=0.6.4
+
+# findutils: ta-lib's `make install` shells out to `find`, and without it the
+# install step fails quietly enough to leave a half-installed tree behind.
+RUN dnf -q install -y gcc-c++ cmake make wget tar gzip findutils && dnf clean all
+
+RUN cd /tmp && \
+    wget -q https://github.com/TA-Lib/ta-lib/releases/download/v${TALIB_VERSION}/ta-lib-${TALIB_VERSION}-src.tar.gz && \
+    tar xzf ta-lib-${TALIB_VERSION}-src.tar.gz && \
+    cd ta-lib-${TALIB_VERSION} && \
+    ./configure --prefix=/usr/local >/dev/null && \
+    make -j"$(nproc)" >/dev/null && \
+    make install >/dev/null && \
+    echo /usr/local/lib > /etc/ld.so.conf.d/usrlocal.conf && ldconfig && \
+    cd / && rm -rf /tmp/ta-lib-${TALIB_VERSION}*
+
+# Fail the IMAGE build if the pinned version is not what landed, rather than
+# discovering a parity break later from mismatched numbers. The version string
+# is NOT in the headers, so ask the library itself — that is authoritative.
+RUN test -f /usr/local/include/ta-lib/ta_libc.h || (echo "ta-lib headers missing" && exit 1)
+RUN printf '#include <ta-lib/ta_libc.h>\n#include <stdio.h>\nint main(void){printf("%%s", TA_GetVersionString());return 0;}\n' > /tmp/tv.c && \
+    gcc /tmp/tv.c -o /tmp/tv -L/usr/local/lib -lta-lib -lm && \
+    VER="$(LD_LIBRARY_PATH=/usr/local/lib /tmp/tv)" && echo "ta-lib reports: $VER" && \
+    case "$VER" in ${TALIB_VERSION}*) echo "TALIB VERSION OK" ;; \
+      *) echo "FAIL: expected ${TALIB_VERSION}, got $VER" && exit 1 ;; esac && \
+    rm -f /tmp/tv /tmp/tv.c

@@ -19,6 +19,7 @@
 #include "bar_builder.hpp"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mjolnir {
@@ -60,4 +61,13 @@ std::vector<double> rollMean(const std::vector<double>& x, int w, int mp = 1);
 std::vector<double> rollStd(const std::vector<double>& x, int w, int mp = 1);
 
 } // namespace pdops
+
+namespace talib_block {
+// Appends the TA-Lib indicator columns. Implemented in talib_block.cpp against
+// libta-lib directly, so values match the reference's wrapper exactly.
+void compute(const std::vector<double>& close, const std::vector<double>& high,
+             const std::vector<double>& low, const std::vector<double>& volume,
+             std::vector<std::pair<std::string, std::vector<double>>>& out);
+} // namespace talib_block
+
 } // namespace mjolnir

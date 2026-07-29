@@ -15,7 +15,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SENTINEL_REPO="${SENTINEL_REPO:-$(cd "$HERE/../../sentinel" && pwd)}"
-IMAGE="rockylinux/rockylinux:8"
+IMAGE="mjolnir-core-build:0.6.4"
 OUT="$HERE/build-linux/libmjolnir_core.so"
 
 DEPLOY_HOST=""
@@ -45,7 +45,6 @@ docker run --rm --platform linux/amd64 \
     -v "$SENTINEL_REPO":/sentinel:ro \
     "$IMAGE" bash -c "
         set -e
-        dnf -q install -y gcc-c++ cmake make >/dev/null 2>&1
         cd /core && rm -rf build-linux
         cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release \
               -DSENTINEL_REPO=/sentinel -DMJOLNIR_CORE_GITSHA='$SHA'

@@ -45,6 +45,7 @@ add_library(mjolnir_core SHARED
     src/core_impl.cpp
     src/bar_builder.cpp
     src/feature_engine.cpp
+    src/talib_block.cpp
     # M1 TODO — the IP modules, added as each lands:
 
 
@@ -55,6 +56,18 @@ add_library(mjolnir_core SHARED
 target_include_directories(mjolnir_core PRIVATE ${CONTRACT_DIR} src)
 target_compile_definitions(mjolnir_core PRIVATE
     MJOLNIR_CORE_GITSHA="${MJOLNIR_CORE_GITSHA}")
+# TA-Lib must be the SAME version production runs (pinned in Dockerfile.build);
+# a different version changes indicator internals and silently breaks parity.
+# -lm is required: libta-lib references asin/exp/log/sqrt and does not pull it in.
+find_library(TALIB_LIB NAMES ta-lib ta_lib HINTS /usr/local/lib /opt/homebrew/lib)
+find_path(TALIB_INC ta-lib/ta_libc.h HINTS /usr/local/include /opt/homebrew/include)
+if(NOT TALIB_LIB OR NOT TALIB_INC)
+    message(FATAL_ERROR "ta-lib not found. Build inside Dockerfile.build, which pins 0.6.4.")
+endif()
+message(STATUS "mjolnir_core: ta-lib ${TALIB_LIB}")
+target_include_directories(mjolnir_core PRIVATE ${TALIB_INC})
+target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} m)
+
 target_compile_options(mjolnir_core PRIVATE -Wall -Wextra)
 
 message(STATUS "mjolnir_core: contract=${CONTRACT_DIR} sha=${MJOLNIR_CORE_GITSHA}")
