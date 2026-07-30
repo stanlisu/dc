@@ -1,0 +1,65 @@
+{
+  "_source": "Generated from hydra:/opt/infra_configs/basealgo.json (real values).",
+  "_cores": "8/9 picked from isolcpus=2-13, avoiding feed_publisher(1,2,5,6) and DPR basealgo(2,3).",
+  "core_thread_core": 8,
+  "core_thread_name": "MJOLNIR_CORE",
+  "logger_thread_core": 9,
+  "logger_thread_name": "MJOLNIR_LOGGER",
+  "sim_date": "20260730",
+  "logger_file_path": "/home/stan/mjolnir_shadow_bundle/log",
+  "contract_file": "/opt/data/Binance/contract_futures.csv",
+  "contract_type": 2,
+  "algo_details": [
+    {
+      "library_name": "/home/stan/mjolnir_shadow_bundle/lib/libtsMjolnir.so",
+      "algo_params": "/home/stan/mjolnir_shadow_bundle/config/algo_params.mjolnir30s.json",
+      "strat_id": 2,
+      "_strat_id_note": "2, not 1 \u2014 the DPR test strat uses strat_id 1 on this host.",
+      "run_date": "20260730",
+      "products": []
+    }
+  ],
+  "node_config_details": {
+    "node_name": "tsMjolnirShadow",
+    "node_log_level": 2,
+    "node_instance_id": 2
+  },
+  "tbt_feed_details": [
+    {
+      "mode": 3,
+      "container_type": 1,
+      "container_size": 1024,
+      "shm_id": 5604
+    }
+  ],
+  "_oms_note": "Route kept for structural completeness only. This build has NO order path compiled in, so the OMS rings are never written to.",
+  "oms_route_details": [
+    {
+      "oms_route_id": 2,
+      "oms_req_config_details": {
+        "mode": 3,
+        "container_type": 1,
+        "container_size": 512,
+        "shm_id": 7299
+      },
+      "oms_resp_config_details": {
+        "mode": 3,
+        "container_type": 1,
+        "container_size": 512,
+        "shm_id": 7400
+      }
+    }
+  ],
+  "ui_req_config_details": {
+    "mode": 3,
+    "container_type": 1,
+    "container_size": 256,
+    "shm_id": 4051
+  },
+  "ui_resp_config_details": {
+    "mode": 3,
+    "container_type": 1,
+    "container_size": 256,
+    "shm_id": 4052
+  }
+}
