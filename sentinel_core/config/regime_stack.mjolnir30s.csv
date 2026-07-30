@@ -1,0 +1,3 @@
+regime,model,position,optimal_threshold
+r068_long,LightGBM,long,0.0005
+r068_short,LightGBM,short,-0.0005

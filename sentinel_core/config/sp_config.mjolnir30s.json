@@ -1,0 +1,44 @@
+{
+  "_source": "SDK sample/sp_config.json, retargeted at the mjolnir plugin.",
+  "_note": "shm ids / cores / contract_file are HOST facts — copy them from the sp_config the LTP stack already runs on this box. The values below are the SDK sample's and are almost certainly wrong for production.",
+
+  "core_thread_core": 2,
+  "core_thread_name": "LTP_STRAT_CORE",
+  "logger_thread_core": 3,
+  "logger_thread_name": "LTP_STRAT_LOGGER",
+  "sim_date": "20260730",
+  "logger_file_path": "/home/stan/mjolnir_shadow_bundle/log",
+  "contract_file": "/home/stan/mjolnir_shadow_bundle/config/contract_futures.csv",
+  "contract_type": 2,
+
+  "algo_details": [
+    {
+      "library_name": "/home/stan/mjolnir_shadow_bundle/lib/libtsMjolnir.so",
+      "algo_params": "/home/stan/mjolnir_shadow_bundle/config/algo_params.mjolnir30s.json",
+      "strat_id": 1,
+      "run_date": "20260730",
+      "products": []
+    }
+  ],
+
+  "node_config_details": {
+    "node_name": "tsLtpBaseAlgo",
+    "node_log_level": 2,
+    "node_instance_id": 1
+  },
+
+  "tbt_feed_details": [
+    { "mode": 3, "container_type": 1, "container_size": 1024, "shm_id": 5604 }
+  ],
+
+  "oms_route_details": [
+    {
+      "oms_route_id": 1,
+      "oms_req_config_details":  { "mode": 3, "container_type": 1, "container_size": 512, "shm_id": 6299 },
+      "oms_resp_config_details": { "mode": 3, "container_type": 1, "container_size": 512, "shm_id": 6399 }
+    }
+  ],
+
+  "ui_req_config_details":  { "mode": 3, "container_type": 1, "container_size": 256, "shm_id": 4051 },
+  "ui_resp_config_details": { "mode": 3, "container_type": 1, "container_size": 256, "shm_id": 4052 }
+}

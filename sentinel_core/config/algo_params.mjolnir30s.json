@@ -1,0 +1,31 @@
+{
+  "_source": "Generated from xmen pred_mjolnir.base.30s_1_xmen/setting.json (live).",
+  "_mode": "SHADOW — the strategy has no order path compiled in.",
+
+  "_FILL_ME_IN": "product_id is the ONLY value that cannot be derived from setting.json. The Python bot addresses symbols by name (BINANCE_PERP_BTC_USDT); LTP addresses them by numeric product_id. Look it up in the contract file referenced by sp_config.contract_file.",
+  "product_id": 0,
+  "levels": 5,
+
+  "dry_run": false,
+  "guard_timer_ms": 1000,
+
+  "bar_sec": 30,
+  "target_sec": 30,
+
+  "warmup_fire_gate_bars": 1080,
+
+  "min_signal_count": 1,
+  "reverse": 1,
+  "hold_ttl_bars": 2,
+
+  "is_anchor": true,
+
+  "regime_subset": "r068",
+
+  "weights_dir": "/home/stan/mjolnir_shadow_bundle/weights",
+  "regime_stack_csv": "/home/stan/mjolnir_shadow_bundle/config/regime_stack.mjolnir30s.csv",
+
+  "logger_thread_name": "tsMjolnirLogger",
+  "logger_core": 4,
+  "logger_file_path": "/home/stan/mjolnir_shadow_bundle/log/mjolnir_shadow"
+}
