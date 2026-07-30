@@ -145,11 +145,10 @@ std::vector<char> applyFilterMask(const FeaturePanel& panel,
     // Missing column -> all-true, matching the reference's per-branch guard.
     auto guard = [&](const char* col) { return !panel.has(col); };
 
-    if (code == codes::R_BASELINE) {
-        throw std::runtime_error(
-            "baseline regime removed — unconditional fires-every-bar no-brainer; "
-            "it must never reach a stack.");
-    }
+    // NOTE: there is deliberately no `baseline` branch. That regime was removed
+    // from the obfuscation map entirely, so it has no code and cannot even be
+    // expressed here — a stronger guarantee than a runtime check. An attempt to
+    // pass it arrives as an unencodable name and is refused above.
 
     if (code == codes::R_HIGH_LIQUIDATION_PRESSURE) {
         if (guard(codes::F_LIQ_BURST_RATIO)) return allTrue(n);
