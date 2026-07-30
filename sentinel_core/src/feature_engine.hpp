@@ -36,6 +36,25 @@ class FeatureEngine {
     // Whether cycle features apply (target coarser than the base bar).
     bool boundaryMode() const { return mTargetSec > mBarSec; }
 
+    // The slim anchor frame: the ONLY columns of the anchor's computed panel
+    // that cross-features read. Kept deliberately narrow — live ships this,
+    // not the anchor's whole 1000-bar buffer. Order is the wire contract; a
+    // consumer added without extending this would silently read zeros.
+    enum AnchorCol { A_MID = 0, A_BID_AMT, A_ASK_AMT, A_TRADE_IMB, A_VOLUME,
+                     A_OFI_L1, A_REL_SPREAD, A_LIQ_DIR, ANCHOR_COLS };
+
+    // Extract the slim frame for one row of an already-computed anchor panel.
+    static void extractAnchorRow(const std::vector<std::string>& names,
+                                 const std::vector<std::vector<double>>& cols,
+                                 size_t row, double* out);
+
+    // Append the anchor cross-features to a peer's panel. `anchor` is the slim
+    // frame history aligned 1:1 with the peer's rows (NaN where the anchor had
+    // no bar at that timestamp), laid out row-major ANCHOR_COLS wide.
+    void addAnchorCrossFeatures(std::vector<std::string>& names,
+                                std::vector<std::vector<double>>& cols,
+                                const std::vector<double>& anchor) const;
+
   private:
     std::vector<int> mWindows;
     int mBarSec;

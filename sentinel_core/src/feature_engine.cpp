@@ -405,3 +405,124 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
 }
 
 } // namespace mjolnir
+
+namespace mjolnir {
+
+void FeatureEngine::extractAnchorRow(const std::vector<std::string>& names,
+                                     const std::vector<std::vector<double>>& cols,
+                                     size_t row, double* out)
+{
+    auto get = [&](const char* key) -> double {
+        for (size_t j = 0; j < names.size(); ++j)
+            if (names[j] == key) return cols[j][row];
+        return NA;   // absent column -> NaN, which propagates like the reference's guard
+    };
+    out[A_MID]        = get(codes::F_MID_PRICE);
+    out[A_BID_AMT]    = get("bid_amount");        // passthrough (unmapped)
+    out[A_ASK_AMT]    = get("ask_amount");        // passthrough (unmapped)
+    out[A_TRADE_IMB]  = get(codes::F_TRADE_IMBALANCE);
+    out[A_VOLUME]     = get("volume");            // passthrough (unmapped)
+    out[A_OFI_L1]     = get("ofi_L1");            // passthrough (unmapped)
+    out[A_REL_SPREAD] = get(codes::F_RELATIVE_SPREAD);
+    out[A_LIQ_DIR]    = get(codes::F_LIQ_DIRECTIONAL_IMBALANCE);
+}
+
+void FeatureEngine::addAnchorCrossFeatures(std::vector<std::string>& names,
+                                           std::vector<std::vector<double>>& cols,
+                                           const std::vector<double>& anchor) const
+{
+    const size_t n = cols.empty() ? 0 : cols[0].size();
+    if (n == 0 || anchor.size() != n * ANCHOR_COLS) return;   // no-op, as the reference does
+
+    // pandas .clip() PRESERVES NaN; std::max/std::min do NOT (std::max(0.0, NaN)
+    // returns 0.0). Collapsing NaN to a number here silently feeds a real value
+    // into the rolling windows where the anchor simply had no bar — the base
+    // column still matches after sanitisation, but every rolling stat drifts.
+    auto nclip = [](double v, double lo, double hi) {
+        if (std::isnan(v)) return v;
+        return v < lo ? lo : (v > hi ? hi : v);
+    };
+    auto nclip_lo = [](double v, double lo) {
+        if (std::isnan(v)) return v;
+        return v < lo ? lo : v;
+    };
+
+    auto acol = [&](int c) {
+        std::vector<double> v(n);
+        for (size_t i = 0; i < n; ++i) v[i] = anchor[i * ANCHOR_COLS + c];
+        return v;
+    };
+    auto put = [&](const std::string& nm, std::vector<double> v) {
+        for (size_t j = 0; j < names.size(); ++j)
+            if (names[j] == nm) { cols[j] = std::move(v); return; }
+        names.push_back(nm); cols.push_back(std::move(v));
+    };
+    auto find = [&](const std::string& nm) -> const std::vector<double>* {
+        for (size_t j = 0; j < names.size(); ++j) if (names[j] == nm) return &cols[j];
+        return nullptr;
+    };
+
+    const auto mid   = acol(A_MID);
+    const auto bidq  = acol(A_BID_AMT);
+    const auto askq  = acol(A_ASK_AMT);
+    const auto ti    = acol(A_TRADE_IMB);
+    const auto vol   = acol(A_VOLUME);
+    const auto ofi   = acol(A_OFI_L1);
+    const auto rspr  = acol(A_REL_SPREAD);
+    const auto liqd  = acol(A_LIQ_DIR);
+
+    // pct_change then shift(1) — both lags are shifted, matching the reference.
+    put(codes::F_BTC_MID_RETURN_LAG1, pdops::shift(pdops::pctChange(mid, 1), 1));
+    put(codes::F_BTC_MID_RETURN_LAG4, pdops::shift(pdops::pctChange(mid, 4), 1));
+
+    {
+        std::vector<double> v(n);
+        for (size_t i = 0; i < n; ++i) {
+            const double b = nclip_lo(bidq[i], 0.0);   // .clip(lower=0), NaN-preserving
+            const double a = nclip_lo(askq[i], 0.0);
+            v[i] = (b - a) / (b + a + EPS);
+        }
+        put(codes::F_BTC_BOOK_IMBALANCE_L1, v);
+    }
+    {
+        // buy_vol = ((ti+1)/2 * volume).clip(0, volume); then / (volume+eps), clipped [0,1]
+        std::vector<double> v(n);
+        for (size_t i = 0; i < n; ++i) {
+            double bv = (ti[i] + 1.0) / 2.0 * vol[i];
+            bv = nclip(bv, 0.0, vol[i]);
+            const double r = bv / (vol[i] + EPS);
+            v[i] = nclip(r, 0.0, 1.0);
+        }
+        put(codes::F_BTC_TRADE_IMBALANCE, v);
+    }
+    put(codes::F_BTC_OFI_L1, ofi);
+    {
+        const std::vector<double>* self_rs = find(codes::F_RELATIVE_SPREAD);
+        if (self_rs) {
+            std::vector<double> v(n);
+            for (size_t i = 0; i < n; ++i) v[i] = rspr[i] / ((*self_rs)[i] + EPS);
+            put(codes::F_BTC_SPREAD_RATIO, v);
+        }
+    }
+    put(codes::F_BTC_LIQ_DIRECTIONAL, liqd);
+
+    // Rolling stats on the three cross-signals, same min_periods rule as the
+    // key-signal rollings (max(1, w//4)) — not 1.
+    const char* ROLLED[] = {codes::F_BTC_BOOK_IMBALANCE_L1,
+                            codes::F_BTC_TRADE_IMBALANCE,
+                            codes::F_BTC_OFI_L1};
+    for (const char* k : ROLLED) {
+        const std::vector<double>* src = find(k);
+        if (!src) continue;
+        const std::vector<double> copy = *src;   // put() may reallocate
+        for (int w : mWindows) {
+            const int mp = std::max(1, w / 4);
+            put(std::string(k) + "_roll" + std::to_string(w) + "_mean",
+                pdops::rollMean(copy, w, mp));
+            put(std::string(k) + "_roll" + std::to_string(w) + "_std",
+                pdops::rollStd(copy, w, mp));
+        }
+    }
+}
+
+} // namespace mjolnir
