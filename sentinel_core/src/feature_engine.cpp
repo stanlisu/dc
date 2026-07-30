@@ -10,7 +10,7 @@
 namespace mjolnir {
 
 namespace {
-// depth_imbalance_L{1,3,5} are the only DYNAMIC column names that are mapped;
+// The L-indexed imbalance columns are the only DYNAMIC names that are mapped;
 // the rest of the L-indexed columns (depth_bid_L*, ofi_L*) are passthrough.
 inline const char* depthImbalanceCode(int L)
 {
@@ -135,7 +135,7 @@ struct Table {
 bool isPointInTime(const std::string& c)
 {
     static const char* PREFIXES[] = {"bids_", "asks_", "depth_bid_L", "depth_ask_L",
-                                     "depth_imbalance_L", "ofi_L", codes::F_OFI_AGG};
+                                     "ofi_L"};
     for (const char* p : PREFIXES) {
         if (c.rfind(p, 0) == 0) return true;
     }
