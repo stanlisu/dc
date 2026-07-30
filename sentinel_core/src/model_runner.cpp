@@ -1,34 +1,22 @@
 #include "model_runner.hpp"
 #include "regime_gate.hpp"          // FeaturePanel
-#include "feature_map_generated.hpp"
 
 #include <LightGBM/c_api.h>
 
 #include <cmath>
 #include <fstream>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 
 namespace mjolnir {
 
-std::string encodeFeatureName(const std::string& real)
+std::string encodeFeatureName(const std::string& name)
 {
-    const auto& M = featureNameToCode();
-    // Exact hit first.
-    auto it = M.find(real);
-    if (it != M.end()) return it->second;
-
-    // Structure-preserving: "<base>_roll<w>_<stat>" -> "<code>_roll<w>_<stat>".
-    // The codec keeps this suffix as structure rather than mapping the whole
-    // composed name, so the base must be encoded and the suffix reattached.
-    static const std::regex re(R"(^(.*)_roll(\d+)_(mean|std)$)");
-    std::smatch m;
-    if (std::regex_match(real, m, re)) {
-        auto bit = M.find(m[1].str());
-        if (bit != M.end()) return bit->second + "_roll" + m[2].str() + "_" + m[3].str();
-    }
-    return real;   // unmapped (passthrough column) — caller decides if that is OK
+    // IDENTITY. The feature engine now emits CODED column names directly, so no
+    // translation is needed — and crucially, no name table is embedded. The
+    // earlier real->code map put all 100 feature names into the .so, where
+    // `strings` recovered them.
+    return name;
 }
 
 ModelRunner::~ModelRunner()
@@ -100,15 +88,6 @@ double ModelRunner::predictRow(const FeaturePanel& panel, size_t row) const
         if (panel.has(want)) {
             v = panel.get(want)[row];
             found = true;
-        } else {
-            // Otherwise scan for the real name that encodes to it.
-            for (const auto& real : panel.names()) {
-                if (encodeFeatureName(real) == want) {
-                    v = panel.get(real)[row];
-                    found = true;
-                    break;
-                }
-            }
         }
         if (!found)
             throw std::runtime_error(
