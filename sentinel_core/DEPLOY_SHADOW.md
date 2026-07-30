@@ -54,10 +54,15 @@ the name table, which is what made the built `.so` recoverable with `strings`.
 Produce them with:
 
 ```bash
-python dc/sentinel_core/tools/export_weights.py \
-    --weights <...>/.weight_cache/weights/window_YYYY_MM_DD \
+PYTHONPATH=mjolnir_pkg/src python marvel/mjolnir/gauntlet/export_sentinel_weights.py \
+    --weights <exp>/.weight_cache/weights/window_YYYY_MM_DD \
     --out     <bundle>/weights
 ```
+
+The exporter lives in **marvel**, not here, on purpose: the only thing it needs
+from the obfuscation system is the regime encoder, and that codec is already
+vendored into the deployed mjolnir package (`mjolnir._obf.codec`). So dc never
+has to exist on a machine that exports weights or runs the bundle.
 
 That tool re-predicts through both the original sklearn object and the exported
 booster and refuses to write if they disagree, so a silently-different model

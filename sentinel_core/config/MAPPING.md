@@ -64,10 +64,15 @@ are refused by design — accepting them would require embedding the name table,
 which is what made the built `.so` recoverable with `strings`.
 
 ```bash
-python dc/sentinel_core/tools/export_weights.py \
+PYTHONPATH=mjolnir_pkg/src python marvel/mjolnir/gauntlet/export_sentinel_weights.py \
     --weights <exp>/.weight_cache/weights/window_YYYY_MM_DD \
     --out     <bundle>/weights
 ```
+
+The exporter lives in **marvel**, not here, on purpose: the only thing it needs
+from the obfuscation system is the regime encoder, and that codec is already
+vendored into the deployed mjolnir package (`mjolnir._obf.codec`). So dc never
+has to exist on a machine that exports weights or runs the bundle.
 
 Live `WEIGHTS_PATH` is currently `window_2026_07_07`; export **that** window, not
 an older one, or the shadow will disagree with the bot for reasons that have
