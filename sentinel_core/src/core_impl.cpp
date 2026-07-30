@@ -23,7 +23,9 @@
 #include "model_runner.hpp"
 
 #include <algorithm>
-#include <cmath>    // std::fabs — gcc 8 does not pull this in transitively
+#include <array>
+#include <cmath>
+#include <limits>    // std::fabs — gcc 8 does not pull this in transitively
 #include <deque>
 #include <fstream>
 #include <map>
@@ -236,19 +238,34 @@ class Core final : public ICore {
 
     // ---- anchor bus -------------------------------------------------------
     bool isAnchor() const override { return mIsAnchor; }
-    int  anchorFrameSize() const override { return static_cast<int>(mAnchorFrame.size()); }
+    int  anchorFrameSize() const override { return static_cast<int>(mOwnFrame.size()); }
     const double* anchorFrame() const override
     {
-        return mAnchorFrame.empty() ? nullptr : mAnchorFrame.data();
+        // Populated by decide() on the anchor. Empty until the first scored bar,
+        // so a peer cannot consume a frame that was never computed.
+        return mOwnFrame.empty() ? nullptr : mOwnFrame.data();
     }
     void setAnchorFrame(const double* frame, int n, int64_t barTsNs) override
     {
         if (frame == nullptr || n <= 0) {
-            mAnchorFrame.clear();
-            mAnchorBarTs = 0;
+            // Absent anchor state is NOT silently tolerated: the peer keeps its
+            // history but records nothing for this bar, so the row aligns to NaN
+            // and the model's missing-feature check fires rather than predicting
+            // from a substituted value.
             return;
         }
-        mAnchorFrame.assign(frame, frame + n);
+        if (n != FeatureEngine::ANCHOR_COLS) {
+            throw std::runtime_error(
+                "anchor frame width " + std::to_string(n) + " != expected "
+                + std::to_string(FeatureEngine::ANCHOR_COLS)
+                + " — publisher/consumer version skew");
+        }
+        std::array<double, FeatureEngine::ANCHOR_COLS> row{};
+        for (int i = 0; i < n; ++i) row[static_cast<size_t>(i)] = frame[i];
+        mAnchorHist[barTsNs] = row;
+        // Bound the history the same way the bar buffer is bounded.
+        while (mAnchorHist.size() > static_cast<size_t>(BUFFER_MAXLEN) * 2)
+            mAnchorHist.erase(mAnchorHist.begin());
         mAnchorBarTs = barTsNs;
     }
 
@@ -263,6 +280,31 @@ class Core final : public ICore {
         std::vector<std::string> names;
         std::vector<std::vector<double>> cols;
         mFeatures->compute(win, names, cols);
+
+        if (mIsAnchor) {
+            // Publish OUR slim frame for the bar we are about to score, so peers
+            // join on the same bar_ts rather than on whatever arrived last.
+            mOwnFrame.assign(FeatureEngine::ANCHOR_COLS, 0.0);
+            FeatureEngine::extractAnchorRow(names, cols, win.size() - 2, mOwnFrame.data());
+            mOwnFrameBarTs = win[win.size() - 2].bucket_ms * 1000000LL;
+        } else {
+            // Peers: align the anchor history to OUR bars BY bar_ts. Rows with no
+            // anchor bar stay NaN — never carried forward from a neighbour, which
+            // would silently invent cross-features.
+            std::vector<double> anchor(win.size() * FeatureEngine::ANCHOR_COLS,
+                                       std::numeric_limits<double>::quiet_NaN());
+            size_t matched = 0;
+            for (size_t i = 0; i < win.size(); ++i) {
+                auto it = mAnchorHist.find(win[i].bucket_ms * 1000000LL);
+                if (it == mAnchorHist.end()) continue;
+                for (int c = 0; c < FeatureEngine::ANCHOR_COLS; ++c)
+                    anchor[i * FeatureEngine::ANCHOR_COLS + c] = it->second[static_cast<size_t>(c)];
+                ++matched;
+            }
+            mLastAnchorMatched = matched;
+            mFeatures->addAnchorCrossFeatures(names, cols, anchor);
+        }
+
         FeaturePanel panel(names, cols);
 
         // iloc[-2]: the row BEFORE the closing bar.
@@ -371,8 +413,11 @@ class Core final : public ICore {
     int64_t mPendingBarTsNs{0};
     bool mHasPending{false};
 
-    std::vector<double> mAnchorFrame;
+    std::map<int64_t, std::array<double, FeatureEngine::ANCHOR_COLS>> mAnchorHist;
+    std::vector<double> mOwnFrame;      // anchor role: our slim frame to publish
+    int64_t mOwnFrameBarTs{0};
     int64_t mAnchorBarTs{0};
+    size_t  mLastAnchorMatched{0};
 
     Decision mHeld;
     int mHeldLeft{0};
