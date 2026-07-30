@@ -77,10 +77,14 @@ if(NOT LGBM_LIB OR NOT LGBM_INC)
 endif()
 message(STATUS "mjolnir_core: lightgbm ${LGBM_LIB}")
 target_include_directories(mjolnir_core PRIVATE ${LGBM_INC})
-# gomp/pthread: LightGBM static pulls in OpenMP; -static-libstdc++/-libgcc so the
-# artifact does not depend on the build image's newer runtime either.
+# gomp/pthread: LightGBM's static lib pulls in OpenMP.
+#
+# libstdc++ is deliberately left SHARED. It is a standard system library present
+# on every target, the build image is the same gcc 8.5 as the deploy host, and
+# newer hosts are backward compatible — whereas ta-lib and LightGBM genuinely do
+# not exist outside this image, which is why only those are static. (Rocky 8's
+# gcc-c++ ships no libstdc++.a anyway, so -static-libstdc++ just fails to link.)
 target_link_libraries(mjolnir_core PRIVATE ${TALIB_LIB} ${LGBM_LIB} gomp pthread m)
-target_link_options(mjolnir_core PRIVATE -static-libstdc++ -static-libgcc)
 
 target_compile_options(mjolnir_core PRIVATE -Wall -Wextra)
 
