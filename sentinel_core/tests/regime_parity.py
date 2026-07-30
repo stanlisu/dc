@@ -12,6 +12,8 @@ failure that survives eyeballing and quietly changes which bars trade.
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -67,7 +69,24 @@ def main() -> int:
     sys.path.insert(0, args.pkg_src)
     from mjolnir.core import regime_filters as rf  # noqa: PLC0415
 
-    specs = [f"{n}|{p}" for n, p in REGIMES]
+    # The C++ gate accepts codes only (real names are refused so they cannot be
+    # recovered from the .so). Encode here — the harness legitimately has the map.
+    regmap = json.loads((Path(args.pkg_src).parent.parent / "obfuscation" / "map.json")
+                        .read_text())["regimes"]
+
+    def enc(expr: str) -> str:
+        out = []
+        for tok in re.split(r"(_and_|_or_)", expr):
+            if tok in ("_and_", "_or_"):
+                out.append(tok); continue
+            base, suf = tok, ""
+            for s2 in ("_long", "_short"):
+                if base.endswith(s2):
+                    base, suf = base[: -len(s2)], s2
+            out.append((regmap.get(base, base)) + suf)
+        return "".join(out)
+
+    specs = [f"{enc(n)}|{p}" for n, p in REGIMES]
     proc = subprocess.run([args.driver, str(BAR_SEC), str(TARGET_SEC), *specs],
                           capture_output=True, text=True, input="\n".join(events))
     if proc.returncode != 0:
@@ -78,7 +97,7 @@ def main() -> int:
 
     bad, checked = [], 0
     for name, pos in REGIMES:
-        key = f"{name}|{pos}"
+        key = f"{enc(name)}|{pos}"
         try:
             ref_mask = rf.apply_filter_mask(panel, name, pos).to_numpy(bool)
         except Exception as exc:                      # noqa: BLE001

@@ -31,6 +31,30 @@ from pathlib import Path
 import joblib
 import numpy as np
 
+_HERE = Path(__file__).resolve().parent
+
+
+def _regime_map() -> dict:
+    """real regime name -> rNNN, from the single source of truth."""
+    mp = json.loads((_HERE / ".." / ".." / "obfuscation" / "map.json").read_text())
+    return mp["regimes"]
+
+
+def encode_regime_dir(name: str, regmap: dict) -> str:
+    """'<real>_long' -> '<code>_long'. The C++ core accepts CODES ONLY — real
+    names are refused there so none can be recovered from the built .so."""
+    for suffix in ("_long", "_short"):
+        if name.endswith(suffix):
+            base = name[: -len(suffix)]
+            code = regmap.get(base)
+            if code is None:
+                raise SystemExit(f"regime {base!r} is not in the obfuscation map")
+            return code + suffix
+    code = regmap.get(name)
+    if code is None:
+        raise SystemExit(f"regime {name!r} is not in the obfuscation map")
+    return code
+
 
 def export_one(regime_dir: Path, out_dir: Path, tol: float) -> dict:
     model_p = regime_dir / "lightgbm_model.pkl"
@@ -127,12 +151,16 @@ def main() -> int:
     if not regimes:
         raise SystemExit(f"no regime dirs under {win}")
 
+    regmap = _regime_map()
     report = []
     for rd in regimes:
-        info = export_one(rd, out / rd.name, args.tol)
+        coded = encode_regime_dir(rd.name, regmap)
+        info = export_one(rd, out / coded, args.tol)
+        info["coded_dir"] = coded
         report.append(info)
-        print(f"  {info['regime']}: {info['n_features']} feats, {info['n_trees']} trees, "
-              f"scaler={info['scaler']}, verify_max_diff={info['verify_max_diff']:.2e}")
+        print(f"  {info['regime']} -> {info['coded_dir']}: {info['n_features']} feats, "
+              f"{info['n_trees']} trees, scaler={info['scaler']}, "
+              f"verify_max_diff={info['verify_max_diff']:.2e}")
 
     (out / "export_report.json").write_text(json.dumps(report, indent=2))
     print(f"=== exported {len(report)} regimes -> {out} (all verified) ===")

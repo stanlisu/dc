@@ -1,4 +1,5 @@
 #include "feature_engine.hpp"
+#include "codes_generated.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,17 @@
 namespace mjolnir {
 
 namespace {
+// depth_imbalance_L{1,3,5} are the only DYNAMIC column names that are mapped;
+// the rest of the L-indexed columns (depth_bid_L*, ofi_L*) are passthrough.
+inline const char* depthImbalanceCode(int L)
+{
+    switch (L) {
+        case 1: return codes::F_DEPTH_IMBALANCE_L1;
+        case 3: return codes::F_DEPTH_IMBALANCE_L3;
+        case 5: return codes::F_DEPTH_IMBALANCE_L5;
+        default: return "";
+    }
+}
 constexpr double NA = std::numeric_limits<double>::quiet_NaN();
 constexpr double EPS = 1e-10;
 const int MA_PERIODS[3] = {7, 25, 99};
@@ -123,15 +135,15 @@ struct Table {
 bool isPointInTime(const std::string& c)
 {
     static const char* PREFIXES[] = {"bids_", "asks_", "depth_bid_L", "depth_ask_L",
-                                     "depth_imbalance_L", "ofi_L", "ofi_agg"};
+                                     "depth_imbalance_L", "ofi_L", codes::F_OFI_AGG};
     for (const char* p : PREFIXES) {
         if (c.rfind(p, 0) == 0) return true;
     }
     static const std::vector<std::string> EXACT = {
         "bid_price", "bid_amount", "ask_price", "ask_amount",
-        "spread", "mid_price", "relative_spread", "microprice", "microprice_vs_mid",
+        codes::F_SPREAD, codes::F_MID_PRICE, codes::F_RELATIVE_SPREAD, codes::F_MICROPRICE, codes::F_MICROPRICE_VS_MID,
         "mark_price", "index_price", "open_interest",
-        "funding_rate", "next_funding_time", "predicted_funding_rate", "basis_pct"};
+        "funding_rate", "next_funding_time", "predicted_funding_rate", codes::F_BASIS_PCT};
     return std::find(EXACT.begin(), EXACT.end(), c) != EXACT.end();
 }
 
@@ -160,7 +172,7 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
     t.put("sell_vol", col([](const Bar& b) { return b.sell_vol; }));
     t.put("n_trades", col([](const Bar& b) { return double(b.n_trades); }));
     t.put("vwap",     col([](const Bar& b) { return b.vwap; }));
-    t.put("trade_imbalance", col([](const Bar& b) { return b.trade_imbalance; }));
+    t.put(codes::F_TRADE_IMBALANCE, col([](const Bar& b) { return b.trade_imbalance; }));
     t.put("bid_price",  col([](const Bar& b) { return b.bid_price; }));
     t.put("bid_amount", col([](const Bar& b) { return b.bid_amount; }));
     t.put("ask_price",  col([](const Bar& b) { return b.ask_price; }));
@@ -182,13 +194,13 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
     t.put("funding_rate", col([](const Bar& b) { return b.funding_rate; }));
     t.put("predicted_funding_rate", col([](const Bar& b) { return b.predicted_funding_rate; }));
     t.put("open_interest", col([](const Bar& b) { return b.open_interest; }));
-    t.put("liq_long_notional",  col([](const Bar& b) { return b.liq_long_notional; }));
-    t.put("liq_short_notional", col([](const Bar& b) { return b.liq_short_notional; }));
+    t.put(codes::F_LIQ_LONG_NOTIONAL,  col([](const Bar& b) { return b.liq_long_notional; }));
+    t.put(codes::F_LIQ_SHORT_NOTIONAL, col([](const Bar& b) { return b.liq_short_notional; }));
     t.put("liq_long_count",  col([](const Bar& b) { return double(b.liq_long_count); }));
     t.put("liq_short_count", col([](const Bar& b) { return double(b.liq_short_count); }));
     t.put("liq_total_count", col([](const Bar& b) { return double(b.liq_total_count); }));
-    t.put("cycle_progress",   col([](const Bar& b) { return b.cycle_progress; }));
-    t.put("secs_to_boundary", col([](const Bar& b) { return double(b.secs_to_boundary); }));
+    t.put(codes::F_CYCLE_PROGRESS,   col([](const Bar& b) { return b.cycle_progress; }));
+    t.put(codes::F_SECS_TO_BOUNDARY, col([](const Bar& b) { return double(b.secs_to_boundary); }));
 
     // ---- book features ---------------------------------------------------
     {
@@ -205,14 +217,14 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             micro[i] = (bp[i] * aq + ap[i] * bq) / tot;
             mvm[i] = micro[i] - mid[i];
         }
-        t.put("spread", spread); t.put("mid_price", mid); t.put("relative_spread", rel);
-        t.put("microprice", micro); t.put("microprice_vs_mid", mvm);
+        t.put(codes::F_SPREAD, spread); t.put(codes::F_MID_PRICE, mid); t.put(codes::F_RELATIVE_SPREAD, rel);
+        t.put(codes::F_MICROPRICE, micro); t.put(codes::F_MICROPRICE_VS_MID, mvm);
         for (int L : {1, 3, 5}) {
             const auto& b = t.get("depth_bid_L" + std::to_string(L));
             const auto& a = t.get("depth_ask_L" + std::to_string(L));
             std::vector<double> di(n);
             for (size_t i = 0; i < n; ++i) di[i] = (b[i] - a[i]) / (b[i] + a[i] + EPS);
-            t.put("depth_imbalance_L" + std::to_string(L), di);
+            t.put(depthImbalanceCode(L), di);
         }
     }
 
@@ -232,7 +244,7 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             }
         }
         for (size_t i = 0; i < n; ++i) if (!any[i]) agg[i] = 0.0;
-        t.put("ofi_agg", agg);
+        t.put(codes::F_OFI_AGG, agg);
     }
 
     // ---- derivative -------------------------------------------------------
@@ -240,7 +252,7 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
         const auto& mk = t.get("mark_price"); const auto& ix = t.get("index_price");
         std::vector<double> basis(n);
         for (size_t i = 0; i < n; ++i) basis[i] = (mk[i] - ix[i]) / (ix[i] + EPS) * 100.0;
-        t.put("basis_pct", basis);
+        t.put(codes::F_BASIS_PCT, basis);
 
         // pre_funding: within 2h before 00:00 / 08:00 / 16:00 UTC.
         std::vector<double> pf(n, 0.0);
@@ -256,7 +268,7 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             }
             pf[i] = hit ? 1.0 : 0.0;
         }
-        t.put("pre_funding", pf);
+        t.put(codes::F_PRE_FUNDING, pf);
     }
 
     // ---- POINT-IN-TIME SHIFT (before rolling stats and targets) ----------
@@ -267,27 +279,27 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
 
     // ---- liquidation ------------------------------------------------------
     {
-        const auto& ll = t.get("liq_long_notional");
-        const auto& ls = t.get("liq_short_notional");
+        const auto& ll = t.get(codes::F_LIQ_LONG_NOTIONAL);
+        const auto& ls = t.get(codes::F_LIQ_SHORT_NOTIONAL);
         std::vector<double> tot(n);
         for (size_t i = 0; i < n; ++i) {
             tot[i] = (isna(ll[i]) ? 0.0 : ll[i]) + (isna(ls[i]) ? 0.0 : ls[i]);
         }
-        t.put("liq_total_notional", tot);
+        t.put(codes::F_LIQ_TOTAL_NOTIONAL, tot);
         const auto r60 = pdops::rollMean(tot, 60);
         std::vector<double> burst(n), dimb(n);
         for (size_t i = 0; i < n; ++i) {
             burst[i] = tot[i] / (r60[i] + EPS);
             dimb[i] = ((isna(ll[i]) ? 0.0 : ll[i]) - (isna(ls[i]) ? 0.0 : ls[i])) / (tot[i] + EPS);
         }
-        t.put("liq_burst_ratio", burst);
-        t.put("liq_directional_imbalance", dimb);
+        t.put(codes::F_LIQ_BURST_RATIO, burst);
+        t.put(codes::F_LIQ_DIRECTIONAL_IMBALANCE, dimb);
     }
 
     // ---- trade flow -------------------------------------------------------
     {
         const auto& close = t.get("close");
-        const auto& ti = t.get("trade_imbalance");
+        const auto& ti = t.get(codes::F_TRADE_IMBALANCE);
         const auto& vol = t.get("volume");
         const auto& nt = t.get("n_trades");
         const auto& open_ = t.get("open");
@@ -298,9 +310,9 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             tint[i] = nt[i] / (r60[i] + EPS);
             kyle[i] = std::fabs(close[i] - open_[i]) / (vol[i] + EPS);
         }
-        t.put("dollar_tsi", dtsi);
-        t.put("trade_intensity", tint);
-        t.put("kyle_lambda", kyle);
+        t.put(codes::F_DOLLAR_TSI, dtsi);
+        t.put(codes::F_TRADE_INTENSITY, tint);
+        t.put(codes::F_KYLE_LAMBDA, kyle);
     }
 
     // ---- price features (non-TA-Lib) --------------------------------------
@@ -313,9 +325,9 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
         for (int i = 0; i < 3; ++i) {
             t.put("mvg" + std::to_string(i + 1), pdops::rollMean(close, MA_PERIODS[i]));
         }
-        t.put("ret_lag1", pdops::shift(hist_ret, 1));
-        t.put("ret_lag2", pdops::shift(hist_ret, 2));
-        t.put("ret_lag3", pdops::shift(hist_ret, 3));
+        t.put(codes::F_RET_LAG1, pdops::shift(hist_ret, 1));
+        t.put(codes::F_RET_LAG2, pdops::shift(hist_ret, 2));
+        t.put(codes::F_RET_LAG3, pdops::shift(hist_ret, 3));
         std::vector<double> pr(n), prp(n), ocd(n), ocp(n), hop(n), lop(n);
         for (size_t i = 0; i < n; ++i) {
             pr[i] = high[i] - low[i];
@@ -325,9 +337,9 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             hop[i] = (high[i] - open_[i]) / (open_[i] + EPS);
             lop[i] = (low[i] - open_[i]) / (open_[i] + EPS);
         }
-        t.put("price_range", pr); t.put("price_range_pct", prp);
-        t.put("open_close_diff", ocd); t.put("open_close_pct", ocp);
-        t.put("high_open_pct", hop); t.put("low_open_pct", lop);
+        t.put(codes::F_PRICE_RANGE, pr); t.put(codes::F_PRICE_RANGE_PCT, prp);
+        t.put(codes::F_OPEN_CLOSE_DIFF, ocd); t.put(codes::F_OPEN_CLOSE_PCT, ocp);
+        t.put(codes::F_HIGH_OPEN_PCT, hop); t.put(codes::F_LOW_OPEN_PCT, lop);
     }
 
     // ---- TA-Lib indicators ------------------------------------------------
@@ -340,8 +352,8 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
 
     // ---- rolling stats on key signals -------------------------------------
     {
-        static const char* KEY[] = {"trade_imbalance", "ofi_agg", "depth_imbalance_L5",
-                                    "relative_spread", "dollar_tsi", "kyle_lambda"};
+        static const char* KEY[] = {codes::F_TRADE_IMBALANCE, codes::F_OFI_AGG, codes::F_DEPTH_IMBALANCE_L5,
+                                    codes::F_RELATIVE_SPREAD, codes::F_DOLLAR_TSI, codes::F_KYLE_LAMBDA};
         for (const char* k : KEY) {
             if (!t.has(k)) continue;
             const auto src = t.get(k);   // copy: put() may reallocate storage
@@ -358,7 +370,7 @@ void FeatureEngine::compute(const std::vector<Bar>& bars,
             const auto& v = t.get("volume");
             std::vector<double> vr(n);
             for (size_t i = 0; i < n; ++i) vr[i] = v[i] / (ma7[i] + EPS);
-            t.put("vol_ratio", vr);
+            t.put(codes::F_VOL_RATIO, vr);
         }
     }
 
