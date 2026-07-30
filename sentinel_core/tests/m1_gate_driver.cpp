@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <algorithm>
 #include <vector>
 
 using namespace mjolnir;
@@ -52,7 +53,15 @@ double toD(const std::string& s)
 
 int main(int argc, char** argv)
 {
-    if (argc < 4) { std::fprintf(stderr, "usage: %s <bars.csv> <tasks.csv> <weights_root>\n", argv[0]); return 2; }
+    if (argc < 4) { std::fprintf(stderr, "usage: %s <bars.csv> <tasks.csv> <weights_root> [zero_cols]\n", argv[0]); return 2; }
+    // Optional 4th arg: comma-separated CODED feature names to force to 0.0.
+    // Used to measure what a feature the LTP feed cannot supply actually costs.
+    std::vector<std::string> zero_cols;
+    if (argc >= 5) {
+        std::stringstream zs(argv[4]); std::string tok;
+        while (std::getline(zs, tok, ',')) if (!tok.empty()) zero_cols.push_back(tok);
+        std::fprintf(stderr, "[m1] zeroing %zu feature column(s)\n", zero_cols.size());
+    }
 
     // ---- load bars, grouped by symbol in file order -----------------------
     std::ifstream bf(argv[1]);
@@ -145,6 +154,10 @@ int main(int argc, char** argv)
         std::vector<std::string> names;
         std::vector<std::vector<double>> cols;
         fe.compute(win, names, cols);
+        for (const auto& z : zero_cols)
+            for (size_t j = 0; j < names.size(); ++j)
+                if (names[j] == z) std::fill(cols[j].begin(), cols[j].end(), 0.0);
+
         FeaturePanel panel(names, cols);
 
         auto mit = models.find(regime_dir);
