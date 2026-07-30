@@ -42,9 +42,23 @@ def main() -> int:
 
     fired["bar_ts_ns"] = (
         pd.to_datetime(fired["bar_ts"], utc=True, format="mixed").astype("int64"))
-    # regime column carries e.g. "<name>_short"; the exported weight dir uses
-    # exactly that name.
-    fired["regime_dir"] = fired["regime"].astype(str)
+    # The decisions CSV records the regime by REAL name; the core and the
+    # exported weight dirs are CODED (no real name compiles into the .so).
+    # Encode here — the harness legitimately holds the map.
+    import json as _json
+    _regmap = _json.loads((Path(__file__).resolve().parents[2] / "obfuscation" /
+                           "map.json").read_text())["regimes"]
+
+    def _enc_dir(name: str) -> str:
+        for suf in ("_long", "_short"):
+            if name.endswith(suf):
+                base = name[: -len(suf)]
+                if base not in _regmap:
+                    raise SystemExit(f"regime {base!r} not in the obfuscation map")
+                return _regmap[base] + suf
+        return _regmap.get(name, name)
+
+    fired["regime_dir"] = fired["regime"].astype(str).map(_enc_dir)
     if args.limit:
         fired = fired.head(args.limit)
 

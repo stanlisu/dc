@@ -140,6 +140,8 @@ bool isPointInTime(const std::string& c)
         if (c.rfind(p, 0) == 0) return true;
     }
     static const std::vector<std::string> EXACT = {
+        codes::F_DEPTH_IMBALANCE_L1, codes::F_DEPTH_IMBALANCE_L3,
+        codes::F_DEPTH_IMBALANCE_L5, codes::F_OFI_AGG,
         "bid_price", "bid_amount", "ask_price", "ask_amount",
         codes::F_SPREAD, codes::F_MID_PRICE, codes::F_RELATIVE_SPREAD, codes::F_MICROPRICE, codes::F_MICROPRICE_VS_MID,
         "mark_price", "index_price", "open_interest",

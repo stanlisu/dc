@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,6 +84,21 @@ def main() -> int:
     cpp = pd.DataFrame([[float(x) for x in ln.split(",")] for ln in lines[1:]],
                        columns=lines[0].split(","))
 
+    # The C++ engine emits CODED column names (no real name compiles into the
+    # .so). Encode the reference's columns the same way before comparing —
+    # otherwise only the passthrough columns line up and the run reports a
+    # meaningless PASS over a fraction of the panel.
+    mp = json.loads((Path(__file__).resolve().parents[2] / "obfuscation" / "map.json")
+                    .read_text())["features"]
+
+    def enc(col: str) -> str:
+        m2 = re.match(r"^(.*)_roll(\d+)_(mean|std)$", col)
+        if m2 and m2.group(1) in mp:
+            return f"{mp[m2.group(1)]}_roll{m2.group(2)}_{m2.group(3)}"
+        return mp.get(col, col)
+
+    ref = ref.rename(columns={c: enc(c) for c in ref.columns})
+
     print(f"[feat_parity] rows ref={len(ref)} cpp={len(cpp)}  "
           f"cols ref={len(ref.columns)} cpp={len(cpp.columns)}")
     if len(ref) != len(cpp):
@@ -105,6 +122,13 @@ def main() -> int:
             bad_cols.append((c, k, float(d.max())))
 
     print(f"[feat_parity] compared {len(shared)} shared columns")
+    # Coverage guard: the codes refactor once dropped this to 55 while still
+    # printing PASS. A comparison that silently shrinks is not a pass.
+    MIN_SHARED = 155
+    if len(shared) < MIN_SHARED:
+        print(f"=== FAIL: only {len(shared)} columns compared (expected >= {MIN_SHARED}) — "
+              f"the rest are UNVERIFIED ===")
+        return 1
     if missing:
         print(f"[feat_parity] NOT YET IMPLEMENTED in C++ ({len(missing)}): "
               f"{', '.join(missing[:30])}{' ...' if len(missing) > 30 else ''}")

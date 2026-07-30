@@ -86,7 +86,18 @@ def main() -> int:
             out.append((regmap.get(base, base)) + suf)
         return "".join(out)
 
-    specs = [f"{enc(n)}|{p}" for n, p in REGIMES]
+    # Dedupe: with everything coded, an entry written as a real name and one
+    # written as its code collapse to the same spec (they were distinct only
+    # while tolerant decoding existed). Duplicates would produce duplicate
+    # output columns and break the comparison.
+    seen, specs, pairs = set(), [], []
+    for n, pos in REGIMES:
+        key = f"{enc(n)}|{pos}"
+        if key in seen:
+            continue
+        seen.add(key)
+        specs.append(key)
+        pairs.append((n, pos))
     proc = subprocess.run([args.driver, str(BAR_SEC), str(TARGET_SEC), *specs],
                           capture_output=True, text=True, input="\n".join(events))
     if proc.returncode != 0:
@@ -96,7 +107,7 @@ def main() -> int:
                        columns=lines[0].split(","))
 
     bad, checked = [], 0
-    for name, pos in REGIMES:
+    for name, pos in pairs:
         key = f"{enc(name)}|{pos}"
         try:
             ref_mask = rf.apply_filter_mask(panel, name, pos).to_numpy(bool)
@@ -115,8 +126,8 @@ def main() -> int:
         # harness: it certifies work that was never checked.
         print("=== FAIL: compared 0 regimes — nothing was verified ===")
         return 1
-    if checked < len(REGIMES):
-        print(f"=== FAIL: only {checked}/{len(REGIMES)} regimes compared "
+    if checked < len(pairs):
+        print(f"=== FAIL: only {checked}/{len(pairs)} regimes compared "
               f"(the rest were skipped, so they are UNVERIFIED) ===")
         return 1
     if bad:
