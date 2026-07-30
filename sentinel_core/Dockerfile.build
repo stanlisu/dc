@@ -19,7 +19,7 @@ RUN cd /tmp && \
     wget -q https://github.com/TA-Lib/ta-lib/releases/download/v${TALIB_VERSION}/ta-lib-${TALIB_VERSION}-src.tar.gz && \
     tar xzf ta-lib-${TALIB_VERSION}-src.tar.gz && \
     cd ta-lib-${TALIB_VERSION} && \
-    ./configure --prefix=/usr/local >/dev/null && \
+    ./configure --prefix=/usr/local --with-pic >/dev/null && \
     make -j"$(nproc)" >/dev/null && \
     make install >/dev/null && \
     echo /usr/local/lib > /etc/ld.so.conf.d/usrlocal.conf && ldconfig && \
@@ -54,7 +54,8 @@ RUN dnf -q install -y git && \
     cd /tmp && git clone --depth 1 --branch v${LIGHTGBM_VERSION} --recursive \
         https://github.com/microsoft/LightGBM.git && \
     cd LightGBM && mkdir build && cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_LIB=ON .. >/dev/null && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_LIB=ON \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON .. >/dev/null && \
     make -j"$(nproc)" >/dev/null && make install >/dev/null && \
     ldconfig && cd / && rm -rf /tmp/LightGBM && dnf clean all
 RUN test -f /usr/local/include/LightGBM/c_api.h || (echo "lightgbm headers missing" && exit 1)
@@ -64,3 +65,8 @@ RUN test -f /usr/local/include/LightGBM/c_api.h || (echo "lightgbm headers missi
 # to link, or link and then fail to load.
 RUN test -f /usr/local/lib/lib_lightgbm.a || (echo "lib_lightgbm.a missing — static build did not produce it" && exit 1)
 RUN test -f /usr/local/lib/libta-lib.a || (echo "libta-lib.a missing" && exit 1)
+# Both .a files must be PIC or they cannot be linked into libmjolnir_core.so
+# ("relocation R_X86_64_32 against .rodata can not be used when making a shared
+# object"). Assert it here rather than discovering it at core-link time.
+RUN readelf --relocs /usr/local/lib/lib_lightgbm.a 2>/dev/null | grep -q "R_X86_64_32[^S]" \
+    && (echo "FAIL: lib_lightgbm.a is not PIC" && exit 1) || echo "lightgbm .a is PIC"
