@@ -373,6 +373,11 @@ def named_filter(
     Raises ValueError for unknown names regardless of df contents; the
     per-branch missing-column all-True guards apply to KNOWN names only
     (and in BOTH atom modes — the guard precedes any cutoff computation).
+    The MVG-dependent filters (trend_aligned, strong_trend, ma_momentum,
+    bb_rebound) instead RAISE when mvg1/mvg2/close are missing (2026-08-01):
+    the old shared all-True guard sat ABOVE the own-column filters too, so
+    e.g. high_vol/low_vol fired on every bar of a frame lacking price columns
+    even with price_range_pct present.
 
     atom_cfg=None = legacy fixed thresholds (documented back-compat default;
     see apply_filter_mask / rolling_quantile_atoms_from_config).
@@ -475,31 +480,13 @@ def named_filter(
 
     # ---- Standard price filters (shared with Agamotto) ----
 
-    mvg1 = df.get("mvg1")
-    mvg2 = df.get("mvg2")
-    close = df.get("close", df.get("mid_price"))
-
-    if mvg1 is None or mvg2 is None or close is None:
-        # Return true if base price columns missing
-        return true
-
-    up_trend = (close > mvg1) & (mvg1 > mvg2)
-    down_trend = (close < mvg1) & (mvg1 < mvg2)
-
-    if name in ("trend_aligned",):
-        return up_trend if position == "long" else down_trend
-
-    if name == "strong_trend":
-        mvg3 = df.get("mvg3")
-        if position == "long":
-            return up_trend & (mvg2 > mvg3) if mvg3 is not None else up_trend
-        return down_trend & (mvg2 < mvg3) if mvg3 is not None else down_trend
-
-    if name == "ma_momentum":
-        mvg3 = df.get("mvg3")
-        if position == "long":
-            return (mvg1 > mvg2) & (mvg1 > mvg3) if mvg3 is not None else (mvg1 > mvg2)
-        return (mvg1 < mvg2) & (mvg1 < mvg3) if mvg3 is not None else (mvg1 < mvg2)
+    # Own-column filters FIRST: none of these read mvg1/mvg2/close, so they
+    # must never be gated on the price columns. Pre-2026-08-01 they sat below
+    # the mvg1/mvg2/close all-True guard, so on frames lacking those columns
+    # they silently fired on EVERY bar even when their own column was present
+    # (high_vol and low_vol both all-True simultaneously) — the banned
+    # baseline-shaped always-on failure. Their own missing column still
+    # returns all-True (longstanding known-name guard, pinned by tests).
 
     if name == "rsi_oversold":
         col = "rsi"
@@ -531,18 +518,6 @@ def named_filter(
             return true
         return df[col] > 25
 
-    if name == "bb_rebound":
-        if position == "long":
-            col = "bb_lower"
-            if col not in df.columns:
-                return true
-            return close < df[col]
-        else:
-            col = "bb_upper"
-            if col not in df.columns:
-                return true
-            return close > df[col]
-
     if name in ("high_volume", "vol_breakout"):
         col = "vol_ratio"
         if col not in df.columns:
@@ -573,6 +548,55 @@ def named_filter(
         if col not in df.columns:
             return true
         return df[col] > 0 if position == "long" else df[col] < 0
+
+    # MVG-dependent filters (trend_aligned, strong_trend, ma_momentum,
+    # bb_rebound) genuinely need the price columns. Missing columns RAISE
+    # (no-silent-fallback, 2026-08-01): the old all-True guard made these
+    # fire on every bar of a degenerate/warmup frame — the same always-on
+    # failure as above, and silent.
+    mvg1 = df.get("mvg1")
+    mvg2 = df.get("mvg2")
+    close = df.get("close", df.get("mid_price"))
+
+    if mvg1 is None or mvg2 is None or close is None:
+        missing = [label for label, col in
+                   (("mvg1", mvg1), ("mvg2", mvg2), ("close/mid_price", close))
+                   if col is None]
+        raise ValueError(
+            f"Filter {name!r} requires price columns; frame is missing "
+            f"{missing}. An all-True fallback here fires on every bar "
+            "(baseline-shaped) — failing loud instead. See CLAUDE.md "
+            "no-silent-fallback rules.")
+
+    up_trend = (close > mvg1) & (mvg1 > mvg2)
+    down_trend = (close < mvg1) & (mvg1 < mvg2)
+
+    if name in ("trend_aligned",):
+        return up_trend if position == "long" else down_trend
+
+    if name == "strong_trend":
+        mvg3 = df.get("mvg3")
+        if position == "long":
+            return up_trend & (mvg2 > mvg3) if mvg3 is not None else up_trend
+        return down_trend & (mvg2 < mvg3) if mvg3 is not None else down_trend
+
+    if name == "ma_momentum":
+        mvg3 = df.get("mvg3")
+        if position == "long":
+            return (mvg1 > mvg2) & (mvg1 > mvg3) if mvg3 is not None else (mvg1 > mvg2)
+        return (mvg1 < mvg2) & (mvg1 < mvg3) if mvg3 is not None else (mvg1 < mvg2)
+
+    if name == "bb_rebound":
+        if position == "long":
+            col = "bb_lower"
+            if col not in df.columns:
+                return true
+            return close < df[col]
+        else:
+            col = "bb_upper"
+            if col not in df.columns:
+                return true
+            return close > df[col]
 
     # Unreachable for unknown names (rejected at the top); firing here means
     # KNOWN_FILTERS drifted out of sync with the branches above.
