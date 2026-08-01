@@ -21,6 +21,7 @@ import pandas as pd
 
 from mjolnir.core.features import MjolnirFeatures, _TF_SECONDS
 from mjolnir.core.multi_tf_merge import merge_cross_tf_features
+from mjolnir.core.regime_filters import rolling_quantile_atoms_from_config
 from mjolnir.core.research import MjolnirResearch, _DEFAULT_FEATURE_WINDOWS, _obf
 from mjolnir.core.utils import normalize_symbol
 
@@ -70,6 +71,17 @@ class MjolnirTrading:
     def __init__(self, config: dict, home_root: str) -> None:
         self.config = config
         self.home_root = home_root
+        # REGIME_ATOM_MODE=rolling_quantile is RESEARCH-ONLY for now: the
+        # live buffer (BUFFER_MAXLEN=1000 bars, ~83 min of 5s) cannot span
+        # the trailing quantile window (default 30 days), so live masks
+        # could never be causal. Fail at construction, BEFORE any mask
+        # call. Deployment path (follow-up, not here): research dumps
+        # frozen per-day cutoffs alongside the weights and the live bot
+        # loads them like model artifacts.
+        if rolling_quantile_atoms_from_config(config) is not None:
+            raise ValueError(
+                "REGIME_ATOM_MODE=rolling_quantile is research-only; live "
+                "bot buffer (1000 bars) cannot span the trailing window")
         # Per-TF buffers keyed as self._tf_buffers[tf][symbol] (Bug 2 — live
         # cross-TF merge needs separate higher-TF bar streams). The base TF
         # is the one named in cfg["TIME_UNIT"] when set, else "5s" for back

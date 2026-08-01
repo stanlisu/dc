@@ -28,6 +28,7 @@
 #include <limits>    // std::fabs — gcc 8 does not pull this in transitively
 #include <deque>
 #include <fstream>
+#include "codes_generated.hpp"
 #include <map>
 #include <memory>
 #include <sstream>
@@ -180,6 +181,14 @@ class Core final : public ICore {
         mBuilder.reset(new BarBuilder(mBarSec, mTargetSec));
         mFeatures.reset(new FeatureEngine({30, 60, 300, 900}, mBarSec, mTargetSec));
 
+        // Optional bar dump for reconciliation against the reference bot.
+        // Written HERE, in the private core, because the bar schema is IP — the
+        // public shell must not learn the column set. Headers are CODED for the
+        // mapped columns; passthrough names (OHLCV, book, timestamps) stay real
+        // because the obfuscation map does not cover them.
+        try { mBarsCsv = p.str("bars_csv"); } catch (const std::exception&) { mBarsCsv.clear(); }
+        try { mSymbol = p.str("symbol"); } catch (const std::exception&) { mSymbol = "UNKNOWN"; }
+
         mStack = loadStack(stackPath, subset);
         for (const auto& e : mStack) {
             if (mModels.count(e.dir)) continue;
@@ -218,11 +227,50 @@ class Core final : public ICore {
             if (mBuilder->onTrade(ev.last_px, ev.last_qty, is_buyer_maker,
                                   static_cast<int64_t>(ev.exchange_ts_ns / 1000000), 1, &closed)) {
                 mBuf.push_back(closed);
+                dumpBar(closed);
                 while (mBuf.size() > static_cast<size_t>(BUFFER_MAXLEN)) mBuf.pop_front();
                 mPendingBarTsNs = closed.bucket_ms * 1000000LL;
                 mHasPending = true;
             }
         }
+    }
+
+    void dumpBar(const Bar& b)
+    {
+        if (mBarsCsv.empty()) return;
+        const bool need_header = !mBarsHeaderWritten;
+        std::ofstream fh(mBarsCsv, std::ios::app);
+        if (!fh) return;   // WHY: dump is diagnostic; a bad path must not kill the strategy
+        if (need_header) {
+            fh << "timestamp_ns,symbol,open,high,low,close,volume,buy_vol,sell_vol,n_trades,"
+               << "vwap," << codes::F_TRADE_IMBALANCE << ",bid_price,bid_amount,ask_price,ask_amount";
+            for (int i = 0; i < BOOK_LEVELS; ++i)
+                fh << ",bids_" << i << "_price,bids_" << i << "_qty"
+                   << ",asks_" << i << "_price,asks_" << i << "_qty";
+            fh << ",depth_bid_L1,depth_bid_L3,depth_bid_L5,depth_ask_L1,depth_ask_L3,depth_ask_L5"
+               << ",mark_price,index_price,funding_rate,predicted_funding_rate,open_interest"
+               << "," << codes::F_LIQ_LONG_NOTIONAL << "," << codes::F_LIQ_SHORT_NOTIONAL
+               << ",liq_long_count,liq_short_count,liq_total_count"
+               << "," << codes::F_CYCLE_PROGRESS << "," << codes::F_SECS_TO_BOUNDARY << "\n";
+            mBarsHeaderWritten = true;
+        }
+        fh.precision(17);
+        fh << (b.bucket_ms * 1000000LL) << "," << mSymbol << ","
+           << b.open << "," << b.high << "," << b.low << "," << b.close << ","
+           << b.volume << "," << b.buy_vol << "," << b.sell_vol << "," << b.n_trades << ","
+           << b.vwap << "," << b.trade_imbalance << ","
+           << b.bid_price << "," << b.bid_amount << "," << b.ask_price << "," << b.ask_amount;
+        for (int i = 0; i < BOOK_LEVELS; ++i)
+            fh << "," << b.bids_price[i] << "," << b.bids_qty[i]
+               << "," << b.asks_price[i] << "," << b.asks_qty[i];
+        fh << "," << b.depth_bid_L1 << "," << b.depth_bid_L3 << "," << b.depth_bid_L5
+           << "," << b.depth_ask_L1 << "," << b.depth_ask_L3 << "," << b.depth_ask_L5
+           << "," << b.mark_price << "," << b.index_price << "," << b.funding_rate
+           << "," << b.predicted_funding_rate << "," << b.open_interest
+           << "," << b.liq_long_notional << "," << b.liq_short_notional
+           << "," << b.liq_long_count << "," << b.liq_short_count
+           << "," << b.liq_total_count << "," << b.cycle_progress
+           << "," << b.secs_to_boundary << "\n";
     }
 
     bool barReady(int64_t* barTsNs) override
@@ -421,6 +469,10 @@ class Core final : public ICore {
 
     Decision mHeld;
     int mHeldLeft{0};
+
+    std::string mBarsCsv;
+    std::string mSymbol{"UNKNOWN"};
+    bool mBarsHeaderWritten{false};
 };
 
 } // namespace

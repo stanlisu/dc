@@ -55,12 +55,30 @@ echo "[build_linux] built: $OUT"
 
 # The artifact is the thing that leaves this machine — prove it carries no
 # distinctive name before it does.
-if ! python3 "$HERE/../obfuscation/audit_public_surface.py" --repo "$HERE/build-linux" >/dev/null 2>&1; then
+#
+# The scanner needs py3.7+ (it uses `from __future__ import annotations`), and a
+# bare `python3` is 3.6 on some build hosts. A scanner that cannot RUN is not a
+# leak — reporting it as one trains the operator to ignore the gate, which is
+# how a real leak eventually ships. Separate the two outcomes explicitly.
+AUDIT_PY=""
+for c in "${AUDIT_PYTHON:-}" python3.13 python3.12 python3.11 python3 "$HOME/miniconda3/envs/py313/bin/python3" /opt/miniconda3/envs/py313/bin/python3; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,7) else 1)' 2>/dev/null; then
+        AUDIT_PY="$c"; break
+    fi
+done
+if [ -z "$AUDIT_PY" ]; then
+    echo "BLOCKED: leak audit could not RUN — no python >= 3.7 found. This is NOT a pass." >&2
+    echo "         Set AUDIT_PYTHON=/path/to/python3, or audit the .so on a host that has one." >&2
+    exit 2
+fi
+AUDIT_OUT="$("$AUDIT_PY" "$HERE/../obfuscation/audit_public_surface.py" --repo "$HERE/build-linux" 2>&1)"; AUDIT_RC=$?
+if [ "$AUDIT_RC" -ne 0 ]; then
     echo "FAIL: leak audit found a distinctive name in the build output." >&2
-    python3 "$HERE/../obfuscation/audit_public_surface.py" --repo "$HERE/build-linux" >&2 || true
+    echo "$AUDIT_OUT" >&2
     exit 1
 fi
-echo "[build_linux] artifact leak audit: PASS"
+echo "[build_linux] artifact leak audit: PASS ($AUDIT_PY)"
 
 if [ -n "$DEPLOY_HOST" ]; then
     echo "[build_linux] deploying .so ONLY to $DEPLOY_HOST (no source)"
