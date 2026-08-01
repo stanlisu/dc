@@ -23,7 +23,7 @@ from .loader import MjolnirLoader
 from .aligner import StreamAligner
 from .multi_tf_merge import merge_cross_tf_features
 from .utils import normalize_symbol, get_dates_in_range
-from .regime_filters import apply_filter_mask
+from .regime_filters import apply_filter_mask, rolling_quantile_atoms_from_config
 from .ladder import compute_ladder_returns
 from .streaming import (
     stream_filter_parquets,
@@ -142,6 +142,10 @@ class MjolnirResearch:
     def __init__(self, config: Dict, home_root: str) -> None:
         self.config = config
         self.home_root = home_root.rstrip("/")
+        # Atom threshold mode (REGIME_ATOM_MODE et al.) parsed ONCE, fail-fast
+        # at construction: a bad key aborts pipeline/bot boot, not the first
+        # mask. None = legacy fixed thresholds (documented back-compat).
+        self._atom_cfg = rolling_quantile_atoms_from_config(config)
         self.vertical_features: Optional[pd.DataFrame] = None
         # per-symbol bar DataFrames, keyed by native ticker (base TF)
         self._symbol_bars: Dict[str, pd.DataFrame] = {}
@@ -684,8 +688,23 @@ class MjolnirResearch:
         filter_name,
         position: str,
     ) -> pd.Series:
-        """Delegate to standalone apply_filter_mask()."""
-        return apply_filter_mask(df, filter_name, position)
+        """Delegate to standalone apply_filter_mask().
+
+        Atom threshold mode comes from setting.json (REGIME_ATOM_MODE /
+        REGIME_ATOM_QUANTILE_WINDOW_BARS / REGIME_ATOM_QUANTILE_LEVELS),
+        parsed fail-fast in __init__; absent keys = legacy fixed thresholds.
+        """
+        # WHY getattr: trading.py's regression tests construct a bare
+        # instance via MjolnirResearch.__new__ under the documented contract
+        # that _apply_filter_mask uses self ONLY for recursion (see
+        # test_trading_decisions.py, 2026-06-15 all-short bug test). A bare
+        # instance has no config at all, and no-config == the documented
+        # fixed-mode back-compat default. Any instance built through
+        # __init__ has _atom_cfg parsed fail-fast; this is not a config
+        # fallback.
+        return apply_filter_mask(
+            df, filter_name, position,
+            atom_cfg=getattr(self, "_atom_cfg", None))
 
     def _compute_ladder_returns(
         self,

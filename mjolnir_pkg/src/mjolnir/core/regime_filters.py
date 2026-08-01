@@ -5,10 +5,21 @@ filter name, and position to produce boolean Series masks.
 
 Extracted from research.py to keep each module under ~700 lines for
 PyArmor trial compatibility.
+
+2026-08-01 — opt-in rolling-quantile atom thresholds: distribution-relative
+atoms (deep_book, spread, vol, liq-pressure) can compute their cutoffs as a
+CAUSAL trailing per-day quantile instead of the legacy full-frame quantile,
+so cutoffs track market level shifts across eras (deep_book fired 0 times in
+2026Q2 under stale cuts). Opt in via REGIME_ATOM_MODE="rolling_quantile" in
+setting.json (see rolling_quantile_atoms_from_config); default is the legacy
+fixed behavior, byte-identical.
 """
 
 from __future__ import annotations
 
+from typing import Mapping, NamedTuple, Optional
+
+import numpy as np
 import pandas as pd
 
 
@@ -44,10 +55,220 @@ KNOWN_FILTERS = frozenset({
 })
 
 
+# ── Atom threshold modes (2026-08-01, opt-in rolling-quantile cutoffs) ────────
+
+ATOM_MODE_FIXED = "fixed"
+ATOM_MODE_ROLLING_QUANTILE = "rolling_quantile"
+
+# Default trailing window for rolling-quantile cutoffs: 30 days of 5s bars
+# (30 * 17280 = 518,400). Configurable via REGIME_ATOM_QUANTILE_WINDOW_BARS.
+DEFAULT_QUANTILE_WINDOW_BARS = 30 * 17_280
+
+# Quantile level per distribution-relative atom. These are the EXACT levels
+# the legacy fixed rules use (`df[col].quantile(level)` over the whole frame):
+# fixed mode reads its literals from here (masks stay byte-identical), and
+# rolling mode reproduces each atom's historical firing rate by construction —
+# e.g. deep_book short fires on the bottom 40% in both modes; rolling just
+# measures that 40% on a causal trailing window instead of the full frame.
+# (The 2026-08-01 design note floated a 0.8 default for deep_book because its
+# fixed-rule percentile was assumed unknowable; the rule IS a frame quantile
+# at 0.6/0.4, so those levels reproduce the 2025 firing rate exactly and are
+# the defaults. Calibration overrides go in REGIME_ATOM_QUANTILE_LEVELS.)
+ATOM_QUANTILE_LEVELS = {
+    "high_liquidation_pressure": 0.75,  # fires when feature > cutoff
+    "low_liquidation_pressure": 0.25,   # fires when feature < cutoff
+    "deep_book_long": 0.6,              # fires when feature > cutoff
+    "deep_book_short": 0.4,             # fires when feature < cutoff
+    "tight_spread": 0.5,                # fires when feature < cutoff
+    "wide_spread": 0.5,                 # fires when feature > cutoff
+    "high_vol": 0.5,                    # fires when feature > cutoff
+    "low_vol": 0.5,                     # fires when feature < cutoff
+}
+
+
+class RollingQuantileAtoms(NamedTuple):
+    """Resolved rolling-quantile atom config: trailing window + levels."""
+
+    window_bars: int
+    levels: Mapping[str, float]
+
+
+def rolling_quantile_atoms_from_config(
+    cfg: Mapping,
+) -> Optional[RollingQuantileAtoms]:
+    """Parse REGIME_ATOM_* keys from a setting.json dict.
+
+    Returns None for fixed (legacy) mode, or a RollingQuantileAtoms for
+    rolling-quantile mode.
+
+    REGIME_ATOM_MODE absent -> fixed. This absent-key default is the
+    explicitly sanctioned back-compat default (agreed opt-in design,
+    2026-08-01): every setting.json written before then predates the key and
+    must produce byte-identical masks. A PRESENT but invalid value always
+    raises — no silent fallback.
+    """
+    if "REGIME_ATOM_MODE" not in cfg:
+        return None
+    mode = cfg["REGIME_ATOM_MODE"]
+    if mode == ATOM_MODE_FIXED:
+        return None
+    if mode != ATOM_MODE_ROLLING_QUANTILE:
+        raise ValueError(
+            f"REGIME_ATOM_MODE={mode!r} invalid; expected "
+            f"{ATOM_MODE_FIXED!r} or {ATOM_MODE_ROLLING_QUANTILE!r}")
+
+    if "REGIME_ATOM_QUANTILE_WINDOW_BARS" in cfg:
+        window_bars = cfg["REGIME_ATOM_QUANTILE_WINDOW_BARS"]
+        if isinstance(window_bars, bool) or not isinstance(window_bars, int) \
+                or window_bars <= 0:
+            raise ValueError(
+                "REGIME_ATOM_QUANTILE_WINDOW_BARS must be a positive int, "
+                f"got {window_bars!r}")
+    else:
+        # Documented default for the NEW opt-in mode (agreed design:
+        # 30 days of 5s bars); a named constant, not a magic number.
+        window_bars = DEFAULT_QUANTILE_WINDOW_BARS
+
+    levels = dict(ATOM_QUANTILE_LEVELS)
+    if "REGIME_ATOM_QUANTILE_LEVELS" in cfg:
+        overrides = cfg["REGIME_ATOM_QUANTILE_LEVELS"]
+        if not isinstance(overrides, Mapping):
+            raise ValueError(
+                "REGIME_ATOM_QUANTILE_LEVELS must be a mapping "
+                f"{{atom: level}}, got {type(overrides).__name__}")
+        for key, level in overrides.items():
+            if key not in levels:
+                raise ValueError(
+                    f"REGIME_ATOM_QUANTILE_LEVELS: unknown atom {key!r}; "
+                    f"valid: {sorted(levels)}")
+            if isinstance(level, bool) \
+                    or not isinstance(level, (int, float)) \
+                    or not 0.0 < float(level) < 1.0:
+                raise ValueError(
+                    f"REGIME_ATOM_QUANTILE_LEVELS[{key!r}] must be a number "
+                    f"in (0, 1), got {level!r}")
+            levels[key] = float(level)
+    return RollingQuantileAtoms(window_bars=window_bars, levels=levels)
+
+
+def _bar_timestamps(df: pd.DataFrame) -> pd.DatetimeIndex:
+    """Per-row timestamps for rolling-quantile cutoffs.
+
+    Prefers a DatetimeIndex; otherwise uses the 'timestamp' column that the
+    streaming/verticalize paths stamp before masks are applied (those frames
+    carry an integer index). Anything else raises — rolling mode cannot be
+    causal without real timestamps.
+    """
+    if isinstance(df.index, pd.DatetimeIndex):
+        ts = df.index
+    elif "timestamp" in df.columns:
+        ts = pd.DatetimeIndex(df["timestamp"])
+    else:
+        raise ValueError(
+            "rolling_quantile atom mode requires a DatetimeIndex or a "
+            "'timestamp' column to build causal trailing cutoffs")
+    if ts.hasnans:
+        raise ValueError("rolling_quantile atom mode: NaT in bar timestamps")
+    return ts
+
+
+def _window_days(ts_sorted: pd.DatetimeIndex, window_bars: int) -> int:
+    """Convert a window in BARS to whole trailing DAYS via bar spacing.
+
+    E.g. 518,400 bars at 5s spacing -> exactly 30 days. Uses the median
+    positive spacing so occasional gaps don't skew the conversion.
+    """
+    if len(ts_sorted) < 2:
+        raise ValueError(
+            "rolling_quantile atom mode needs >= 2 bars to infer bar "
+            f"spacing; got {len(ts_sorted)} row(s)")
+    diffs = np.diff(ts_sorted.asi8)  # nanoseconds
+    pos = diffs[diffs > 0]
+    if len(pos) == 0:
+        raise ValueError(
+            "rolling_quantile atom mode: all bar timestamps identical — "
+            "cannot infer bar spacing")
+    bar_sec = float(np.median(pos)) / 1e9
+    return max(1, int(round(window_bars * bar_sec / 86_400.0)))
+
+
+def rolling_quantile_cutoff(
+    df: pd.DataFrame,
+    col: str,
+    level: float,
+    window_bars: int,
+) -> pd.Series:
+    """Causal trailing quantile cutoff for df[col], aligned to df.index.
+
+    Exact per-bar trailing quantiles over the default window (518,400 bars
+    per symbol) are O(n*window) — infeasible at 5s scale. Documented
+    approximation (coarser, but strictly causal):
+
+      1. per-UTC-day quantile of that day's values: q_d
+      2. trailing mean over the last `window_days` daily quantiles: m_d
+      3. shift one full day: cutoff applied to day d = m_{d-1}
+      4. broadcast each day's cutoff onto that day's bars
+
+    Causality: step 3 shifts by one FULL day, so the cutoff applied to any
+    bar of day d is built exclusively from days <= d-1 — no same-day leakage,
+    and in particular bar t's own value never enters its cutoff. Warmup (the
+    first day per symbol) has no prior day -> NaN cutoff -> comparisons are
+    False, i.e. the regime fails CLOSED until one full prior day exists.
+
+    Per-symbol: when a 'symbol' column is present, each symbol gets its own
+    independent quantile stream (constraint: no cross-symbol pooling).
+    """
+    ts = _bar_timestamps(df)
+    values = df[col].to_numpy(dtype=float)
+    out = np.full(len(df), np.nan)
+
+    if "symbol" in df.columns:
+        group_ids = df["symbol"].to_numpy()
+        groups = [
+            np.flatnonzero(group_ids == g) for g in pd.unique(group_ids)
+        ]
+    else:
+        groups = [np.arange(len(df))]
+
+    for idx in groups:
+        g_ts = ts[idx]
+        order = np.argsort(g_ts.asi8, kind="stable")
+        ts_sorted = g_ts[order]
+        s = pd.Series(values[idx][order], index=ts_sorted)
+        daily_q = s.resample("1D").quantile(level)
+        w_days = _window_days(ts_sorted, window_bars)
+        cut_daily = daily_q.rolling(w_days, min_periods=1).mean().shift(1)
+        # Map each bar to ITS day's cutoff by exact day key (no ffill
+        # ambiguity); restore original row order.
+        out[idx[order]] = cut_daily.reindex(ts_sorted.normalize()).to_numpy()
+    return pd.Series(out, index=df.index)
+
+
+def _atom_cutoff(
+    df: pd.DataFrame,
+    col: str,
+    atom_key: str,
+    atom_cfg: Optional[RollingQuantileAtoms],
+):
+    """Cutoff for one distribution-relative atom.
+
+    fixed (atom_cfg None): the legacy full-frame quantile at the atom's
+    canonical level — the exact expression the pre-2026-08-01 code used
+    (ATOM_QUANTILE_LEVELS holds those literals; masks byte-identical).
+    rolling_quantile: causal trailing per-day quantile, see
+    rolling_quantile_cutoff().
+    """
+    if atom_cfg is None:
+        return df[col].quantile(ATOM_QUANTILE_LEVELS[atom_key])
+    return rolling_quantile_cutoff(
+        df, col, atom_cfg.levels[atom_key], atom_cfg.window_bars)
+
+
 def apply_filter_mask(
     df: pd.DataFrame,
     filter_name,
     position: str,
+    atom_cfg: Optional[RollingQuantileAtoms] = None,
 ) -> pd.Series:
     """Return a boolean Series: True = include in filter.
 
@@ -56,6 +277,11 @@ def apply_filter_mask(
     - List filters: ["filter_a", "&", "filter_b"]
     - Mjolnir-specific microstructure filters
     - Standard Agamotto price filters (baseline, rsi, macd, etc.)
+
+    atom_cfg=None is the documented back-compat default = legacy fixed
+    thresholds (byte-identical masks). Pass a RollingQuantileAtoms (built by
+    rolling_quantile_atoms_from_config) to opt in to causal trailing
+    rolling-quantile cutoffs for the distribution-relative atoms.
     """
     # --- List support (recursive) ---
     if isinstance(filter_name, list):
@@ -66,7 +292,7 @@ def apply_filter_mask(
             if item in ("|", "&"):
                 op = item
             else:
-                sub = apply_filter_mask(df, item, position)
+                sub = apply_filter_mask(df, item, position, atom_cfg)
                 if mask is None:
                     mask = sub
                 elif op == "|":
@@ -85,14 +311,14 @@ def apply_filter_mask(
             parts = name.split("_and_")
             mask = None
             for p in parts:
-                sub = apply_filter_mask(df, p.strip(), position)
+                sub = apply_filter_mask(df, p.strip(), position, atom_cfg)
                 mask = sub if mask is None else (mask & sub)
             return mask if mask is not None else pd.Series(True, index=df.index)
         if "_or_" in name:
             parts = name.split("_or_")
             mask = None
             for p in parts:
-                sub = apply_filter_mask(df, p.strip(), position)
+                sub = apply_filter_mask(df, p.strip(), position, atom_cfg)
                 mask = sub if mask is None else (mask | sub)
             return mask if mask is not None else pd.Series(True, index=df.index)
     else:
@@ -104,14 +330,23 @@ def apply_filter_mask(
     # Strip trailing _long / _short from the filter name
     name = name.replace("_long", "").replace("_short", "")
 
-    return named_filter(df, name, position)
+    return named_filter(df, name, position, atom_cfg)
 
 
-def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
+def named_filter(
+    df: pd.DataFrame,
+    name: str,
+    position: str,
+    atom_cfg: Optional[RollingQuantileAtoms] = None,
+) -> pd.Series:
     """Dispatch to a named filter implementation.
 
     Raises ValueError for unknown names regardless of df contents; the
-    per-branch missing-column all-True guards apply to KNOWN names only.
+    per-branch missing-column all-True guards apply to KNOWN names only
+    (and in BOTH atom modes — the guard precedes any cutoff computation).
+
+    atom_cfg=None = legacy fixed thresholds (documented back-compat default;
+    see apply_filter_mask / rolling_quantile_atoms_from_config).
     """
     if name not in KNOWN_FILTERS:
         raise ValueError(f"Unknown filter: {name!r}")
@@ -129,13 +364,13 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
         col = "liq_burst_ratio"
         if col not in df.columns:
             return true
-        return df[col] > df[col].quantile(0.75)
+        return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "low_liquidation_pressure":
         col = "liq_burst_ratio"
         if col not in df.columns:
             return true
-        return df[col] < df[col].quantile(0.25)
+        return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "funding_positive":
         col = "funding_rate"
@@ -154,8 +389,8 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
         if col not in df.columns:
             return true
         if position == "long":
-            return df[col] > df[col].quantile(0.6)
-        return df[col] < df[col].quantile(0.4)
+            return df[col] > _atom_cutoff(df, col, "deep_book_long", atom_cfg)
+        return df[col] < _atom_cutoff(df, col, "deep_book_short", atom_cfg)
 
     if name == "trade_imbalance":
         col = "trade_imbalance"
@@ -201,13 +436,13 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
         col = "relative_spread"
         if col not in df.columns:
             return true
-        return df[col] < df[col].quantile(0.5)
+        return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "wide_spread":
         col = "relative_spread"
         if col not in df.columns:
             return true
-        return df[col] > df[col].quantile(0.5)
+        return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     # ---- Standard price filters (shared with Agamotto) ----
 
@@ -296,13 +531,13 @@ def named_filter(df: pd.DataFrame, name: str, position: str) -> pd.Series:
         col = "price_range_pct"
         if col not in df.columns:
             return true
-        return df[col] > df[col].quantile(0.5)
+        return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "low_vol":
         col = "price_range_pct"
         if col not in df.columns:
             return true
-        return df[col] < df[col].quantile(0.5)
+        return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "mom_positive":
         col = "mom"
