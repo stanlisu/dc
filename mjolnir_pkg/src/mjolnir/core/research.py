@@ -694,17 +694,13 @@ class MjolnirResearch:
         REGIME_ATOM_QUANTILE_WINDOW_BARS / REGIME_ATOM_QUANTILE_LEVELS),
         parsed fail-fast in __init__; absent keys = legacy fixed thresholds.
         """
-        # WHY getattr: trading.py's regression tests construct a bare
-        # instance via MjolnirResearch.__new__ under the documented contract
-        # that _apply_filter_mask uses self ONLY for recursion (see
-        # test_trading_decisions.py, 2026-06-15 all-short bug test). A bare
-        # instance has no config at all, and no-config == the documented
-        # fixed-mode back-compat default. Any instance built through
-        # __init__ has _atom_cfg parsed fail-fast; this is not a config
-        # fallback.
+        # Strict attribute access: _atom_cfg is set fail-fast in __init__.
+        # Callers that construct a bare instance via __new__ (the trading
+        # regression tests' documented "self only for recursion" contract)
+        # must set _atom_cfg explicitly; a missing attribute raises rather
+        # than silently defaulting.
         return apply_filter_mask(
-            df, filter_name, position,
-            atom_cfg=getattr(self, "_atom_cfg", None))
+            df, filter_name, position, atom_cfg=self._atom_cfg)
 
     def _compute_ladder_returns(
         self,

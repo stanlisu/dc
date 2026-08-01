@@ -353,8 +353,11 @@ def test_quantile_regime_filter_uses_window_not_single_row():
     inst = _make_mj()
     sym = "BINANCE_PERP_BTC_USDT"
     # Real filter logic: _apply_filter_mask/_named_filter use self only for
-    # recursion, so a bare instance (no __init__) is sufficient.
+    # recursion plus the atom-threshold mode, so a bare instance (no
+    # __init__) with _atom_cfg set explicitly is sufficient. None = fixed
+    # legacy thresholds (no config was parsed for this bare instance).
     inst._research = MjolnirResearch.__new__(MjolnirResearch)
+    inst._research._atom_cfg = None
 
     _fill_buffer(inst, sym, 200)
     base_ts = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")

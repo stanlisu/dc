@@ -16,6 +16,8 @@ Bars here are 5-minute (288/day): the mechanism infers bar spacing from the
 timestamps, so the test grid is interval-agnostic and fast.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -87,7 +89,9 @@ class TestDayShift:
         df = pd.DataFrame(
             {"depth_imbalance_L5": np.concatenate([day0, day1])}, index=idx)
 
-        mask = apply_filter_mask(df, "deep_book", "short", _cfg(3))
+        # window_days=1: min_periods equals the window, so day 1's cutoff is
+        # exactly day 0's daily quantile (one full prior day, nothing else).
+        mask = apply_filter_mask(df, "deep_book", "short", _cfg(1))
         m = mask.to_numpy()
 
         # Warmup: day 0 has no prior day -> NaN cutoff -> fails CLOSED.
@@ -112,8 +116,10 @@ class TestAdaptivity:
 
         # ROLLING rule re-adapts and fires at ~ the target rate again.
         mask = apply_filter_mask(df, "deep_book", "short", _cfg(5))
-        # Month 1, after the 1-day warmup: ~40% firing rate.
-        m1_rate = mask.iloc[BARS_PER_DAY:m1_end].mean()
+        # Warmup: the first window_days (5) fail CLOSED (min_periods=window).
+        assert not mask.iloc[:5 * BARS_PER_DAY].any()
+        # Month 1, after the window_days warmup: ~40% firing rate.
+        m1_rate = mask.iloc[5 * BARS_PER_DAY:m1_end].mean()
         assert abs(m1_rate - 0.4) < 0.05
         # Month 2, after the 5-day trailing window fully re-adapts (skip 6
         # local days): ~40% again — same rate as before the level shift.
@@ -171,7 +177,7 @@ class TestFixedModeByteIdentical:
         for (name, pos), expected in self._legacy_masks(df).items():
             got = apply_filter_mask(df, name, pos)
             pd.testing.assert_series_equal(
-                got, expected, check_names=False), (name, pos)
+                got, expected, check_names=False, obj=f"{name}/{pos}")
 
     def test_explicit_fixed_mode_matches_legacy(self):
         df = self._fixture()
@@ -180,7 +186,7 @@ class TestFixedModeByteIdentical:
         for (name, pos), expected in self._legacy_masks(df).items():
             got = apply_filter_mask(df, name, pos, cfg)
             pd.testing.assert_series_equal(
-                got, expected, check_names=False), (name, pos)
+                got, expected, check_names=False, obj=f"{name}/{pos}")
 
     def test_fixed_mode_needs_no_timestamps(self):
         # Integer index, no timestamp column — legacy frames must keep
@@ -210,9 +216,10 @@ class TestPerSymbol:
         n = len(a)
         assert (mask.to_numpy()[:n] == solo_a.to_numpy()).all()
         assert (mask.to_numpy()[n:] == solo_b.to_numpy()).all()
-        # Both symbols fire post-warmup — pooling would silence one side.
-        assert solo_a.iloc[BARS_PER_DAY:].any()
-        assert solo_b.iloc[BARS_PER_DAY:].any()
+        # Both symbols fire after the 2-day warmup — pooling would silence
+        # one side.
+        assert solo_a.iloc[2 * BARS_PER_DAY:].any()
+        assert solo_b.iloc[2 * BARS_PER_DAY:].any()
 
 
 class TestConfigParser:
@@ -269,8 +276,46 @@ class TestConfigParser:
                     "REGIME_ATOM_QUANTILE_LEVELS": {"deep_book_short": bad},
                 })
 
+    @pytest.mark.parametrize("mode_kv", [
+        {},                                # mode absent
+        {"REGIME_ATOM_MODE": "fixed"},     # mode explicitly fixed
+    ])
+    @pytest.mark.parametrize("stray_kv", [
+        {"REGIME_ATOM_QUANTILE_WINDOW_BARS": 518_400},
+        {"REGIME_ATOM_QUANTILE_LEVELS": {"deep_book_short": 0.4}},
+    ])
+    def test_rolling_only_keys_without_rolling_mode_raise(
+            self, mode_kv, stray_kv):
+        # The keys are inert without REGIME_ATOM_MODE="rolling_quantile" —
+        # a config carrying them under fixed mode must fail loud, not look
+        # active while doing nothing.
+        with pytest.raises(ValueError, match="inert"):
+            rolling_quantile_atoms_from_config({**mode_kv, **stray_kv})
+
     def test_rolling_mode_without_timestamps_fails_loud(self):
         df = pd.DataFrame({"depth_imbalance_L5": np.random.default_rng(1)
                           .normal(size=64)})  # integer index, no timestamps
         with pytest.raises(ValueError, match="DatetimeIndex"):
             apply_filter_mask(df, "deep_book", "short", _cfg(2))
+
+
+class TestLiveBootFailFast:
+    def test_trading_constructor_rejects_rolling_mode(self):
+        # C1: rolling mode is research-only — the live buffer (1000 bars,
+        # ~83 min of 5s) cannot span the trailing window (default 30 days).
+        # MjolnirTrading must refuse to BOOT, before any mask call.
+        from mjolnir.trading import MjolnirTrading
+        cfg = {
+            "TIME_UNIT": "5s",
+            "SYMBOLS": ["BINANCE_PERP_BTC_USDT"],
+            "TARGET_HORIZON_BARS": 1,
+            "FEE": 2.0,
+            "OUTPUT_DIR": "/tmp/mjolnir_test",
+            "REGIME_STACK_PATH": "/tmp/regime_stack.csv",
+            "REGIME_ATOM_MODE": "rolling_quantile",
+        }
+        with patch.object(MjolnirTrading, "_load_regime_stack",
+                          return_value=[]), \
+                patch.object(MjolnirTrading, "_load_models"):
+            with pytest.raises(ValueError, match="research-only"):
+                MjolnirTrading(config=cfg, home_root="/tmp")

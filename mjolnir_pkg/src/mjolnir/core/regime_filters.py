@@ -93,6 +93,15 @@ class RollingQuantileAtoms(NamedTuple):
     levels: Mapping[str, float]
 
 
+# Keys that only have meaning in rolling-quantile mode. Their presence with
+# mode absent/"fixed" raises — a config carrying them while running fixed
+# thresholds is a misconfiguration waiting to be misread as active.
+_ROLLING_ONLY_KEYS = (
+    "REGIME_ATOM_QUANTILE_WINDOW_BARS",
+    "REGIME_ATOM_QUANTILE_LEVELS",
+)
+
+
 def rolling_quantile_atoms_from_config(
     cfg: Mapping,
 ) -> Optional[RollingQuantileAtoms]:
@@ -105,12 +114,18 @@ def rolling_quantile_atoms_from_config(
     explicitly sanctioned back-compat default (agreed opt-in design,
     2026-08-01): every setting.json written before then predates the key and
     must produce byte-identical masks. A PRESENT but invalid value always
-    raises — no silent fallback.
+    raises — no silent fallback. Rolling-only keys present while the mode is
+    absent/"fixed" also raise (they would be silently inert).
     """
-    if "REGIME_ATOM_MODE" not in cfg:
-        return None
-    mode = cfg["REGIME_ATOM_MODE"]
+    mode = cfg["REGIME_ATOM_MODE"] if "REGIME_ATOM_MODE" in cfg \
+        else ATOM_MODE_FIXED
     if mode == ATOM_MODE_FIXED:
+        stray = [k for k in _ROLLING_ONLY_KEYS if k in cfg]
+        if stray:
+            raise ValueError(
+                f"{', '.join(stray)} present but inert: these keys require "
+                f"REGIME_ATOM_MODE={ATOM_MODE_ROLLING_QUANTILE!r} "
+                f"(mode is {cfg.get('REGIME_ATOM_MODE', '<absent>')!r})")
         return None
     if mode != ATOM_MODE_ROLLING_QUANTILE:
         raise ValueError(
@@ -169,6 +184,10 @@ def _bar_timestamps(df: pd.DataFrame) -> pd.DatetimeIndex:
             "'timestamp' column to build causal trailing cutoffs")
     if ts.hasnans:
         raise ValueError("rolling_quantile atom mode: NaT in bar timestamps")
+    if ts.tz is not None:
+        # Normalize to UTC so day-bucket keys are true UTC days regardless
+        # of the frame's timezone.
+        ts = ts.tz_convert("UTC")
     return ts
 
 
@@ -206,17 +225,27 @@ def rolling_quantile_cutoff(
 
       1. per-UTC-day quantile of that day's values: q_d
       2. trailing mean over the last `window_days` daily quantiles: m_d
+         (min_periods = window_days: a partial window yields NaN, so warmup
+         behavior is deterministic across walk-forward windows)
       3. shift one full day: cutoff applied to day d = m_{d-1}
       4. broadcast each day's cutoff onto that day's bars
 
     Causality: step 3 shifts by one FULL day, so the cutoff applied to any
     bar of day d is built exclusively from days <= d-1 — no same-day leakage,
-    and in particular bar t's own value never enters its cutoff. Warmup (the
-    first day per symbol) has no prior day -> NaN cutoff -> comparisons are
-    False, i.e. the regime fails CLOSED until one full prior day exists.
+    and in particular bar t's own value never enters its cutoff.
+
+    Warmup: the FIRST window_days per symbol (and any day whose trailing
+    window has a data-gap day) get NaN cutoffs -> comparisons are False ->
+    the regime fails CLOSED. Research runs must therefore extend LOAD_START
+    by one full window (default 30 days) before the intended study start.
 
     Per-symbol: when a 'symbol' column is present, each symbol gets its own
     independent quantile stream (constraint: no cross-symbol pooling).
+
+    Live deployment path (follow-up, NOT implemented here): live bots cannot
+    span this window from their bar buffer — research is to dump the frozen
+    per-day cutoffs alongside the weights and the live bot loads them like
+    model artifacts. Until then MjolnirTrading rejects rolling mode at boot.
     """
     ts = _bar_timestamps(df)
     values = df[col].to_numpy(dtype=float)
@@ -237,7 +266,7 @@ def rolling_quantile_cutoff(
         s = pd.Series(values[idx][order], index=ts_sorted)
         daily_q = s.resample("1D").quantile(level)
         w_days = _window_days(ts_sorted, window_bars)
-        cut_daily = daily_q.rolling(w_days, min_periods=1).mean().shift(1)
+        cut_daily = daily_q.rolling(w_days, min_periods=w_days).mean().shift(1)
         # Map each bar to ITS day's cutoff by exact day key (no ffill
         # ambiguity); restore original row order.
         out[idx[order]] = cut_daily.reindex(ts_sorted.normalize()).to_numpy()
