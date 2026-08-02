@@ -15,6 +15,13 @@ the `combined_*` composites) RAISE on missing close/mvg1/mvg2 instead of
 returning all-True. Mirrors the mjolnir fix (b5ea04a,
 mjolnir/core/regime_filters.py::named_filter) — see
 mjolnir_pkg/tests/test_regime_filters.py.
+
+2026-08-02 (separate, pre-existing): the three volume atoms resolved their
+column via `df.get("quote_vol_ratio", df.get("vol_ratio", 1.0))`. On a frame
+carrying neither column that collapsed to the scalar 1.0, so `low_volume` /
+`high_volume` / `vol_breakout` returned a plain Python bool instead of a
+per-row mask — the banned `cfg.get("KEY", X)`-shaped magic default. They now
+raise via AgamottoResearch._volume_ratio. See TestVolumeRatioFailsLoud.
 """
 
 import pandas as pd
@@ -54,6 +61,12 @@ OWN_COLUMN_ATOMS = {
     "roc_positive": "roc",
     "roc_negative": "roc",
 }
+
+# The atoms that resolve their column through AgamottoResearch._volume_ratio,
+# i.e. accept EITHER quote_vol_ratio (preferred) or vol_ratio. Derived from
+# OWN_COLUMN_ATOMS so the two can't drift apart.
+VOLUME_ATOMS = tuple(
+    sorted(n for n, col in OWN_COLUMN_ATOMS.items() if col == "vol_ratio"))
 
 
 @pytest.fixture
@@ -213,6 +226,119 @@ class TestMvgGuardFailsLoud:
             df, "trend_aligned", "long").tolist() == [False, True]
         assert research._apply_filter_mask(
             df, "trend_aligned", "short").tolist() == [False, False]
+
+
+class TestVolumeRatioFailsLoud:
+    """2026-08-02 (pre-existing, separate from the dispatch-order fix): with
+    neither quote_vol_ratio nor vol_ratio present, the three volume atoms used
+    `df.get("quote_vol_ratio", df.get("vol_ratio", 1.0))` and compared against
+    the scalar 1.0, returning a plain bool rather than a per-row mask."""
+
+    def test_volume_atoms_cover_the_expected_three(self):
+        assert VOLUME_ATOMS == ("high_volume", "low_volume", "vol_breakout")
+
+    @pytest.mark.parametrize("name", VOLUME_ATOMS)
+    def test_missing_both_volume_columns_raises(self, research, name):
+        df = _bare_frame().drop(columns=["vol_ratio"])
+        for position in _positions(name):
+            with pytest.raises(
+                    ValueError, match="requires a volume-ratio column"):
+                research._apply_filter_mask(df, name, position)
+
+    @pytest.mark.parametrize("name", VOLUME_ATOMS)
+    def test_reported_repro_frame_raises(self, research, name):
+        """The exact frame from the 2026-08-02 report: price columns only, so
+        the atom used to return the bare bool False for both positions."""
+        df = pd.DataFrame({
+            "close": [1.0, 2.0], "mvg1": [1.0, 1.0], "mvg2": [1.0, 1.0]})
+        for position in _positions(name):
+            with pytest.raises(
+                    ValueError, match="requires a volume-ratio column"):
+                research._apply_filter_mask(df, name, position)
+
+    def test_error_names_both_accepted_columns(self, research):
+        df = pd.DataFrame({"close": [1.0, 2.0]})
+        with pytest.raises(ValueError, match="quote_vol_ratio"):
+            research._apply_filter_mask(df, "vol_breakout", "long")
+        with pytest.raises(ValueError, match="vol_ratio"):
+            research._apply_filter_mask(df, "vol_breakout", "long")
+
+    @pytest.mark.parametrize("name", VOLUME_ATOMS)
+    def test_never_returns_a_scalar_bool(self, research, name):
+        """Direct guard on the reported symptom: whatever comes back is a
+        per-row Series, never a bool — raising counts as not returning one."""
+        for df in (_bare_frame(), _full_frame(),
+                   _bare_frame().drop(columns=["vol_ratio"])):
+            for position in _positions(name):
+                try:
+                    got = research._apply_filter_mask(df, name, position)
+                except ValueError:
+                    continue
+                assert isinstance(got, pd.Series), (name, position)
+                assert len(got) == len(df)
+
+    @pytest.mark.parametrize("name,expected", [
+        ("low_volume", [True, True, False, False, False]),
+        ("high_volume", [False, False, True, True, True]),
+        ("vol_breakout", [False, False, False, True, True]),
+    ])
+    def test_vol_ratio_only_frame_still_dispatches(
+            self, research, name, expected):
+        """The common real shape: `volume` is a required load column so
+        vol_ratio always exists, while `quote_volume` (hence quote_vol_ratio)
+        is optional. Thresholds pinned: <1.0 / >1.0 / >2.0."""
+        df = pd.DataFrame({"vol_ratio": [0.5, 0.9, 1.5, 2.5, 3.0]})
+        assert research._apply_filter_mask(df, name, "long").tolist() == expected
+
+    @pytest.mark.parametrize("name,expected", [
+        ("low_volume", [True, True, False, False, False]),
+        ("high_volume", [False, False, True, True, True]),
+        ("vol_breakout", [False, False, False, True, True]),
+    ])
+    def test_quote_vol_ratio_only_frame_still_dispatches(
+            self, research, name, expected):
+        df = pd.DataFrame({"quote_vol_ratio": [0.5, 0.9, 1.5, 2.5, 3.0]})
+        assert research._apply_filter_mask(df, name, "long").tolist() == expected
+
+    @pytest.mark.parametrize("name", VOLUME_ATOMS)
+    def test_quote_vol_ratio_takes_priority_over_vol_ratio(
+            self, research, name):
+        """Longstanding priority, unchanged by the helper extraction."""
+        quote = [0.5, 0.9, 1.5, 2.5, 3.0]
+        both = pd.DataFrame({
+            "quote_vol_ratio": quote,
+            "vol_ratio": [9.0, 9.0, 9.0, 0.1, 0.1],  # would flip every row
+        })
+        quote_only = pd.DataFrame({"quote_vol_ratio": quote})
+        for position in _positions(name):
+            got = research._apply_filter_mask(both, name, position)
+            want = research._apply_filter_mask(quote_only, name, position)
+            assert got.tolist() == want.tolist(), (name, position)
+
+    def test_compound_and_propagates_the_raise(self, research):
+        """Pre-fix, `False & Series` silently produced an all-False mask."""
+        df = _bare_frame().drop(columns=["vol_ratio"])
+        with pytest.raises(ValueError, match="requires a volume-ratio column"):
+            research._apply_filter_mask(df, "vol_breakout_and_adx_trend", "long")
+
+    def test_compound_or_propagates_the_raise(self, research):
+        """Pre-fix, `False | Series` silently dropped the volume conjunct."""
+        df = _bare_frame().drop(columns=["vol_ratio"])
+        with pytest.raises(ValueError, match="requires a volume-ratio column"):
+            research._apply_filter_mask(df, "vol_breakout_or_adx_trend", "long")
+
+    def test_list_form_propagates_the_raise(self, research):
+        df = _bare_frame().drop(columns=["vol_ratio"])
+        with pytest.raises(ValueError, match="requires a volume-ratio column"):
+            research._apply_filter_mask(
+                df, ["high_volume", "&", "adx_trend"], "long")
+
+    def test_unknown_name_unaffected_by_the_volume_guard(self, research):
+        """A frame with no volume columns must still report unknown names as
+        unknown, not as a missing-volume-column error."""
+        df = _bare_frame().drop(columns=["vol_ratio"])
+        with pytest.raises(ValueError, match="Unknown filter name"):
+            research._apply_filter_mask(df, "definitely_not_a_filter", "long")
 
 
 class TestRollingQuantileMathUnchanged:
