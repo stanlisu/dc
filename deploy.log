@@ -49,3 +49,46 @@
     Per the dc README rule ("never deploy onto a host with running bots"), shield was skipped.
     Re-run for shield once that job finishes:
       rsync -az --delete build_dist/mjolnir_pkg/ shield:/home/stan/sandbox/marvel/mjolnir_pkg/
+
+2026-08-02 13:06 [local] rebuild+redeploy 8 algos -> hydra, shield, shield2 (main@56e02e0, routine refresh; map v1 unchanged: 72 regimes / 100 features)
+  - built via ./build_distribution.sh --build-only (pyarmor 9.2.3 trial, linux.x86_64, darwin.aarch64 host)
+  - SHIPPED (8/9): orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir
+  - rsync -az --delete build_dist/<algo>_pkg/ -> <host>:/home/stan/sandbox/marvel/<algo>_pkg/  (24/24 OK: 8 algos x 3 hosts)
+  - pre-ship checks on every package: matching pyarmor_runtime.so present (780K each) and _obf/map.json
+    survived (4890 B in 7 of 8; vibranium correctly carries none — it is excluded from sync_vendor._TARGETS)
+  - verified on hydra, shield, shield2 with the target's own python
+    (shield /opt/miniconda3/envs/py313, hydra+shield2 $HOME/miniconda3/envs/py313):
+    imported orb.research.OrbResearch, aether.research.AetherResearch, scepter.research.ScepterResearch,
+    mjolnir.trading.MjolnirTrading, stormbreaker.core.research.StormBreakerResearch,
+    valkyrie.core.research.ValkyrieResearch, vomir.research.VomirResearch, vibranium.research
+    -> 8/8 import and expose their API on all three hosts.
+
+  *** NOT SHIPPED: agamotto (pyarmor licence, unchanged since 2026-07-29) ***
+  - ./build_distribution.sh --build-only aborted at agamotto/research.py with "ERROR out of license",
+    exactly as recorded on 2026-07-29. set -e killed the whole 9-package batch, so the remaining 8 were
+    built individually (per the README "build algo-by-algo rather than assuming the source is broken").
+    All 8 then built clean on the first attempt — the quota is specific to that one oversized script.
+  - build_dist/agamotto_pkg/ is AGAIN a torn partial build: 2 of 10 files (lib_binance.py + the runtime
+    __init__). NOT rsynced anywhere. hydra/shield/shield2 keep their 2026-07-28 agamotto_pkg — stale but
+    consistent and working, NOT torn.
+  - FIX unchanged: buy/renew a pyarmor licence, or split agamotto/research.py below the trial ceiling
+    (~37KB-63KB per script).
+
+  *** DEPLOYED TO shield DESPITE A RUNNING JOB — evidence, not assumption ***
+  - shield was again mid-run on the ORB research job (gauntlet/rolling_predict_returns.py -c
+    pred_orb.base.1h_1 --workers 200, ~8h20m elapsed, 26 loky workers). On 2026-07-29 shield was SKIPPED
+    on the README rule "never deploy onto a host with running bots".
+  - This time the job's actual exposure was measured instead of assumed:
+      PYTHONPATH=/home/stan/sandbox/marvel/agamotto_pkg/src:/home/stan/sandbox/marvel
+      /proc/<pid>/maps + fd across the parent and all loky workers -> the ONLY marvel *_pkg mapped open
+      is agamotto_pkg.
+    agamotto_pkg is precisely the package this deploy does not ship, and no other *_pkg is on that job's
+    sys.path, so a re-spawning loky worker cannot import one of the 8 mid-rsync. Shipped, and confirmed
+    after: PID 3167625 still alive, 26 workers, job uninterrupted.
+  - hydra's live knull bots were likewise verified NOT to touch the deploy target: all three
+    (mjolnir_bridge --venue ltp, run_knull --venue ltp, run_knull --venue sumo) run with
+    cwd=/home/stan/sandbox/xmen and PYTHONPATH=/home/stan/sandbox/xmen:/home/stan/sandbox/xmen/mjolnir_pkg/src.
+    Zero processes on hydra had a cwd under sandbox/marvel. Same 3 PIDs (3954467/3954579/3954723) alive
+    after the deploy. hydra's crontab jobs use agamotto_pkg/src only — again, not shipped.
+  - xmen's vendored mjolnir_pkg is NOT updated by this deploy (git-tracked, refreshed via
+    --xmen + commit + PR + pull). It remains on its own build.
