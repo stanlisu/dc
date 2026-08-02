@@ -1,6 +1,6 @@
 {
   "_source": "Generated from xmen pred_mjolnir.base.30s_1_xmen/setting.json (live).",
-  "_mode": "SHADOW \u2014 the strategy has no order path compiled in.",
+  "_mode": "SHADOW by default. The P2 order path is compiled in but DISARMED unless enable_order_path=true AND every order_* key below is present and in range.",
   "product_id": 2000000170,
   "levels": 5,
   "dry_run": false,
@@ -18,5 +18,14 @@
   "logger_thread_name": "tsMjolnirLogger",
   "logger_core": 10,
   "logger_file_path": "/home/stan/mjolnir_shadow_bundle/log/mjolnir_shadow",
-  "_product_id": "BTCUSDT PERPETUAL, from /opt/data/Binance/contract_futures.csv"
+  "_product_id": "BTCUSDT PERPETUAL, from /opt/data/Binance/contract_futures.csv",
+  "enable_order_path": false,
+  "_order_path_note": "Set true ONLY to trade live. Requires oms_id (must match the running tsLtpShmOms node_config_details.oms_id), and all of order_notional_usd / max_position_notional_usd / price_tick / qty_step / cross_pct / quote_stale_ns. Missing key => refuses to arm. dry_run=true overrides.",
+  "oms_id": 0,
+  "order_notional_usd": 100.0,
+  "max_position_notional_usd": 150.0,
+  "price_tick": 0.1,
+  "qty_step": 0.001,
+  "cross_pct": 0.0005,
+  "quote_stale_ns": 2000000000
 }
