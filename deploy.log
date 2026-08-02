@@ -16,3 +16,36 @@
   - vibranium_pkg intentionally has NO _obf/map.json (sync_vendor._TARGETS excludes it) — not a build failure
   - PENDING: xmen/mjolnir_pkg NOT synced (separate target); hydra ops.log deploy prereq requires
     rsync marvel/mjolnir_pkg -> xmen/mjolnir_pkg before relaunching the knull bridge
+
+2026-08-02 14:1x [local] rebuild+redeploy mjolnir ONLY -> hydra, shield2 (main@931f417, incl PRs #27/#28)
+  - GOAL was all 9 algo pkgs -> hydra + shield + shield2. PARTIALLY BLOCKED, see below.
+  - mjolnir: ./build_distribution.sh --build-only mjolnir (pyarmor 9.2.3 trial, linux.x86_64) — all
+    files obfuscated OK incl. core/{research,features,regime_filters,streaming,ladder}.py + trading.py
+  - rsync -az --delete build_dist/mjolnir_pkg/ -> {hydra,shield2}:/home/stan/sandbox/marvel/mjolnir_pkg/ (2/2 OK)
+  - both hosts idle at deploy time (python procs = 0), so nothing imported a package mid-rsync
+  - ALSO rsync marvel/mjolnir_pkg/ -> xmen/mjolnir_pkg/ on hydra (the /launch-xmen-bots deploy prereq,
+    which build_distribution never does) — verified obfuscated import on the xmen copy:
+    mjolnir imports, MjolnirTrading present, _obf/map.json = 4 entries
+  - WHY mjolnir only: diff 2f0920c..HEAD shows only agamotto_pkg and mjolnir_pkg changed. The other
+    7 pkgs are unchanged since the 2026-07-28 build, so their deployed copies already match HEAD.
+
+  *** BLOCKED: agamotto_pkg cannot be rebuilt — pyarmor "ERROR out of license" ***
+  - Fails obfuscating agamotto/src/agamotto/research.py. That file grew 58842 -> 63418 bytes between
+    2f0920c (last good all-9 build, 2026-07-28, logged "no out of license") and 931f417 (PRs #27/#28).
+    mjolnir's largest shipped file is 36981 B and builds fine, so the pyarmor 9.2.3 TRIAL ceiling sits
+    between ~37KB and ~63KB per script. This is a licence limit, not a code defect.
+  - CONSEQUENCE 1: hydra/shield2/shield still run the 2026-07-28 agamotto_pkg. Stale, but consistent
+    and working — NOT torn.
+  - CONSEQUENCE 2: build_dist/agamotto_pkg/ is now a TORN partial build (only lib_binance.py written
+    before the error). DO NOT rsync that directory to any host — it would ship an incomplete package.
+    build_distribution.sh aborts on the build failure so its own deploy path can't reach it, but a
+    manual per-algo rsync would. Left in place rather than deleted, pending a licence decision.
+  - FIX: buy/renew a pyarmor licence, or split agamotto/research.py below the trial ceiling.
+
+  *** NOT DEPLOYED: shield ***
+  - shield was mid-run on a live ORB research job (gauntlet/rolling_predict_returns.py -c
+    pred_orb.base.1h_1 --workers 200, ~1h14m elapsed, ~24 loky workers). Those workers spawn new
+    processes that re-import the algo packages, and rsync --delete would tear the tree mid-import.
+    Per the dc README rule ("never deploy onto a host with running bots"), shield was skipped.
+    Re-run for shield once that job finishes:
+      rsync -az --delete build_dist/mjolnir_pkg/ shield:/home/stan/sandbox/marvel/mjolnir_pkg/
