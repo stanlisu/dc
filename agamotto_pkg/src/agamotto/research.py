@@ -798,6 +798,29 @@ class AgamottoResearch:
         else:
             self.vertical_features = pd.DataFrame()
 
+    @staticmethod
+    def _volume_ratio(df: pd.DataFrame, filter_name: str) -> pd.Series:
+        """Volume-ratio series backing low_volume/high_volume/vol_breakout.
+
+        Prefers quote_vol_ratio (quote_vol / 7d MA) over vol_ratio
+        (vol / 7d MA), matching the longstanding priority. Raises when neither
+        column exists — the old `df.get("quote_vol_ratio", df.get("vol_ratio",
+        1.0))` collapsed to the scalar 1.0 there, so the three comparisons
+        returned a plain Python bool instead of a per-row mask and
+        `features_df[mask]` degenerated (KeyError standalone, silent all-False
+        under `_and_`, silently dropped under `_or_`). engineer_features always
+        builds vol_ratio (raw `volume` is a required load column), so a real
+        feature frame never hits this.
+        """
+        for col in ("quote_vol_ratio", "vol_ratio"):
+            if col in df.columns:
+                return df[col]
+        raise ValueError(
+            f"Filter {filter_name!r} requires a volume-ratio column; frame is "
+            "missing both 'quote_vol_ratio' and 'vol_ratio'. A scalar 1.0 "
+            "fallback here returns a bool instead of a per-row mask — "
+            "failing loud instead. See CLAUDE.md no-silent-fallback rules.")
+
     def _apply_filter_mask(self, df: pd.DataFrame, filter_name: str | list, position: str) -> pd.Series:
         """
         Applies a named filter or list of filters to the DataFrame.
@@ -890,7 +913,9 @@ class AgamottoResearch:
         # (high_vol AND low_vol simultaneously all-True) — the banned
         # baseline-shaped always-on failure. Mirrors the mjolnir fix (b5ea04a,
         # mjolnir/core/regime_filters.py). Their own missing-column all-True
-        # guards are unchanged (longstanding, pinned by tests).
+        # guards are unchanged (longstanding, pinned by tests) — except the
+        # three volume atoms, which RAISE via _volume_ratio() rather than
+        # collapsing to a scalar-1.0 comparison (2026-08-02, see that helper).
         if position == "long":
             if filter_name == "low_vol":
                 q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
@@ -916,11 +941,11 @@ class AgamottoResearch:
                 return df["mom"] > 0 if "mom" in df.columns else pd.Series(True, index=df.index)
 
             # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
-            v_ratio = df.get("quote_vol_ratio", df.get("vol_ratio", 1.0))
-
-            if filter_name == "low_volume": return (v_ratio < 1.0)
-            if filter_name == "high_volume": return (v_ratio > 1.0)
-            if filter_name == "vol_breakout": return (v_ratio > 2.0)
+            if filter_name in ("low_volume", "high_volume", "vol_breakout"):
+                v_ratio = type(self)._volume_ratio(df, filter_name)
+                if filter_name == "low_volume": return (v_ratio < 1.0)
+                if filter_name == "high_volume": return (v_ratio > 1.0)
+                return (v_ratio > 2.0)  # vol_breakout
 
             # New TA-lab filters
             if filter_name == "buy_pressure":
@@ -958,13 +983,11 @@ class AgamottoResearch:
             # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
             # quote_vol_ratio = quote_vol / 7d_ma
             # vol_ratio = vol / 7d_ma
-
-            # Helper to get either ratio
-            v_ratio = df.get("quote_vol_ratio", df.get("vol_ratio", 1.0))
-
-            if filter_name == "low_volume": return (v_ratio < 1.0)
-            if filter_name == "high_volume": return (v_ratio > 1.0)
-            if filter_name == "vol_breakout": return (v_ratio > 2.0)
+            if filter_name in ("low_volume", "high_volume", "vol_breakout"):
+                v_ratio = type(self)._volume_ratio(df, filter_name)
+                if filter_name == "low_volume": return (v_ratio < 1.0)
+                if filter_name == "high_volume": return (v_ratio > 1.0)
+                return (v_ratio > 2.0)  # vol_breakout
 
             # New TA-lab filters
             if filter_name == "buy_pressure":
