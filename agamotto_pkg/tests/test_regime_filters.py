@@ -436,3 +436,77 @@ class TestBaseRegimeCompositesUnaffected:
         with pytest.raises(ValueError, match="requires price columns"):
             research._apply_filter_mask(
                 _bare_frame(), "vol_breakout_and_strong_trend", "long")
+
+
+class TestOwnColumnMissingRaises:
+    """2026-08-04 (dc #29 follow-up): an own-column atom whose source column
+    is absent must RAISE, not return an all-True mask.
+
+    An all-True mask there matches every row, i.e. `baseline` wearing another
+    regime's name — the unconditional fires-on-every-bar regime CLAUDE.md
+    removed forever on 2026-06-18. A renamed or unbuilt feature column
+    silently reinstated it and inflated any screen that touched the regime.
+    Mirrors mjolnir `core/regime_filters.py::_require_col` and stormbreaker
+    `core/filters.py`.
+    """
+
+    @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
+    def test_absent_own_column_raises_rather_than_matching_every_row(
+            self, research, name):
+        col = OWN_COLUMN_ATOMS[name]
+        # Start from the frame that has EVERY own column, then remove only
+        # this atom's input — so nothing else can explain the raise.
+        df = _bare_frame().drop(columns=[col])
+        if name in VOLUME_ATOMS:
+            # These resolve through _volume_ratio, which accepts either
+            # quote_vol_ratio or vol_ratio — drop both to starve it.
+            df = df.drop(columns=["quote_vol_ratio"], errors="ignore")
+        for position in _positions(name):
+            with pytest.raises(ValueError) as exc:
+                research._apply_filter_mask(df, name, position)
+            msg = str(exc.value)
+            assert name in msg, (name, position, msg)
+
+    @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
+    def test_error_names_the_missing_column(self, research, name):
+        if name in VOLUME_ATOMS:
+            pytest.skip("_volume_ratio names the pair, covered by its own test")
+        col = OWN_COLUMN_ATOMS[name]
+        df = _bare_frame().drop(columns=[col])
+        for position in _positions(name):
+            with pytest.raises(ValueError) as exc:
+                research._apply_filter_mask(df, name, position)
+            assert col in str(exc.value), (name, position, str(exc.value))
+
+    @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
+    def test_present_column_still_yields_a_mask(self, research, name):
+        # Guard against over-correcting into "always raises".
+        bare = _bare_frame()
+        for position in _positions(name):
+            mask = research._apply_filter_mask(bare, name, position)
+            assert isinstance(mask, pd.Series), (name, position)
+            assert len(mask) == len(bare), (name, position)
+
+    def test_zero_column_frame_short_circuits_before_dispatch(self, research):
+        # Rows but ZERO columns. pandas reports that frame as `.empty`, so
+        # _apply_filter_mask's early `if df.empty` guard returns an empty
+        # Series BEFORE any atom dispatch — the missing-column raise is never
+        # reached. Pinned so the boundary is explicit rather than assumed.
+        #
+        # This is NOT the all-True baseline bug: the mask is length 0, not
+        # all-True, so it cannot make a regime fire on every bar. It is a
+        # separate pre-existing path that predates dc #29 and is deliberately
+        # left alone by it.
+        df = pd.DataFrame(index=range(5))
+        assert df.empty  # the pandas property this whole test hinges on
+        for name in sorted(OWN_COLUMN_ATOMS):
+            for position in _positions(name):
+                mask = research._apply_filter_mask(df, name, position)
+                assert len(mask) == 0, (name, position)
+
+    def test_composition_with_starved_atom_raises(self, research):
+        # A compound must fail loud rather than composing an all-True conjunct.
+        df = _bare_frame().drop(columns=["rsi"])
+        with pytest.raises(ValueError, match="rsi"):
+            research._apply_filter_mask(df, "rsi_oversold_and_adx_trend",
+                                        "long")

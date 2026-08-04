@@ -32,4 +32,17 @@ jobs:
                       stormbreaker_pkg/
 
       - name: Run tests
-        run: pytest agamotto_pkg/tests/ -v --tb=short
+        # Run the WHOLE suite, not just agamotto_pkg/tests/. Until 2026-08-04
+        # this line named agamotto only, so the mjolnir, stormbreaker, orb,
+        # scepter, aether, vomir, valkyrie and vibranium suites were never
+        # exercised by CI even though every one of those packages is pip
+        # installed above — dc #29 (the missing-column raise) shipped with its
+        # regression tests invisible to CI.
+        #
+        # Invoked from the repo root on purpose: it picks up new packages
+        # automatically, so adding one can never silently leave it untested.
+        # conftest.py regenerates the vendored _obf codec first (it is derived
+        # and gitignored); sentinel_core/tests/*.py are parity DRIVERS, not
+        # test_*.py, so pytest does not collect them and they still need their
+        # compiled binaries to run.
+        run: pytest -v --tb=short
