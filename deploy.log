@@ -92,3 +92,41 @@
     after the deploy. hydra's crontab jobs use agamotto_pkg/src only — again, not shipped.
   - xmen's vendored mjolnir_pkg is NOT updated by this deploy (git-tracked, refreshed via
     --xmen + commit + PR + pull). It remains on its own build.
+
+================================================================================
+2026-08-04 06:08:45 UTC — deploy mjolnir_pkg + stormbreaker_pkg (dc #29)
+================================================================================
+WHAT: dc PR #29 "fix(regime): raise on missing source column instead of an
+      all-True mask" (squash-merged as 01f615e). A known regime whose source
+      column was absent returned an all-True mask = a silent `baseline` regime.
+
+BUILT/DEPLOYED: mjolnir_pkg, stormbreaker_pkg -> hydra, shield, shield2
+      (`echo 4 | ./build_distribution.sh <algo>`, option 4 = all marvel hosts)
+
+SCOPE — why not all 9 algos: `./build_distribution.sh --build-only` (full fleet)
+      ABORTS. pyarmor 9.2.3 is on a TRIAL licence and `pyarmor gen` fails with
+      "ERROR out of license" on agamotto/research.py; `set -e` then kills the
+      run before any later algo builds. Only mjolnir_pkg and stormbreaker_pkg
+      contain dc #29 changes, so those are the two that needed shipping.
+
+PRE-DEPLOY CHECK: hydra had ZERO bot processes running
+      (ps -eo pid,etime,args | grep -E "trade_execution|knull|bridge_main|--venue"
+      -> none), so no live process was importing the deploy target.
+
+VERIFIED AFTER (obfuscated builds cannot be grepped — called the real function
+      and read the behavior, on each host, with $HOME/miniconda3/envs/py313/bin/python):
+        hydra   OK  mjolnir/wide_spread raised; stormbreaker/buy_flow raised
+        shield  OK  mjolnir/wide_spread raised; stormbreaker/buy_flow raised
+        shield2 OK  mjolnir/wide_spread raised; stormbreaker/buy_flow raised
+      (pre-#29 these returned an all-True mask instead of raising)
+
+NOT COVERED BY THIS DEPLOY:
+  - sentinel_core .so — build_distribution.sh does not touch sentinel_core.
+    regime_gate.cpp's guard now throws; the shipped .so is STALE until rebuilt
+    (sentinel_core/build_linux.sh). Being done on dev105 next.
+  - xmen's vendored mjolnir_pkg — git-tracked, refreshed only via
+    `--xmen` + commit + PR + `git pull` on the host. xmen therefore still runs
+    a mjolnir build WITH the all-True fallback. Bots are down, so no live
+    exposure right now, but xmen must be refreshed before the next launch.
+  - agamotto_pkg — licence-blocked (above) AND still carries the same
+    all-True bug in research.py::_apply_filter_mask (follow-up, not yet fixed).
