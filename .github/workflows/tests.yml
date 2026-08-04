@@ -33,7 +33,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pytest pytest-cov pytest-asyncio
-          pip install pandas numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
+          # pandas PINNED 2026-08-04 to match marvel/environment.yml and the
+          # servers. Unpinned, CI resolved to whatever was newest (3.0.5) while
+          # environment.yml declared 2.3.3 and prod ran 3.0.2/3.0.3 — three
+          # different pandas across dev, CI and prod. That MAJOR-version split
+          # is how mjolnir's rolling-quantile warmup bug stayed hidden: it
+          # fails on pandas 3 and passes on 2.3.3, and only the local Mac was
+          # on 2.3.3. Keep in lockstep with marvel environment.yml and
+          # marvel/.github/workflows/ci.yml.
+          pip install 'pandas==3.0.3' numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
           # -e on EVERY package, not just the first. Until 2026-08-04 this read
           # `pip install -e agamotto_pkg/ \ orb_pkg/ \ ...`, where -e binds only
           # to agamotto: the other eight were installed NON-editable, i.e.
