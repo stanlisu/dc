@@ -130,3 +130,64 @@ NOT COVERED BY THIS DEPLOY:
     exposure right now, but xmen must be refreshed before the next launch.
   - agamotto_pkg — licence-blocked (above) AND still carries the same
     all-True bug in research.py::_apply_filter_mask (follow-up, not yet fixed).
+
+================================================================================
+2026-08-04 06:15:14 UTC — sentinel_core .so rebuild (dev105) + deploy to hydra
+================================================================================
+WHY: dc #29 changed sentinel_core/src/regime_gate.cpp — the per-branch missing
+     column guard now THROWS instead of returning allTrue(n). The shipped .so
+     predates that and build_distribution.sh never touches sentinel_core.
+
+BUILT: dev105 (192.168.72.105) — ~/sandbox/dc pulled to ab97943, then
+     `sentinel_core/build_linux.sh` (rockylinux:8 container, glibc 2.28/gcc 8.5)
+       sha=ab97943 (clean, not -dirty)
+       artifact leak audit: PASS (python3.11)
+       out: sentinel_core/build-linux/libmjolnir_core.so
+       sha256 caca4ca4549c5943327eef4a3206aa1120bf5cb44d7cc741d4b02525c182fefc
+
+DEPLOYED to hydra: ~/mjolnir_core_lib/libmjolnir_core.so (9273496 bytes)
+     Route was dev105 -> local -> hydra, NOT `build_linux.sh --deploy hydra`:
+     dev105 cannot resolve "hydra" (private LAN vs public AWS host) and has no
+     key for it (Permission denied (publickey) to stan@13.115.134.141, though
+     TCP/22 is open). No credential was added — local holds keys for both.
+     sha256 verified identical at all three points.
+     hydra had NO existing .so and NO bots running at deploy time.
+
+--------------------------------------------------------------------------------
+PARITY GATE RUN (tests/regime_parity.py) — PRE-EXISTING FAILURE, NOT FROM #29
+--------------------------------------------------------------------------------
+There is no committed build recipe for the parity drivers, so the driver was
+compiled ad hoc in the same container (see FOLLOW-UP below):
+  g++ -std=c++17 -O2 -I/sentinel/.../stan_code tests/regime_parity_driver.cpp \
+      src/{bar_builder,feature_engine,regime_gate,talib_block}.cpp \
+      /usr/local/lib/libta-lib.a -o build-linux/regime_parity_driver
+
+Note: `mjolnir/_obf` is derived + gitignored; without running
+obfuscation/{build_map,sync_vendor}.py first the harness SKIPs every regime and
+correctly reports "compared 0 regimes — nothing was verified".
+
+RESULT at ab97943 (post-#29):   rows=1122 compared=30, FAIL: 5 regimes differ
+RESULT at e47a05c (pre-#29):    rows=1122 compared=30, FAIL: 5 regimes differ
+  -> BYTE-IDENTICAL failure lists and row counts. The 5 failures PRE-DATE #29.
+
+  r060 rsi_oversold    long : 114 rows differ (ref true=152, cpp true=68)
+  r059 rsi_overbought  long :  78 rows differ (ref true=103, cpp true=29)
+  r042 macd_bullish    long :  29 rows differ (ref true=565, cpp true=536)
+  r041 macd_bearish    short:  29 rows differ (ref true=565, cpp true=536)
+  r003 adx_trend       long : 320 rows differ (ref true=0,   cpp true=320)
+
+All 5 are TA-Lib indicator regimes -> a C++ talib_block vs Python TA math gap,
+NOT the missing-column path #29 touched. Zero SKIPs in both runs, i.e. no regime
+reached the missing-column guard at all, which is why #29 cannot be implicated.
+Consistent with sentinel_core/README.md: M1 is scaffold/shadow-only and the
+variant-A parity gate is explicitly not yet passed.
+
+#29's own effect on the harness is nil, as predicted: the synthetic panel
+carries every source column (M events supply mark/index/funding; index is
+tz-aware so pre_funding exists), so no regime raises and the compared-set is
+unchanged at 30.
+
+FOLLOW-UPS:
+  - The 5 TA-Lib parity failures are a real open gate on the C++ port.
+  - No committed build recipe for tests/*_parity_driver.cpp (CLAUDE.md wants a
+    committed script + README, not a hand-rebuilt command line).
