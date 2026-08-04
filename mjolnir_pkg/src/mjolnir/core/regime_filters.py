@@ -362,6 +362,31 @@ def apply_filter_mask(
     return named_filter(df, name, position, atom_cfg)
 
 
+def _require_col(df: pd.DataFrame, name: str, col: str) -> None:
+    """Fail loud when a known filter's source column is absent.
+
+    2026-08-04: this used to `return pd.Series(True, index=df.index)` — an
+    all-True mask, i.e. the regime fires on EVERY bar. That silently
+    reconstructs `baseline` (removed forever 2026-06-18, hard-enforced in
+    code) under some other regime's name: a renamed, mis-built, or
+    wrong-prefix feature column turns a conditional gate into an
+    unconditional one and inflates every screen that touched it. Found
+    during the 2026-08-04 hlp causal rerun on shield2. Same failure shape as
+    the mvg1/mvg2/close guard fixed 2026-08-01 below, and as
+    stormbreaker core/filters.py.
+
+    Callers that legitimately cannot supply a column must drop the regime
+    from the stack, not evaluate it against a frame that cannot express it.
+    """
+    if col not in df.columns:
+        raise ValueError(
+            f"Filter {name!r} requires column {col!r}; frame is missing it "
+            f"({len(df.columns)} columns present). An all-True fallback here "
+            "fires on every bar — a `baseline` regime under another name, "
+            "which CLAUDE.md removed forever (2026-06-18). Failing loud "
+            "instead; drop the regime from the stack or build the column.")
+
+
 def named_filter(
     df: pd.DataFrame,
     name: str,
@@ -370,22 +395,19 @@ def named_filter(
 ) -> pd.Series:
     """Dispatch to a named filter implementation.
 
-    Raises ValueError for unknown names regardless of df contents; the
-    per-branch missing-column all-True guards apply to KNOWN names only
-    (and in BOTH atom modes — the guard precedes any cutoff computation).
-    The MVG-dependent filters (trend_aligned, strong_trend, ma_momentum,
-    bb_rebound) instead RAISE when mvg1/mvg2/close are missing (2026-08-01):
-    the old shared all-True guard sat ABOVE the own-column filters too, so
-    e.g. high_vol/low_vol fired on every bar of a frame lacking price columns
-    even with price_range_pct present.
+    Raises ValueError for unknown names regardless of df contents. KNOWN
+    names whose source column is absent ALSO raise (2026-08-04, see
+    _require_col) — there is no all-True fallback left in this function, in
+    either atom mode: every guard precedes any cutoff computation and every
+    guard raises. The MVG-dependent filters (trend_aligned, strong_trend,
+    ma_momentum, bb_rebound) raise on missing mvg1/mvg2/close for the same
+    reason (2026-08-01).
 
     atom_cfg=None = legacy fixed thresholds (documented back-compat default;
     see apply_filter_mask / rolling_quantile_atoms_from_config).
     """
     if name not in KNOWN_FILTERS:
         raise ValueError(f"Unknown filter: {name!r}")
-
-    true = pd.Series(True, index=df.index)
 
     # ---- Microstructure filters (Mjolnir-specific) ----
 
@@ -396,60 +418,51 @@ def named_filter(
 
     if name == "high_liquidation_pressure":
         col = "liq_burst_ratio"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "low_liquidation_pressure":
         col = "liq_burst_ratio"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "funding_positive":
         col = "funding_rate"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 0
 
     if name == "funding_negative":
         col = "funding_rate"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < 0
 
     if name == "deep_book":
         col = "depth_imbalance_L5"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         if position == "long":
             return df[col] > _atom_cutoff(df, col, "deep_book_long", atom_cfg)
         return df[col] < _atom_cutoff(df, col, "deep_book_short", atom_cfg)
 
     if name == "trade_imbalance":
         col = "trade_imbalance"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         if position == "long":
             return df[col] > 0
         return df[col] < 0
 
     if name == "basis_premium":
         col = "basis_pct"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 0
 
     if name == "basis_discount":
         col = "basis_pct"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < 0
 
     if name == "pre_funding_settlement":
         col = "pre_funding"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 0
 
     # oi_expansion/oi_contraction REMOVED 2026-07-24: they gated on the SIGN
@@ -460,22 +473,19 @@ def named_filter(
 
     if name == "ofi_positive":
         col = "ofi_agg"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         if position == "long":
             return df[col] > 0
         return df[col] < 0
 
     if name == "tight_spread":
         col = "relative_spread"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "wide_spread":
         col = "relative_spread"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     # ---- Standard price filters (shared with Agamotto) ----
@@ -485,68 +495,58 @@ def named_filter(
     # the mvg1/mvg2/close all-True guard, so on frames lacking those columns
     # they silently fired on EVERY bar even when their own column was present
     # (high_vol and low_vol both all-True simultaneously) — the banned
-    # baseline-shaped always-on failure. Their own missing column still
-    # returns all-True (longstanding known-name guard, pinned by tests).
+    # baseline-shaped always-on failure. Since 2026-08-04 their OWN missing
+    # column raises too (_require_col): the last all-True path is gone.
 
     if name == "rsi_oversold":
         col = "rsi"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < 30
 
     if name == "rsi_overbought":
         col = "rsi"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 70
 
     if name == "macd_bullish":
         col = "macdhist"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 0 if position == "long" else df[col] < 0
 
     if name == "macd_bearish":
         col = "macdhist"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < 0 if position == "long" else df[col] > 0
 
     if name == "adx_trend":
         col = "adx"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 25
 
     if name in ("high_volume", "vol_breakout"):
         col = "vol_ratio"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         threshold = 2.0 if name == "vol_breakout" else 1.0
         return df[col] > threshold
 
     if name == "low_volume":
         col = "vol_ratio"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < 1.0
 
     if name == "high_vol":
         col = "price_range_pct"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "low_vol":
         col = "price_range_pct"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] < _atom_cutoff(df, col, name, atom_cfg)
 
     if name == "mom_positive":
         col = "mom"
-        if col not in df.columns:
-            return true
+        _require_col(df, name, col)
         return df[col] > 0 if position == "long" else df[col] < 0
 
     # MVG-dependent filters (trend_aligned, strong_trend, ma_momentum,
@@ -589,13 +589,11 @@ def named_filter(
     if name == "bb_rebound":
         if position == "long":
             col = "bb_lower"
-            if col not in df.columns:
-                return true
+            _require_col(df, name, col)
             return close < df[col]
         else:
             col = "bb_upper"
-            if col not in df.columns:
-                return true
+            _require_col(df, name, col)
             return close > df[col]
 
     # Unreachable for unknown names (rejected at the top); firing here means
