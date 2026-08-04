@@ -142,8 +142,20 @@ std::vector<char> applyFilterMask(const FeaturePanel& panel,
         throw std::runtime_error("regime is not a code (expected rNNN): " + name);
 
     const bool is_long = (position == "long");
-    // Missing column -> all-true, matching the reference's per-branch guard.
-    auto guard = [&](const char* col) { return !panel.has(col); };
+    // Missing column -> THROW, matching the reference's per-branch guard
+    // (dc mjolnir_pkg .../regime_filters.py::_require_col, 2026-08-04).
+    // These used to return all-true, i.e. fire on EVERY bar — a silent
+    // `baseline` regime under another name, which CLAUDE.md removed forever
+    // (2026-06-18). Python and C++ MUST agree here: regime_parity.py SKIPs a
+    // regime whose reference raised and then FAILs when it compared fewer
+    // regimes than it was asked for, so a one-sided change is caught there.
+    auto guard = [&](const char* col) -> void {
+        if (!panel.has(col))
+            throw std::runtime_error(
+                "regime r" + std::to_string(code) + " requires missing column: "
+                + std::string(col) + " (an all-true fallback here fires on "
+                "every bar — a baseline regime under another name)");
+    };
 
     // NOTE: there is deliberately no `baseline` branch. That regime was removed
     // from the obfuscation map entirely, so it has no code and cannot even be
@@ -151,115 +163,115 @@ std::vector<char> applyFilterMask(const FeaturePanel& panel,
     // pass it arrives as an unencodable name and is refused above.
 
     if (code == codes::R_HIGH_LIQUIDATION_PRESSURE) {
-        if (guard(codes::F_LIQ_BURST_RATIO)) return allTrue(n);
+        guard(codes::F_LIQ_BURST_RATIO);
         const auto& c = panel.get(codes::F_LIQ_BURST_RATIO);
         const double q = quantileLinear(c, 0.75);
         return cmpCol(c, [q](double v) { return v > q; });
     }
     if (code == codes::R_LOW_LIQUIDATION_PRESSURE) {
-        if (guard(codes::F_LIQ_BURST_RATIO)) return allTrue(n);
+        guard(codes::F_LIQ_BURST_RATIO);
         const auto& c = panel.get(codes::F_LIQ_BURST_RATIO);
         const double q = quantileLinear(c, 0.25);
         return cmpCol(c, [q](double v) { return v < q; });
     }
     if (code == codes::R_FUNDING_POSITIVE) {
-        if (guard("funding_rate")) return allTrue(n);
+        guard("funding_rate");
         return cmpCol(panel.get("funding_rate"), [](double v) { return v > 0; });
     }
     if (code == codes::R_FUNDING_NEGATIVE) {
-        if (guard("funding_rate")) return allTrue(n);
+        guard("funding_rate");
         return cmpCol(panel.get("funding_rate"), [](double v) { return v < 0; });
     }
     if (code == codes::R_DEEP_BOOK) {
-        if (guard(codes::F_DEPTH_IMBALANCE_L5)) return allTrue(n);
+        guard(codes::F_DEPTH_IMBALANCE_L5);
         const auto& c = panel.get(codes::F_DEPTH_IMBALANCE_L5);
         const double q = quantileLinear(c, is_long ? 0.6 : 0.4);
         return is_long ? cmpCol(c, [q](double v) { return v > q; })
                        : cmpCol(c, [q](double v) { return v < q; });
     }
     if (code == codes::R_TRADE_IMBALANCE) {
-        if (guard(codes::F_TRADE_IMBALANCE)) return allTrue(n);
+        guard(codes::F_TRADE_IMBALANCE);
         const auto& c = panel.get(codes::F_TRADE_IMBALANCE);
         return is_long ? cmpCol(c, [](double v) { return v > 0; })
                        : cmpCol(c, [](double v) { return v < 0; });
     }
     if (code == codes::R_BASIS_PREMIUM) {
-        if (guard(codes::F_BASIS_PCT)) return allTrue(n);
+        guard(codes::F_BASIS_PCT);
         return cmpCol(panel.get(codes::F_BASIS_PCT), [](double v) { return v > 0; });
     }
     if (code == codes::R_BASIS_DISCOUNT) {
-        if (guard(codes::F_BASIS_PCT)) return allTrue(n);
+        guard(codes::F_BASIS_PCT);
         return cmpCol(panel.get(codes::F_BASIS_PCT), [](double v) { return v < 0; });
     }
     if (code == codes::R_PRE_FUNDING_SETTLEMENT) {
-        if (guard(codes::F_PRE_FUNDING)) return allTrue(n);
+        guard(codes::F_PRE_FUNDING);
         return cmpCol(panel.get(codes::F_PRE_FUNDING), [](double v) { return v > 0; });
     }
     if (code == codes::R_OFI_POSITIVE) {
-        if (guard(codes::F_OFI_AGG)) return allTrue(n);
+        guard(codes::F_OFI_AGG);
         const auto& c = panel.get(codes::F_OFI_AGG);
         return is_long ? cmpCol(c, [](double v) { return v > 0; })
                        : cmpCol(c, [](double v) { return v < 0; });
     }
     if (code == codes::R_TIGHT_SPREAD) {
-        if (guard(codes::F_RELATIVE_SPREAD)) return allTrue(n);
+        guard(codes::F_RELATIVE_SPREAD);
         const auto& c = panel.get(codes::F_RELATIVE_SPREAD);
         const double q = quantileLinear(c, 0.5);
         return cmpCol(c, [q](double v) { return v < q; });
     }
     if (code == codes::R_WIDE_SPREAD) {
-        if (guard(codes::F_RELATIVE_SPREAD)) return allTrue(n);
+        guard(codes::F_RELATIVE_SPREAD);
         const auto& c = panel.get(codes::F_RELATIVE_SPREAD);
         const double q = quantileLinear(c, 0.5);
         return cmpCol(c, [q](double v) { return v > q; });
     }
     if (code == codes::R_RSI_OVERSOLD) {
-        if (guard(codes::F_RSI)) return allTrue(n);
+        guard(codes::F_RSI);
         return cmpCol(panel.get(codes::F_RSI), [](double v) { return v < 30; });
     }
     if (code == codes::R_RSI_OVERBOUGHT) {
-        if (guard(codes::F_RSI)) return allTrue(n);
+        guard(codes::F_RSI);
         return cmpCol(panel.get(codes::F_RSI), [](double v) { return v > 70; });
     }
     if (code == codes::R_MACD_BULLISH) {
-        if (guard(codes::F_MACDHIST)) return allTrue(n);
+        guard(codes::F_MACDHIST);
         const auto& c = panel.get(codes::F_MACDHIST);
         return is_long ? cmpCol(c, [](double v) { return v > 0; })
                        : cmpCol(c, [](double v) { return v < 0; });
     }
     if (code == codes::R_MACD_BEARISH) {
-        if (guard(codes::F_MACDHIST)) return allTrue(n);
+        guard(codes::F_MACDHIST);
         const auto& c = panel.get(codes::F_MACDHIST);
         return is_long ? cmpCol(c, [](double v) { return v < 0; })
                        : cmpCol(c, [](double v) { return v > 0; });
     }
     if (code == codes::R_ADX_TREND) {
-        if (guard(codes::F_ADX)) return allTrue(n);
+        guard(codes::F_ADX);
         return cmpCol(panel.get(codes::F_ADX), [](double v) { return v > 25; });
     }
     if (code == codes::R_VOL_BREAKOUT || code == codes::R_HIGH_VOLUME) {
-        if (guard(codes::F_VOL_RATIO)) return allTrue(n);
+        guard(codes::F_VOL_RATIO);
         const double thr = (code == codes::R_VOL_BREAKOUT) ? 2.0 : 1.0;
         return cmpCol(panel.get(codes::F_VOL_RATIO), [thr](double v) { return v > thr; });
     }
     if (code == codes::R_LOW_VOLUME) {
-        if (guard(codes::F_VOL_RATIO)) return allTrue(n);
+        guard(codes::F_VOL_RATIO);
         return cmpCol(panel.get(codes::F_VOL_RATIO), [](double v) { return v < 1.0; });
     }
     if (code == codes::R_HIGH_VOL) {
-        if (guard(codes::F_PRICE_RANGE_PCT)) return allTrue(n);
+        guard(codes::F_PRICE_RANGE_PCT);
         const auto& c = panel.get(codes::F_PRICE_RANGE_PCT);
         const double q = quantileLinear(c, 0.5);
         return cmpCol(c, [q](double v) { return v > q; });
     }
     if (code == codes::R_LOW_VOL) {
-        if (guard(codes::F_PRICE_RANGE_PCT)) return allTrue(n);
+        guard(codes::F_PRICE_RANGE_PCT);
         const auto& c = panel.get(codes::F_PRICE_RANGE_PCT);
         const double q = quantileLinear(c, 0.5);
         return cmpCol(c, [q](double v) { return v < q; });
     }
     if (code == codes::R_MOM_POSITIVE) {
-        if (guard(codes::F_MOM)) return allTrue(n);
+        guard(codes::F_MOM);
         const auto& c = panel.get(codes::F_MOM);
         return is_long ? cmpCol(c, [](double v) { return v > 0; })
                        : cmpCol(c, [](double v) { return v < 0; });
