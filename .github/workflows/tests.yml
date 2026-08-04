@@ -17,19 +17,55 @@ jobs:
         with:
           python-version: "3.13"
 
+      # MUST run BEFORE `pip install -e`. The vendored <pkg>/_obf/ copies are
+      # derived from obfuscation/ and gitignored (.gitignore:11), so they do
+      # not exist in a fresh checkout. setuptools records an editable
+      # package's subpackages at INSTALL time, so a subpackage created later
+      # is never mapped and `import <pkg>._obf` fails at runtime. conftest.py
+      # regenerates them too, but by then the mapping is already fixed —
+      # which is exactly how `scepter._obf` failed the moment CI stopped
+      # running agamotto alone. Both scripts are stdlib-only.
+      - name: Generate vendored obfuscation codec
+        run: |
+          python obfuscation/build_map.py
+          python obfuscation/sync_vendor.py
+
       - name: Install dependencies
         run: |
           pip install pytest pytest-cov pytest-asyncio
           pip install pandas numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
+          # -e on EVERY package, not just the first. Until 2026-08-04 this read
+          # `pip install -e agamotto_pkg/ \ orb_pkg/ \ ...`, where -e binds only
+          # to agamotto: the other eight were installed NON-editable, i.e.
+          # copied into site-packages. None of their setup.py files declare
+          # package_data, so the vendored _obf/map.json (a DATA file) never got
+          # copied and `Codec()` died on a missing map at import time. It went
+          # unnoticed because CI only ever ran agamotto's tests — the one
+          # package that was editable and therefore read from the source tree.
+          # build_distribution.sh patches package_data in for the pyarmor build,
+          # which is why real deploys are unaffected.
           pip install -e agamotto_pkg/ \
-                      orb_pkg/ \
-                      scepter_pkg/ \
-                      mjolnir_pkg/ \
-                      vomir_pkg/ \
-                      vibranium_pkg/ \
-                      valkyrie_pkg/ \
-                      aether_pkg/ \
-                      stormbreaker_pkg/
+                      -e orb_pkg/ \
+                      -e scepter_pkg/ \
+                      -e mjolnir_pkg/ \
+                      -e vomir_pkg/ \
+                      -e vibranium_pkg/ \
+                      -e valkyrie_pkg/ \
+                      -e aether_pkg/ \
+                      -e stormbreaker_pkg/
 
       - name: Run tests
-        run: pytest agamotto_pkg/tests/ -v --tb=short
+        # Run the WHOLE suite, not just agamotto_pkg/tests/. Until 2026-08-04
+        # this line named agamotto only, so the mjolnir, stormbreaker, orb,
+        # scepter, aether, vomir, valkyrie and vibranium suites were never
+        # exercised by CI even though every one of those packages is pip
+        # installed above — dc #29 (the missing-column raise) shipped with its
+        # regression tests invisible to CI.
+        #
+        # Invoked from the repo root on purpose: it picks up new packages
+        # automatically, so adding one can never silently leave it untested.
+        # conftest.py regenerates the vendored _obf codec first (it is derived
+        # and gitignored); sentinel_core/tests/*.py are parity DRIVERS, not
+        # test_*.py, so pytest does not collect them and they still need their
+        # compiled binaries to run.
+        run: pytest -v --tb=short

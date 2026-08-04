@@ -73,6 +73,32 @@ def compute_dual_horizon_target(
     return result
 
 
+def _require_col(df: pd.DataFrame, filter_name: str, col: str) -> None:
+    """Fail loud when a known filter's source column is absent.
+
+    2026-08-04: this used to return an all-True mask, i.e. the regime fires
+    on EVERY bar. That silently reconstructs `baseline` (removed forever
+    2026-06-18, hard-enforced in code) under some other regime's name: a
+    renamed, mis-built, or wrong-prefix feature column turns a conditional
+    gate into an unconditional one and inflates every screen that touched it.
+
+    Mirrors the mjolnir/stormbreaker fix (dc #29,
+    mjolnir/core/regime_filters.py::_require_col). Callers that legitimately
+    cannot supply a column must drop the regime from the stack, not evaluate
+    it against a frame that cannot express it.
+
+    NOT applied to the empty-composition defaults (an empty list filter, or a
+    `__metadata__` row): those are not missing-column paths and stay.
+    """
+    if col not in df.columns:
+        raise ValueError(
+            f"Filter {filter_name!r} requires column {col!r}; frame is missing "
+            f"it ({len(df.columns)} columns present). An all-True fallback "
+            "here fires on every bar — a `baseline` regime under another "
+            "name, which CLAUDE.md removed forever (2026-06-18). Failing loud "
+            "instead; drop the regime from the stack or build the column.")
+
+
 class AgamottoResearch:
     # Directionally-biased filters: these only make sense for one side.
     # Enforced at regime_stack.csv generation time so nonsensical combos
@@ -912,33 +938,43 @@ class AgamottoResearch:
         # silently fired on EVERY bar even when their own column was present
         # (high_vol AND low_vol simultaneously all-True) — the banned
         # baseline-shaped always-on failure. Mirrors the mjolnir fix (b5ea04a,
-        # mjolnir/core/regime_filters.py). Their own missing-column all-True
-        # guards are unchanged (longstanding, pinned by tests) — except the
+        # mjolnir/core/regime_filters.py). Since 2026-08-04 (dc #29 follow-up)
+        # their OWN missing column raises too, via _require_col — the last
+        # all-True path here is gone. Already true of the
         # three volume atoms, which RAISE via _volume_ratio() rather than
         # collapsing to a scalar-1.0 comparison (2026-08-02, see that helper).
         if position == "long":
             if filter_name == "low_vol":
+                _require_col(df, filter_name, "price_range_pct")
                 q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
                 return df["price_range_pct"] < q50
             if filter_name == "high_vol":
+                _require_col(df, filter_name, "price_range_pct")
                 q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
                 return df["price_range_pct"] > q50
             if filter_name == "strong_candle":
+                _require_col(df, filter_name, "open_close_pct")
                 return (df["open_close_pct"] > 0.005)
 
             # TA-Lib based
             if filter_name == "rsi_oversold":
-                return df["rsi"] < 30 if "rsi" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "rsi")
+                return df["rsi"] < 30
             if filter_name == "macd_bullish":
-                return df["macdhist"] > 0 if "macdhist" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "macdhist")
+                return df["macdhist"] > 0
             if filter_name == "stoch_bullish":
-                return (df["stoch_k"] > df["stoch_d"]) if "stoch_k" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "stoch_k")
+                return (df["stoch_k"] > df["stoch_d"])
             if filter_name == "cci_reversal":
-                return df["cci"] > 100 if "cci" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "cci")
+                return df["cci"] > 100
             if filter_name == "adx_trend":
-                return (df["adx"] > 25) if "adx" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "adx")
+                return (df["adx"] > 25)
             if filter_name == "mom_positive":
-                return df["mom"] > 0 if "mom" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "mom")
+                return df["mom"] > 0
 
             # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
             if filter_name in ("low_volume", "high_volume", "vol_breakout"):
@@ -949,36 +985,49 @@ class AgamottoResearch:
 
             # New TA-lab filters
             if filter_name == "buy_pressure":
-                return df["buy_pressure"] > 0.55 if "buy_pressure" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "buy_pressure")
+                return df["buy_pressure"] > 0.55
             if filter_name == "mfi_oversold":
-                return df["mfi"] < 30 if "mfi" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "mfi")
+                return df["mfi"] < 30
             if filter_name == "bop_bullish":
-                return df["bop"] > 0.1 if "bop" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "bop")
+                return df["bop"] > 0.1
             if filter_name == "roc_positive":
-                return df["roc"] > 0 if "roc" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "roc")
+                return df["roc"] > 0
         else:  # short
             if filter_name == "low_vol":
+                _require_col(df, filter_name, "price_range_pct")
                 q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
                 return df["price_range_pct"] < q50
             if filter_name == "high_vol":
+                _require_col(df, filter_name, "price_range_pct")
                 q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
                 return df["price_range_pct"] > q50
             if filter_name == "strong_candle":
+                _require_col(df, filter_name, "open_close_pct")
                 return (df["open_close_pct"] < -0.005)
 
             # TA-Lib based
             if filter_name == "rsi_overbought":
-                return df["rsi"] > 70 if "rsi" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "rsi")
+                return df["rsi"] > 70
             if filter_name == "macd_bearish":
-                return df["macdhist"] < 0 if "macdhist" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "macdhist")
+                return df["macdhist"] < 0
             if filter_name == "stoch_bullish":
-                return (df["stoch_k"] > df["stoch_d"]) if "stoch_k" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "stoch_k")
+                return (df["stoch_k"] > df["stoch_d"])
             if filter_name == "cci_reversal":
-                return df["cci"] < -100 if "cci" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "cci")
+                return df["cci"] < -100
             if filter_name == "adx_trend":
-                return (df["adx"] > 25) if "adx" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "adx")
+                return (df["adx"] > 25)
             if filter_name == "mom_positive":
-                return df["mom"] < 0 if "mom" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "mom")
+                return df["mom"] < 0
 
             # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
             # quote_vol_ratio = quote_vol / 7d_ma
@@ -991,13 +1040,17 @@ class AgamottoResearch:
 
             # New TA-lab filters
             if filter_name == "buy_pressure":
-                return df["buy_pressure"] < 0.45 if "buy_pressure" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "buy_pressure")
+                return df["buy_pressure"] < 0.45
             if filter_name == "mfi_overbought":
-                return df["mfi"] > 70 if "mfi" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "mfi")
+                return df["mfi"] > 70
             if filter_name == "bop_bearish":
-                return df["bop"] < -0.1 if "bop" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "bop")
+                return df["bop"] < -0.1
             if filter_name == "roc_negative":
-                return df["roc"] < 0 if "roc" in df.columns else pd.Series(True, index=df.index)
+                _require_col(df, filter_name, "roc")
+                return df["roc"] < 0
 
         # ---- Price-column dependent filters ----
         # These genuinely read close/mvg1/mvg2. Missing columns RAISE
@@ -1036,9 +1089,11 @@ class AgamottoResearch:
                 if filter_name == "near_ma":
                     return ((df["close"] - df["mvg1"]) / df["mvg1"] < 0.02)
                 if filter_name == "bb_rebound":
-                    return df["close"] < df["bb_lower"] if "bb_lower" in df.columns else pd.Series(True, index=df.index)
+                    _require_col(df, filter_name, "bb_lower")
+                    return df["close"] < df["bb_lower"]
                 if filter_name == "sar_aligned":
-                    return df["close"] > df["sar"] if "sar" in df.columns else pd.Series(True, index=df.index)
+                    _require_col(df, filter_name, "sar")
+                    return df["close"] > df["sar"]
             else:  # short
                 if filter_name == "trend_aligned":  # baseline removed 2026-06-18 (no-brainer; falls through to strict raise)
                     return down_trend
@@ -1054,9 +1109,11 @@ class AgamottoResearch:
                 if filter_name == "near_ma":
                     return ((df["mvg1"] - df["close"]) / df["mvg1"] < 0.02)
                 if filter_name == "bb_rebound":
-                    return df["close"] > df["bb_upper"] if "bb_upper" in df.columns else pd.Series(True, index=df.index)
+                    _require_col(df, filter_name, "bb_upper")
+                    return df["close"] > df["bb_upper"]
                 if filter_name == "sar_aligned":
-                    return df["close"] < df["sar"] if "sar" in df.columns else pd.Series(True, index=df.index)
+                    _require_col(df, filter_name, "sar")
+                    return df["close"] < df["sar"]
 
                 # Combined Strategies
                 if filter_name.startswith("combined_"):
