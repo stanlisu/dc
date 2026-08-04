@@ -34,15 +34,25 @@ jobs:
         run: |
           pip install pytest pytest-cov pytest-asyncio
           pip install pandas numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
+          # -e on EVERY package, not just the first. Until 2026-08-04 this read
+          # `pip install -e agamotto_pkg/ \ orb_pkg/ \ ...`, where -e binds only
+          # to agamotto: the other eight were installed NON-editable, i.e.
+          # copied into site-packages. None of their setup.py files declare
+          # package_data, so the vendored _obf/map.json (a DATA file) never got
+          # copied and `Codec()` died on a missing map at import time. It went
+          # unnoticed because CI only ever ran agamotto's tests — the one
+          # package that was editable and therefore read from the source tree.
+          # build_distribution.sh patches package_data in for the pyarmor build,
+          # which is why real deploys are unaffected.
           pip install -e agamotto_pkg/ \
-                      orb_pkg/ \
-                      scepter_pkg/ \
-                      mjolnir_pkg/ \
-                      vomir_pkg/ \
-                      vibranium_pkg/ \
-                      valkyrie_pkg/ \
-                      aether_pkg/ \
-                      stormbreaker_pkg/
+                      -e orb_pkg/ \
+                      -e scepter_pkg/ \
+                      -e mjolnir_pkg/ \
+                      -e vomir_pkg/ \
+                      -e vibranium_pkg/ \
+                      -e valkyrie_pkg/ \
+                      -e aether_pkg/ \
+                      -e stormbreaker_pkg/
 
       - name: Run tests
         # Run the WHOLE suite, not just agamotto_pkg/tests/. Until 2026-08-04
