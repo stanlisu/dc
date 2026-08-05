@@ -36,6 +36,22 @@ except ImportError:
 
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
+# Import filter definitions and evaluation logic from sub-module
+from .research_filters import (
+    _require_col,
+    _volume_ratio,
+    LONG_ONLY_FILTERS,
+    SHORT_ONLY_FILTERS,
+    MVG_DEPENDENT_FILTERS,
+    BASE_REGIMES,
+    _SWEEP_VOL_FILTERS,
+    _SWEEP_TECH_FILTERS,
+    allowed_positions,
+    comprehensive_sweep_regimes,
+    generate_regime_stack,
+    apply_filter_mask,
+)
+
 
 def compute_dual_horizon_target(
     closes_base: pd.Series,
@@ -73,150 +89,18 @@ def compute_dual_horizon_target(
     return result
 
 
-def _require_col(df: pd.DataFrame, filter_name: str, col: str) -> None:
-    """Fail loud when a known filter's source column is absent.
-
-    2026-08-04: this used to return an all-True mask, i.e. the regime fires
-    on EVERY bar. That silently reconstructs `baseline` (removed forever
-    2026-06-18, hard-enforced in code) under some other regime's name: a
-    renamed, mis-built, or wrong-prefix feature column turns a conditional
-    gate into an unconditional one and inflates every screen that touched it.
-
-    Mirrors the mjolnir/stormbreaker fix (dc #29,
-    mjolnir/core/regime_filters.py::_require_col). Callers that legitimately
-    cannot supply a column must drop the regime from the stack, not evaluate
-    it against a frame that cannot express it.
-
-    NOT applied to the empty-composition defaults (an empty list filter, or a
-    `__metadata__` row): those are not missing-column paths and stay.
-    """
-    if col not in df.columns:
-        raise ValueError(
-            f"Filter {filter_name!r} requires column {col!r}; frame is missing "
-            f"it ({len(df.columns)} columns present). An all-True fallback "
-            "here fires on every bar — a `baseline` regime under another "
-            "name, which CLAUDE.md removed forever (2026-06-18). Failing loud "
-            "instead; drop the regime from the stack or build the column.")
-
-
 class AgamottoResearch:
-    # Directionally-biased filters: these only make sense for one side.
-    # Enforced at regime_stack.csv generation time so nonsensical combos
-    # (e.g. macd_bullish_short) are never created.
-    LONG_ONLY_FILTERS = frozenset({
-        "macd_bullish", "stoch_bullish", "rsi_oversold",
-        "mfi_oversold", "bop_bullish", "roc_positive",
-    })
-    SHORT_ONLY_FILTERS = frozenset({
-        "macd_bearish", "rsi_overbought",
-        "mfi_overbought", "bop_bearish", "roc_negative",
-    })
-    # buy_pressure and sar_aligned are direction-agnostic: condition flips per position
+    LONG_ONLY_FILTERS = LONG_ONLY_FILTERS
+    SHORT_ONLY_FILTERS = SHORT_ONLY_FILTERS
+    MVG_DEPENDENT_FILTERS = MVG_DEPENDENT_FILTERS
+    BASE_REGIMES = BASE_REGIMES
+    _SWEEP_VOL_FILTERS = _SWEEP_VOL_FILTERS
+    _SWEEP_TECH_FILTERS = _SWEEP_TECH_FILTERS
 
-    # Filters that genuinely read close/mvg1/mvg2 in _apply_filter_mask. Only
-    # these are gated on the price columns, and a missing column RAISES rather
-    # than returning an all-True mask (2026-08-02, no-silent-fallback). Every
-    # other atom reads its own column and must dispatch BEFORE that check —
-    # mirrors the mjolnir fix (b5ea04a, mjolnir/core/regime_filters.py).
-    # `combined_*` composites are handled by prefix, not listed here.
-    MVG_DEPENDENT_FILTERS = frozenset({
-        "trend_aligned", "strong_trend", "ma_momentum", "above_all_mas",
-        "near_ma", "bb_rebound", "sar_aligned",
-    })
-
-    @classmethod
-    def allowed_positions(cls, filter_name: str) -> list:
-        """Return ['long'], ['short'], or ['long','short'] for a regime name.
-
-        Splits compound names on '_and_' and checks each component.
-        Contradictory combos (long-only + short-only) return [] (skip).
-        """
-        # Accept coded regimes (rename rollout): decode code→real, real passes through.
-        if isinstance(filter_name, str):
-            filter_name = _obf().decode_regime_tolerant(filter_name)
-        parts = filter_name.split("_and_") if "_and_" in filter_name else [filter_name]
-        needs_long = False
-        needs_short = False
-        for part in parts:
-            # Strip TF prefix (e.g. "4h_macd_bullish" → "macd_bullish")
-            base = part.strip()
-            tokens = base.split("_")
-            if len(tokens) > 1 and tokens[0] in ("15m", "1h", "4h", "1d"):
-                base = "_".join(tokens[1:])
-            if base in cls.LONG_ONLY_FILTERS:
-                needs_long = True
-            if base in cls.SHORT_ONLY_FILTERS:
-                needs_short = True
-        if needs_long and needs_short:
-            return []  # contradictory — skip
-        if needs_long:
-            return ["long"]
-        if needs_short:
-            return ["short"]
-        return ["long", "short"]
-
-    # Canonical base regime list (moved out of the public marvel generator so
-    # the real names live only in the obfuscated package). `baseline` excluded —
-    # removed 2026-06-18 (see CLAUDE.md). NOTE: `_and_` composites are built from
-    # the atoms in _apply_filter_mask; allowed_positions enforces directionality.
-    BASE_REGIMES = [
-        "vol_breakout",
-        "vol_breakout_and_strong_trend", "vol_breakout_and_ma_momentum",
-        "vol_breakout_and_above_all_mas", "vol_breakout_and_rsi_oversold",
-        "vol_breakout_and_rsi_overbought", "vol_breakout_and_macd_bullish",
-        "vol_breakout_and_macd_bearish", "vol_breakout_and_cci_reversal",
-        "vol_breakout_and_adx_trend", "vol_breakout_and_bb_rebound",
-        "vol_breakout_and_mom_positive", "vol_breakout_and_strong_candle",
-        "vol_breakout_and_near_ma", "vol_breakout_and_stoch_bullish",
-        "high_volume_and_strong_trend", "high_volume_and_ma_momentum",
-        "high_volume_and_above_all_mas", "high_volume_and_rsi_oversold",
-        "high_volume_and_rsi_overbought", "high_volume_and_macd_bullish",
-        "high_volume_and_macd_bearish", "high_volume_and_cci_reversal",
-        "high_volume_and_adx_trend", "high_volume_and_bb_rebound",
-        "high_volume_and_mom_positive", "high_volume_and_strong_candle",
-        "low_volume_and_strong_trend", "low_volume_and_ma_momentum",
-        "low_volume_and_above_all_mas", "low_volume_and_rsi_oversold",
-        "low_volume_and_bb_rebound", "low_volume_and_cci_reversal",
-    ]
-
-    # Comprehensive IC-sweep filter set (moved out of the public research_sweep.py
-    # so real names live only here). `baseline` excluded (see CLAUDE.md).
-    _SWEEP_VOL_FILTERS = ["low_volume", "high_volume", "vol_breakout"]
-    _SWEEP_TECH_FILTERS = [
-        "above_all_mas", "rsi_oversold", "rsi_overbought",
-        "cci_reversal", "bb_rebound", "macd_bullish", "macd_bearish",
-        "stoch_bullish", "adx_trend", "mom_positive", "strong_trend",
-        "ma_momentum", "near_ma", "strong_candle",
-    ]
-
-    @classmethod
-    def comprehensive_sweep_regimes(cls) -> list[str]:
-        """Coded regime names for the 'comprehensive' alpha sweep: each vol and
-        tech atom plus every vol×tech `_and_` combo. Obfuscated (structure
-        preserved) so the public sweep driver never holds real names.
-        """
-        c = _obf()
-        names = (
-            cls._SWEEP_VOL_FILTERS
-            + cls._SWEEP_TECH_FILTERS
-            + [f"{v}_and_{t}" for v in cls._SWEEP_VOL_FILTERS
-               for t in cls._SWEEP_TECH_FILTERS]
-        )
-        return [c.encode_regime(n) for n in names]
-
-    @classmethod
-    def generate_regime_stack(cls) -> list[dict]:
-        """Coded [{regime, position}] for every base regime × allowed position.
-
-        Regime names are returned OBFUSCATED (structure preserved) so the public
-        marvel generator that writes regime_stack.csv never handles real names.
-        """
-        c = _obf()
-        rows = []
-        for regime in cls.BASE_REGIMES:
-            for pos in cls.allowed_positions(regime):
-                rows.append({"regime": c.encode_regime(regime), "position": pos})
-        return rows
+    allowed_positions = staticmethod(allowed_positions)
+    comprehensive_sweep_regimes = staticmethod(comprehensive_sweep_regimes)
+    generate_regime_stack = staticmethod(generate_regime_stack)
+    _volume_ratio = staticmethod(_volume_ratio)
 
     def __init__(self, config: Dict[str, object], home_root: str) -> None:
         self.config = config
@@ -248,10 +132,8 @@ class AgamottoResearch:
         
         # Determine source directory based on exchange type
         if exchange.upper() == "STOCKS":
-            # Stocks data structure: data/{data_family}/{timeframe}/
             source_dir = f"{self.home_root}/data/{data_family}/{timeframe}"
         else:
-            # BINANCEFUTURES data structure: data/BINANCEFUTURES/{timeframe}/{data_family}
             source_dir = f"{self.home_root}/data/BINANCEFUTURES/{timeframe}/{data_family}"
         
         for symbol_dir in sorted(glob.glob(f"{source_dir}/*")):
@@ -262,19 +144,15 @@ class AgamottoResearch:
             if whitelist and symbol.upper() not in whitelist:
                 continue
             
-            # Load all monthly CSV files for this symbol
             symbol_frames = []
             for csv_path in sorted(glob.glob(f"{symbol_dir}/*_{timeframe}.csv")):
                 logger.debug(f"Loading {csv_path}")
                 try:
-                    # Read CSV with header to detect actual columns
                     df_header = pd.read_csv(csv_path, nrows=0)
                     actual_columns = df_header.columns.tolist()
                     
-                    # Read full CSV
                     df = pd.read_csv(csv_path, header=0)
                     
-                    # Ensure open_time_ms exists (required)
                     if "open_time_ms" not in df.columns:
                         raise ValueError(f"Missing required column 'open_time_ms' in {csv_path}")
                     
@@ -282,10 +160,7 @@ class AgamottoResearch:
                     df.set_index("timestamp", inplace=True)
                     df = df[~df.index.duplicated(keep="last")]
                     
-                    # Required columns (must exist)
                     required_cols = ["open", "high", "low", "close", "volume"]
-                    
-                    # Optional columns (fill with NaN if missing)
                     optional_cols = [
                         "quote_volume",
                         "number_of_trades",
@@ -293,12 +168,10 @@ class AgamottoResearch:
                         "taker_buy_quote_volume",
                     ]
                     
-                    # Check required columns
                     missing_required = [col for col in required_cols if col not in df.columns]
                     if missing_required:
                         raise ValueError(f"Missing required columns: {missing_required}")
                     
-                    # Select and convert to float
                     existing_cols = [col for col in required_cols + optional_cols if col in df.columns]
                     df = df[existing_cols].astype(float)
                     symbol_frames.append(df)
@@ -307,7 +180,6 @@ class AgamottoResearch:
                     continue
             
             if symbol_frames:
-                # Combine all monthly data for this symbol
                 symbol_df = pd.concat(symbol_frames).sort_index()
                 symbol_df = symbol_df[~symbol_df.index.duplicated(keep="last")]
                 symbol_df.columns = [f"{symbol}_{col}" for col in symbol_df.columns]
@@ -324,29 +196,12 @@ class AgamottoResearch:
         if self.raw is None:
             raise RuntimeError("Call load() before engineer_features().")
 
-        # WHY: drop the self.raw.copy() — the loop below only reads df[col] to
-        # build new Series; it never mutates df in place. The duplicate cost
-        # ~one wide multi-symbol OHLCV frame (e.g. 15m × 29 syms × 3.5y =
-        # ~300 MB) during engineer_features, contributing to the 2026-05-22
-        # OOM peak. self.raw is freed by the caller (OrbResearch.engineer_features
-        # sets inst.raw = None after) so retaining the reference here is safe.
         df = self.raw
         engineered_frames = [df]
         
-        # Get ladder config for position sizing
-        ladder = self.config.get("LADDER", 1)  # Default to 1 if not specified
-
         ladder = int(self.config.get("LADDER", 1) or 0)
-        # FEE is required (no fallback): a missing key must fail loudly so
-        # misconfiguration cannot silently inject a phantom fee into the target.
-        # The historical `or 0.0` collapsed any falsy FEE (incl. 0) to the
-        # default — only safe by coincidence here, banned per CLAUDE.md.
         fee_rate = float(self.config["FEE"]) / 10000.0
         step_size = 0.0001
-        # Dual-horizon: when enabled, also emit a 2-bar-horizon target set
-        # (ret_2bar + laddered/fee return_{long,short}_2bar) so a second model
-        # can be trained as a same-direction confirmation gate. Off by default —
-        # only DH experiments set DUAL_HORIZON, so base experiments are unaffected.
         dual_horizon = bool(self.config.get("DUAL_HORIZON"))
 
         for col in df.columns:
@@ -369,17 +224,13 @@ class AgamottoResearch:
                 high_open_pct = ((high_series - open_series) / (open_series + 1e-8)).rename(f"{base}_high_open_pct")
                 low_open_pct = ((low_series - open_series) / (open_series + 1e-8)).rename(f"{base}_low_open_pct")
                 
-                # Calculate historical return (for features) and target return (shifted)
                 hist_return = close.pct_change(fill_method=None)
                 price_return = hist_return.shift(-1)
 
-                # Lagged returns (past returns as features)
                 ret_lag1 = hist_return.shift(1).rename(f"{base}_ret_lag1")
                 ret_lag2 = hist_return.shift(2).rename(f"{base}_ret_lag2")
                 ret_lag3 = hist_return.shift(3).rename(f"{base}_ret_lag3")
 
-                # Apply ladder multiplier based on next candle's low/high
-                # Get next period's low and high (t+1)
                 low_next = low_series.shift(-1)
                 high_next = high_series.shift(-1)
                 close_safe = close.replace(0, np.nan)
@@ -394,14 +245,6 @@ class AgamottoResearch:
                 short_layers = short_layers.clip(lower=0, upper=ladder)
                 short_layers = short_layers.fillna(0).astype(int)
 
-                # 2026-06-20 refined ladder fill (parity with mjolnir dc 4fb9eb8): no free
-                # base rung (size = n, NOT 1 + n) AND a round-trip gate — a unit is realized
-                # only if it BOTH filled on entry AND could exit on the opposite excursion
-                # (LONG enters on the dip / exits on the rise; SHORT mirrors), so both sides
-                # use size = min(long_layers, short_layers). A <1bps dip OR <1bps rise -> 0
-                # (no always-on position). The old `1 + n` base rung + forward-excursion
-                # look-ahead manufactured a direction-agnostic phantom edge on a
-                # close-to-close return.
                 size = np.minimum(long_layers, short_layers)
 
                 fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
@@ -409,19 +252,11 @@ class AgamottoResearch:
                 price_return_long = (long_per_layer_return * size).rename(f"{base}_return_long")
 
                 short_raw_per_layer = price_return + fee_cost
-                # (price_return + fee_cost) * size, then short_subset flips it to -(...)
                 price_return_short = (short_raw_per_layer * size).rename(f"{base}_return_short")
 
-                # Raw returns (no fee) for downstream Sharpe calculation
                 price_return_long_raw = (price_return * size).rename(f"{base}_return_long_raw")
                 price_return_short_raw = (price_return * size).rename(f"{base}_return_short_raw")
 
-                # Dual-horizon 2-bar target set — mirror of the 1-bar block above
-                # over a 2-bar forward hold. ret_2bar is the plain cumulative
-                # return the 2-bar confirmation model trains on (analogous to the
-                # 1-bar `ret`); return_{long,short}_2bar are the laddered+fee
-                # PnL analogs (analogous to return_long/return_short). Ladder fill
-                # uses the worst price over the next two bars (min low / max high).
                 if dual_horizon:
                     price_return_2bar = (close.shift(-2) / close_safe - 1)
                     low_min2 = pd.concat(
@@ -437,7 +272,6 @@ class AgamottoResearch:
                     short_layers2 = np.floor(distance_short2 / step_size)
                     short_layers2 = short_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
 
-                    # Refined ladder (same as 1-bar block): no base rung + round-trip gate.
                     size2 = np.minimum(long_layers2, short_layers2)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
@@ -446,16 +280,11 @@ class AgamottoResearch:
                     return_long_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_long_2bar_raw")
                     return_short_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_short_2bar_raw")
 
-                # Dip/rip target columns for compound classification label (Vomir)
-                # return_dip = low[T+1]/close[T] - 1  (how far price dips next bar)
-                # return_rip = high[T+1]/close[T] - 1  (how far price rips next bar)
                 return_dip = (low_next / close_safe - 1).rename(f"{base}_return_dip")
                 return_rip = (high_next / close_safe - 1).rename(f"{base}_return_rip")
 
-                # Store both versions (will be used based on position type during filtering)
                 price_return_combined = price_return.rename(f"{base}_return")
                 
-                # Get MA periods from config, default to [7, 25, 99]
                 ma_periods = self.config.get("MA_PERIODS", [7, 25, 99])
                 if not isinstance(ma_periods, list) or len(ma_periods) != 3:
                     raise ValueError(f"MA_PERIODS must be a list of 3 integers, got: {ma_periods}")
@@ -465,36 +294,30 @@ class AgamottoResearch:
                 ma2 = close.rolling(int(ma2_period), min_periods=1).mean().rename(f"{base}_ma{ma2_period}")
                 ma3 = close.rolling(int(ma3_period), min_periods=1).mean().rename(f"{base}_ma{ma3_period}")
 
-                # Volume-based features
                 volume_features = []
                 
-                # 1. Base Volume
                 if f"{base}_volume" in df.columns:
                     vol = df[f"{base}_volume"]
                     vol_ma = vol.rolling(7, min_periods=1).mean()
                     vol_ratio = (vol / (vol_ma + 1e-8)).rename(f"{base}_vol_ratio")
                     volume_features.append(vol_ratio)
-                    # Volume return lags — captures volume momentum (surge/fade patterns)
                     vol_ret = vol.pct_change(fill_method=None)
                     volume_features.append(vol_ret.shift(1).rename(f"{base}_vol_ret_lag1"))
                     volume_features.append(vol_ret.shift(2).rename(f"{base}_vol_ret_lag2"))
                     volume_features.append(vol_ret.shift(3).rename(f"{base}_vol_ret_lag3"))
 
-                # 2. Quote Volume
                 if f"{base}_quote_volume" in df.columns:
                     quote_vol = df[f"{base}_quote_volume"]
                     quote_vol_ma = quote_vol.rolling(7, min_periods=1).mean()
                     quote_vol_ratio = (quote_vol / (quote_vol_ma + 1e-8)).rename(f"{base}_quote_vol_ratio")
                     volume_features.append(quote_vol_ratio)
 
-                    # Buy pressure (taker buy / total volume)
                     taker_buy_col = f"{base}_taker_buy_quote_volume"
                     if taker_buy_col in df.columns:
                         taker_buy = df[taker_buy_col]
                         buy_pressure = (taker_buy / (quote_vol + 1e-8)).rename(f"{base}_buy_pressure")
                         volume_features.append(buy_pressure)
                     
-                    # Trade intensity (trades / 7-period MA trades)
                     trades_col = f"{base}_number_of_trades"
                     if trades_col in df.columns:
                         num_trades = df[trades_col]
@@ -502,16 +325,13 @@ class AgamottoResearch:
                         trade_intensity = (num_trades / (trades_ma + 1e-8)).rename(f"{base}_trade_intensity")
                         volume_features.append(trade_intensity)
 
-                # TA-Lib Indicators
                 ta_features = []
                 try:
                     import talib
-                    # Convert to double precision for TA-Lib if needed
                     c_vals = close.values.astype(float)
                     h_vals = high_series.values.astype(float)
                     l_vals = low_series.values.astype(float)
                     
-                    # Momentum Indicators
                     ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=14), index=df.index, name=f"{base}_rsi"))
                     ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=7), index=df.index, name=f"{base}_rsi_7"))
                     ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=28), index=df.index, name=f"{base}_rsi_28"))
@@ -539,9 +359,6 @@ class AgamottoResearch:
                     ta_features.append(pd.Series(fastk, index=df.index, name=f"{base}_stochrsi_k"))
                     ta_features.append(pd.Series(fastd, index=df.index, name=f"{base}_stochrsi_d"))
 
-                    # Volume Indicators
-                    # OBV and AD are cumulative — use diff(14) instead of raw values
-                    # so the result is history-length independent (net change over 14 periods).
                     v_vals = df[f"{base}_volume"].values.astype(float)
                     obv_raw = pd.Series(talib.OBV(c_vals, v_vals), index=df.index)
                     ad_raw = pd.Series(talib.AD(h_vals, l_vals, c_vals, v_vals), index=df.index)
@@ -550,7 +367,6 @@ class AgamottoResearch:
                     ta_features.append(pd.Series(talib.MFI(h_vals, l_vals, c_vals, v_vals, timeperiod=14), index=df.index, name=f"{base}_mfi"))
                     ta_features.append(pd.Series(talib.BOP(open_series.values.astype(float), h_vals, l_vals, c_vals), index=df.index, name=f"{base}_bop"))
 
-                    # Volatility Indicators
                     ta_features.append(pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_atr"))
                     ta_features.append(pd.Series(talib.NATR(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_natr"))
                     parkinson_vol = np.sqrt(
@@ -561,20 +377,16 @@ class AgamottoResearch:
                     ta_features.append(pd.Series(upper, index=df.index, name=f"{base}_bb_upper"))
                     ta_features.append(pd.Series(lower, index=df.index, name=f"{base}_bb_lower"))
 
-                    # Trend Indicators
                     ta_features.append(pd.Series(talib.SAR(h_vals, l_vals, acceleration=0.02, maximum=0.2), index=df.index, name=f"{base}_sar"))
                 except Exception as e:
                     logger.warning(f"TA-Lib error for {base}: {e}")
 
-                # Statistical Features (Use historical return, not shifted target return)
                 stats_window = int(self.config.get("STATS_WINDOW", 14))
                 rolling_stats = []
                 rolling_stats.append(hist_return.rolling(window=stats_window).std().rename(f"{base}_std"))
                 rolling_stats.append(hist_return.rolling(window=stats_window).skew().rename(f"{base}_skew"))
                 rolling_stats.append(hist_return.rolling(window=stats_window).kurt().rename(f"{base}_kurt"))
 
-                # Rolling autocorrelation of returns at lag 1 — captures momentum/mean-reversion regime.
-                # Positive = momentum (returns persist), Negative = mean-reversion (returns reverse).
                 rolling_stats.append(
                     hist_return.rolling(window=stats_window).apply(
                         lambda x: float(pd.Series(x).autocorr(lag=1)) if len(x) >= 4 else 0.0,
@@ -590,13 +402,13 @@ class AgamottoResearch:
                     open_close_pct,
                     high_open_pct,
                     low_open_pct,
-                    price_return_combined,  # Original return (for compatibility)
-                    price_return_long,  # Long-specific laddered return
-                    price_return_short,  # Short-specific laddered return
-                    price_return_long_raw,  # Raw long return (no fee)
-                    price_return_short_raw,  # Raw short return (no fee)
-                    return_dip,  # next bar low/close - 1 (compound label)
-                    return_rip,  # next bar high/close - 1 (compound label)
+                    price_return_combined,
+                    price_return_long,
+                    price_return_short,
+                    price_return_long_raw,
+                    price_return_short_raw,
+                    return_dip,
+                    return_rip,
                     ret_lag1,
                     ret_lag2,
                     ret_lag3,
@@ -616,21 +428,9 @@ class AgamottoResearch:
 
         feature_df = pd.concat(engineered_frames, axis=1)
 
-        # WHY: pd.concat with axis=1 in pandas ≥2.0 returns an owning DataFrame
-        # (not a view), so the immediately-following column assignments
-        # (feature_df["year"] = ..., ["month"] = ..., ["close_timestamp"] = ...)
-        # do not need a defensive .copy() to avoid SettingWithCopyWarning.
-        # Dropping the copy saves a full feature-matrix duplication
-        # (~1.5 GB peak for 15m × 29 syms × 3.5y × ~55 engineered cols),
-        # which was a major contributor to the 2026-05-22 OOM.
         feature_df["year"] = feature_df.index.year
         feature_df["month"] = feature_df.index.month
 
-        # close_timestamp: when this bar closes = open time + TF duration.
-        # Used downstream by OrbResearch._align_timeframes to enforce causal
-        # alignment — a higher-TF bar is only used once its close_timestamp
-        # is <= the decision time (base-TF bar open).
-        from .utils import _timeframe_to_seconds
         tf_secs = _timeframe_to_seconds(self.config.get("TIME_UNIT", "1d"))
         feature_df["close_timestamp"] = (
             feature_df.index + pd.Timedelta(seconds=tf_secs)
@@ -642,37 +442,29 @@ class AgamottoResearch:
         if self.features is None:
              self.engineer_features()
              
-        # Drop the last row (NaN targets) for Training/Research output
         if self.features is not None and not self.features.empty:
              self.features = self.features.iloc[:-1]
 
         self.verticalize()
 
-        # Resolve output directory based on VERSION
         version = self.config.get("VERSION")
         if not version:
              raise ValueError("VERSION missing from config")
              
-        # Use OUTPUT_DIR from config if available (injected by runner)
         if "OUTPUT_DIR" in self.config:
             out_dir = self.config["OUTPUT_DIR"]
         else:
-            # Construct path: gauntlet/pred_{version}
             out_dir = os.path.join("gauntlet", f"pred_{version}")
         
-        # Ensure absolute path using home_root if relative
         if not os.path.isabs(out_dir):
             out_dir = os.path.join(self.home_root, out_dir)
             
         os.makedirs(out_dir, exist_ok=True)
         
-        # Save vertical features
         if hasattr(self, 'vertical_features') and self.vertical_features is not None:
             v_out_path = os.path.join(out_dir, "vertical_features.csv")
             self.vertical_features.to_csv(v_out_path, index=False)
 
-
-        # Load regime stack — REGIME_STACK_PATH must be set in config, no fallback
         if "REGIME_STACK_PATH" not in self.config:
             raise ValueError("REGIME_STACK_PATH not set in config — cannot run research without a regime list")
 
@@ -690,20 +482,14 @@ class AgamottoResearch:
         with open(stack_path, newline="") as f:
             regime_stack = list(_csv.DictReader(f))
 
-        # Skip metadata rows (e.g. __summary__ from filter_regime_stacks.py)
         regime_stack = [r for r in regime_stack if not str(r.get("regime", "")).startswith("__")]
         logger.info(f"Loaded {len(regime_stack)} regimes from {stack_path}")
         for regime in regime_stack:
             self.filter_signals(regime, save=True, out_dir=out_dir)
-            
 
         return out_dir
 
     def verticalize(self, df: pd.DataFrame | None = None) -> None:
-        """
-        Unify features by removing symbol prefixes and stacking them vertically.
-        Populates self.vertical_features.
-        """
         if df is None:
             df = self.features
         if df is None:
@@ -716,7 +502,6 @@ class AgamottoResearch:
                 continue
             prefix = native
             
-            # Base rename map
             base_rename_map = {
                 f"{prefix}_close": "close",
                 f"{prefix}_mvg1": "mvg1",
@@ -729,11 +514,9 @@ class AgamottoResearch:
                 f"{prefix}_open_close_pct": "open_close_pct",
                 f"{prefix}_high_open_pct": "high_open_pct",
                 f"{prefix}_low_open_pct": "low_open_pct",
-                # Lagged returns
                 f"{prefix}_ret_lag1": "ret_lag1",
                 f"{prefix}_ret_lag2": "ret_lag2",
                 f"{prefix}_ret_lag3": "ret_lag3",
-                # TA-Lib
                 f"{prefix}_rsi": "rsi",
                 f"{prefix}_rsi_7": "rsi_7",
                 f"{prefix}_rsi_28": "rsi_28",
@@ -764,12 +547,10 @@ class AgamottoResearch:
                 f"{prefix}_bb_upper": "bb_upper",
                 f"{prefix}_bb_lower": "bb_lower",
                 f"{prefix}_sar": "sar",
-                # Rolling stats
                 f"{prefix}_std": "std",
                 f"{prefix}_skew": "skew",
                 f"{prefix}_kurt": "kurt",
                 f"{prefix}_acf_lag1": "acf_lag1",
-                # Volume features
                 f"{prefix}_quote_vol_ratio": "quote_vol_ratio",
                 f"{prefix}_vol_ratio": "vol_ratio",
                 f"{prefix}_buy_pressure": "buy_pressure",
@@ -777,19 +558,16 @@ class AgamottoResearch:
                 f"{prefix}_vol_ret_lag1": "vol_ret_lag1",
                 f"{prefix}_vol_ret_lag2": "vol_ret_lag2",
                 f"{prefix}_vol_ret_lag3": "vol_ret_lag3",
-                # Compound classification label targets (Vomir)
                 f"{prefix}_return_dip": "return_dip",
                 f"{prefix}_return_rip": "return_rip",
             }
 
-            # Check for laddered returns
             long_return_col = f"{prefix}_return_long"
             short_return_col = f"{prefix}_return_short"
             long_return_raw_col = f"{prefix}_return_long_raw"
             short_return_raw_col = f"{prefix}_return_short_raw"
             base_return_col = f"{prefix}_return"
 
-            # Logic for default "long" verticalization
             rename_map = base_rename_map.copy()
             if long_return_col in df.columns:
                 rename_map[long_return_col] = "return_long"
@@ -802,7 +580,6 @@ class AgamottoResearch:
             if base_return_col in df.columns:
                 rename_map[base_return_col] = "return"
 
-            # Dual-horizon 2-bar target columns (present only for DH experiments)
             for suffix in ("ret_2bar", "return_long_2bar", "return_short_2bar",
                            "return_long_2bar_raw", "return_short_2bar_raw"):
                 col2 = f"{prefix}_{suffix}"
@@ -824,344 +601,16 @@ class AgamottoResearch:
         else:
             self.vertical_features = pd.DataFrame()
 
-    @staticmethod
-    def _volume_ratio(df: pd.DataFrame, filter_name: str) -> pd.Series:
-        """Volume-ratio series backing low_volume/high_volume/vol_breakout.
-
-        Prefers quote_vol_ratio (quote_vol / 7d MA) over vol_ratio
-        (vol / 7d MA), matching the longstanding priority. Raises when neither
-        column exists — the old `df.get("quote_vol_ratio", df.get("vol_ratio",
-        1.0))` collapsed to the scalar 1.0 there, so the three comparisons
-        returned a plain Python bool instead of a per-row mask and
-        `features_df[mask]` degenerated (KeyError standalone, silent all-False
-        under `_and_`, silently dropped under `_or_`). engineer_features always
-        builds vol_ratio (raw `volume` is a required load column), so a real
-        feature frame never hits this.
-        """
-        for col in ("quote_vol_ratio", "vol_ratio"):
-            if col in df.columns:
-                return df[col]
-        raise ValueError(
-            f"Filter {filter_name!r} requires a volume-ratio column; frame is "
-            "missing both 'quote_vol_ratio' and 'vol_ratio'. A scalar 1.0 "
-            "fallback here returns a bool instead of a per-row mask — "
-            "failing loud instead. See CLAUDE.md no-silent-fallback rules.")
-
     def _apply_filter_mask(self, df: pd.DataFrame, filter_name: str | list, position: str) -> pd.Series:
-        """
-        Applies a named filter or list of filters to the DataFrame.
-        Returns a boolean Series (mask) where True = Keep signal.
-
-        Dispatch order matters (2026-08-02): own-column atoms (high_vol,
-        low_vol, rsi_*, macd_*, stoch_bullish, cci_reversal, adx_trend,
-        strong_candle, *_volume, vol_breakout, mom_positive, buy_pressure,
-        mfi_*, bop_*, roc_*) resolve BEFORE any close/mvg1/mvg2 check, because
-        none of them read those columns. The MVG_DEPENDENT_FILTERS (plus the
-        `combined_*` composites) RAISE when close/mvg1/mvg2 are missing instead
-        of returning an all-True mask — an all-True mask there fires on every
-        bar, the banned baseline-shaped always-on pattern. Mirrors the mjolnir
-        fix (b5ea04a, mjolnir/core/regime_filters.py::named_filter).
-
-        Unknown names are unaffected by the price-column check and still hit
-        the strict-filters raise at the bottom.
-        """
-        # --- List Support (Recursive) ---
-        if isinstance(filter_name, list):
-            mask = None
-            current_op = None
-            for item in filter_name:
-                item = str(item).strip()
-                if item in ["|", "&"]:
-                    current_op = item
-                else:
-                    sub_mask = self._apply_filter_mask(df, item, position)
-                    if mask is None:
-                        mask = sub_mask
-                    else:
-                        if current_op == "|":
-                            mask = mask | sub_mask
-                        elif current_op == "&":
-                            mask = mask & sub_mask
-                        else:
-                            # Default to AND
-                            mask = mask & sub_mask
-            return mask if mask is not None else pd.Series(True, index=df.index)
-
-        # --- Base Filters ---
-        if isinstance(filter_name, str):
-            filter_name = filter_name.lower().strip()
-
-            # Skip metadata rows (e.g. __summary__ from filter_regime_stacks.py)
-            if filter_name.startswith("__"):
-                return pd.Series(True, index=df.index)
-
-            # Accept coded regimes (rename rollout): decode code→real before the
-            # real-name `filter_name == "..."` chain. Real names pass through;
-            # genuinely-unknown tokens still hit the strict raise below.
-            filter_name = _obf().decode_regime_tolerant(filter_name)
-
-            # Support complex strings like "filterA_and_filterB" or "filterA_or_filterB"
-            if "_and_" in filter_name:
-                parts = filter_name.split("_and_")
-                mask = None
-                for part in parts:
-                    sub_mask = self._apply_filter_mask(df, part.strip(), position)
-                    mask = sub_mask if mask is None else (mask & sub_mask)
-                return mask if mask is not None else pd.Series(True, index=df.index)
-            
-            if "_or_" in filter_name:
-                parts = filter_name.split("_or_")
-                mask = None
-                for part in parts:
-                    sub_mask = self._apply_filter_mask(df, part.strip(), position)
-                    mask = sub_mask if mask is None else (mask | sub_mask)
-                return mask if mask is not None else pd.Series(True, index=df.index)
-
-        if df.empty:
-            return pd.Series(dtype=bool)
-
-        # Strip suffixes from filter name
-        if isinstance(filter_name, str):
-            filter_name = filter_name.replace("_long", "").replace("_short", "")
-            # Strip TF prefix from ORB regime names (e.g. "15m_stoch_bullish" → "stoch_bullish")
-            filter_name = re.sub(r'^(?:15m|1h|4h|1d)_', '', filter_name)
-
-        # Enforce LONG_ONLY / SHORT_ONLY constraints via allowed_positions()
-        _allowed = type(self).allowed_positions(filter_name) if isinstance(filter_name, str) else None
-        if _allowed and position not in _allowed:
-            return pd.Series(False, index=df.index)
-
-        # ---- Own-column filters FIRST ----
-        # None of the atoms below read close/mvg1/mvg2, so they must never be
-        # gated on the price columns. Pre-2026-08-02 they sat BELOW the shared
-        # required_base all-True guard, so on a frame lacking those columns they
-        # silently fired on EVERY bar even when their own column was present
-        # (high_vol AND low_vol simultaneously all-True) — the banned
-        # baseline-shaped always-on failure. Mirrors the mjolnir fix (b5ea04a,
-        # mjolnir/core/regime_filters.py). Since 2026-08-04 (dc #29 follow-up)
-        # their OWN missing column raises too, via _require_col — the last
-        # all-True path here is gone. Already true of the
-        # three volume atoms, which RAISE via _volume_ratio() rather than
-        # collapsing to a scalar-1.0 comparison (2026-08-02, see that helper).
-        if position == "long":
-            if filter_name == "low_vol":
-                _require_col(df, filter_name, "price_range_pct")
-                q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
-                return df["price_range_pct"] < q50
-            if filter_name == "high_vol":
-                _require_col(df, filter_name, "price_range_pct")
-                q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
-                return df["price_range_pct"] > q50
-            if filter_name == "strong_candle":
-                _require_col(df, filter_name, "open_close_pct")
-                return (df["open_close_pct"] > 0.005)
-
-            # TA-Lib based
-            if filter_name == "rsi_oversold":
-                _require_col(df, filter_name, "rsi")
-                return df["rsi"] < 30
-            if filter_name == "macd_bullish":
-                _require_col(df, filter_name, "macdhist")
-                return df["macdhist"] > 0
-            if filter_name == "stoch_bullish":
-                _require_col(df, filter_name, "stoch_k")
-                return (df["stoch_k"] > df["stoch_d"])
-            if filter_name == "cci_reversal":
-                _require_col(df, filter_name, "cci")
-                return df["cci"] > 100
-            if filter_name == "adx_trend":
-                _require_col(df, filter_name, "adx")
-                return (df["adx"] > 25)
-            if filter_name == "mom_positive":
-                _require_col(df, filter_name, "mom")
-                return df["mom"] > 0
-
-            # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
-            if filter_name in ("low_volume", "high_volume", "vol_breakout"):
-                v_ratio = type(self)._volume_ratio(df, filter_name)
-                if filter_name == "low_volume": return (v_ratio < 1.0)
-                if filter_name == "high_volume": return (v_ratio > 1.0)
-                return (v_ratio > 2.0)  # vol_breakout
-
-            # New TA-lab filters
-            if filter_name == "buy_pressure":
-                _require_col(df, filter_name, "buy_pressure")
-                return df["buy_pressure"] > 0.55
-            if filter_name == "mfi_oversold":
-                _require_col(df, filter_name, "mfi")
-                return df["mfi"] < 30
-            if filter_name == "bop_bullish":
-                _require_col(df, filter_name, "bop")
-                return df["bop"] > 0.1
-            if filter_name == "roc_positive":
-                _require_col(df, filter_name, "roc")
-                return df["roc"] > 0
-        else:  # short
-            if filter_name == "low_vol":
-                _require_col(df, filter_name, "price_range_pct")
-                q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
-                return df["price_range_pct"] < q50
-            if filter_name == "high_vol":
-                _require_col(df, filter_name, "price_range_pct")
-                q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
-                return df["price_range_pct"] > q50
-            if filter_name == "strong_candle":
-                _require_col(df, filter_name, "open_close_pct")
-                return (df["open_close_pct"] < -0.005)
-
-            # TA-Lib based
-            if filter_name == "rsi_overbought":
-                _require_col(df, filter_name, "rsi")
-                return df["rsi"] > 70
-            if filter_name == "macd_bearish":
-                _require_col(df, filter_name, "macdhist")
-                return df["macdhist"] < 0
-            if filter_name == "stoch_bullish":
-                _require_col(df, filter_name, "stoch_k")
-                return (df["stoch_k"] > df["stoch_d"])
-            if filter_name == "cci_reversal":
-                _require_col(df, filter_name, "cci")
-                return df["cci"] < -100
-            if filter_name == "adx_trend":
-                _require_col(df, filter_name, "adx")
-                return (df["adx"] > 25)
-            if filter_name == "mom_positive":
-                _require_col(df, filter_name, "mom")
-                return df["mom"] < 0
-
-            # Volume-based (priority to quote_vol_ratio if available, else vol_ratio)
-            # quote_vol_ratio = quote_vol / 7d_ma
-            # vol_ratio = vol / 7d_ma
-            if filter_name in ("low_volume", "high_volume", "vol_breakout"):
-                v_ratio = type(self)._volume_ratio(df, filter_name)
-                if filter_name == "low_volume": return (v_ratio < 1.0)
-                if filter_name == "high_volume": return (v_ratio > 1.0)
-                return (v_ratio > 2.0)  # vol_breakout
-
-            # New TA-lab filters
-            if filter_name == "buy_pressure":
-                _require_col(df, filter_name, "buy_pressure")
-                return df["buy_pressure"] < 0.45
-            if filter_name == "mfi_overbought":
-                _require_col(df, filter_name, "mfi")
-                return df["mfi"] > 70
-            if filter_name == "bop_bearish":
-                _require_col(df, filter_name, "bop")
-                return df["bop"] < -0.1
-            if filter_name == "roc_negative":
-                _require_col(df, filter_name, "roc")
-                return df["roc"] < 0
-
-        # ---- Price-column dependent filters ----
-        # These genuinely read close/mvg1/mvg2. Missing columns RAISE
-        # (no-silent-fallback, CLAUDE.md): the old shared guard logged a warning
-        # and returned all-True, so on a degenerate/warmup frame every one of
-        # them fired on every bar. Unknown names are NOT gated here — they still
-        # fall through to the strict-filters raise below, unchanged.
-        if isinstance(filter_name, str) and (
-                filter_name in type(self).MVG_DEPENDENT_FILTERS
-                or filter_name.startswith("combined_")):
-            required_base = ["close", "mvg1", "mvg2"]
-            missing = [col for col in required_base if col not in df.columns]
-            if missing:
-                raise ValueError(
-                    f"Filter {filter_name!r} requires price columns; frame is "
-                    f"missing {missing}. An all-True fallback here fires on "
-                    "every bar (baseline-shaped) — failing loud instead. "
-                    "See CLAUDE.md no-silent-fallback rules.")
-
-            # Common trend conditions
-            up_trend = (df["close"] > df["mvg1"]) & (df["mvg1"] > df["mvg2"])
-            down_trend = (df["close"] < df["mvg1"]) & (df["mvg1"] < df["mvg2"])
-
-            if position == "long":
-                if filter_name == "trend_aligned":  # baseline removed 2026-06-18 (no-brainer; falls through to strict raise)
-                    return up_trend
-                if filter_name == "strong_trend":
-                    return up_trend & (df["mvg2"] > df["mvg3"]) if "mvg3" in df.columns else up_trend
-                if filter_name == "ma_momentum":
-                    return (df["mvg1"] > df["mvg2"]) & (df["mvg1"] > df["mvg3"]) if "mvg3" in df.columns else (df["mvg1"] > df["mvg2"])
-                if filter_name == "above_all_mas":
-                    mask = (df["close"] > df["mvg1"]) & (df["close"] > df["mvg2"])
-                    if "mvg3" in df.columns:
-                        mask &= (df["close"] > df["mvg3"])
-                    return mask
-                if filter_name == "near_ma":
-                    return ((df["close"] - df["mvg1"]) / df["mvg1"] < 0.02)
-                if filter_name == "bb_rebound":
-                    _require_col(df, filter_name, "bb_lower")
-                    return df["close"] < df["bb_lower"]
-                if filter_name == "sar_aligned":
-                    _require_col(df, filter_name, "sar")
-                    return df["close"] > df["sar"]
-            else:  # short
-                if filter_name == "trend_aligned":  # baseline removed 2026-06-18 (no-brainer; falls through to strict raise)
-                    return down_trend
-                if filter_name == "strong_trend":
-                    return down_trend & (df["mvg2"] < df["mvg3"]) if "mvg3" in df.columns else down_trend
-                if filter_name == "ma_momentum":
-                    return (df["mvg1"] < df["mvg2"]) & (df["mvg1"] < df["mvg3"]) if "mvg3" in df.columns else (df["mvg1"] < df["mvg2"])
-                if filter_name == "above_all_mas":
-                    mask = (df["close"] < df["mvg1"]) & (df["close"] < df["mvg2"])
-                    if "mvg3" in df.columns:
-                        mask &= (df["close"] < df["mvg3"])
-                    return mask
-                if filter_name == "near_ma":
-                    return ((df["mvg1"] - df["close"]) / df["mvg1"] < 0.02)
-                if filter_name == "bb_rebound":
-                    _require_col(df, filter_name, "bb_upper")
-                    return df["close"] > df["bb_upper"]
-                if filter_name == "sar_aligned":
-                    _require_col(df, filter_name, "sar")
-                    return df["close"] < df["sar"]
-
-                # Combined Strategies
-                if filter_name.startswith("combined_"):
-                    # Component masks
-                    _q50 = df["price_range_pct_q50"] if "price_range_pct_q50" in df.columns else df["price_range_pct"].rolling(700, min_periods=1).quantile(0.5)
-                    low_vol_mask = down_trend & (df["price_range_pct"] < _q50)
-                    vol_breakout_mask = down_trend & (df.get("quote_vol_ratio", 0.0) > 2.0)
-
-                    if filter_name == "combined_union":
-                        # Trade if EITHER Low Vol OR Volume Breakout
-                        return low_vol_mask | vol_breakout_mask
-
-                    if filter_name == "combined_intersection":
-                        # Trade only if BOTH Low Vol AND Volume Breakout
-                        return low_vol_mask & vol_breakout_mask
-
-                    # New Combinations
-                    above_all_mask = (df["close"] < df["mvg1"]) & (df["close"] < df["mvg2"])
-                    if "mvg3" in df.columns: above_all_mask &= (df["close"] < df["mvg3"])
-
-                    if filter_name == "combined_union_plus":
-                        # Low Vol OR Vol Breakout OR Above All MAs
-                        return low_vol_mask | vol_breakout_mask | above_all_mask
-
-                    if filter_name == "combined_union_alt":
-                        # Low Vol OR Above All MAs
-                        return low_vol_mask | above_all_mask
-
-        # No fallback: raise or return False mask depending on context
-        if getattr(self, '_strict_filters', True):
-            raise ValueError(f"Unknown filter name: {filter_name}")
-        logger.debug("Unknown filter '%s' for position '%s' — treating as no-match",
-                      filter_name, position)
-        return pd.Series(False, index=df.index)
+        return apply_filter_mask(
+            df,
+            filter_name,
+            position,
+            strict_filters=getattr(self, '_strict_filters', True),
+            allowed_positions_fn=type(self).allowed_positions,
+        )
 
     def filter_signals(self, regime: dict, limit_timestamp: Optional[pd.Timestamp] = None, save: bool = False, out_dir: str = None) -> pd.DataFrame:
-        """
-        Filter signals for a SINGLE regime.
-        
-        Args:
-            regime: Regime dictionary containing 'regime' and 'position'.
-            limit_timestamp: If provided, only process data from this timestamp onwards.
-            save: If True, save filtered signals to disk.
-            out_dir: Directory to save signals if save is True.
-            
-        Returns:
-            pd.DataFrame: Filtered signals for this regime.
-        """
         if not hasattr(self, 'vertical_features') or self.vertical_features is None:
              raise RuntimeError("Call verticalize() before filter_signals().")
 
@@ -1172,7 +621,6 @@ class AgamottoResearch:
         regime_name = regime["regime"]
         position = regime.get("position", "long")
 
-        # Convert list regime to string for storage (e.g. ["high_volume", "&", "cci_reversal"] -> "high_volume_and_cci_reversal")
         regime_name_str = regime_name
         if isinstance(regime_name, list):
             regime_name_str = "_and_".join(p for p in regime_name if p not in ("|", "&"))
@@ -1186,7 +634,6 @@ class AgamottoResearch:
         filtered_subset["position"] = position
         filtered_subset["regime"] = regime_name_str
         
-        # Assign 'ret' column based on position
         if position == "long":
              if "return_long" in filtered_subset.columns:
                  filtered_subset["ret"] = filtered_subset["return_long"]
@@ -1203,16 +650,8 @@ class AgamottoResearch:
                  filtered_subset["ret_raw"] = filtered_subset["return_short_raw"]
                  
         if save and out_dir:
-            # Save to pred_agamotto*_1/filter/filter_{regime}
-            
-            # Clean regime_name first to remove any pre-existing position suffix
             clean_regime = regime_name_str.replace("_long", "").replace("_short", "")
-            
-            # Construct simplified filename: filter_{regime}_{position}.csv
-            # This avoids filter_regime_long_long.csv
             safe_name = f"{clean_regime}_{position}"
-            
-            # Cleaning filename characters
             safe_name = "".join([c if c.isalnum() or c in ['_'] else '_' for c in safe_name])
             
             save_dir = os.path.join(out_dir, "filter")
@@ -1220,18 +659,8 @@ class AgamottoResearch:
             
             save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
             try:
-                # Obfuscation: persist feature columns under opaque codes (real
-                # name -> code, TF prefix preserved). Targets / metadata / OHLCV
-                # are not in the feature map and pass through unchanged. Done at
-                # write only — the in-memory frame keeps real names. Downstream
-                # (select_feature_columns, training, meta.pkl, preds) inherits the
-                # coded schema, so the public marvel repo never sees real names.
                 _to_save = filtered_subset.rename(
                     columns=_obf().encode_columns(filtered_subset.columns))
-                # Narrow float64 feature columns to float32 (the rolling trainer
-                # casts to float32 on load anyway) + zstd — roughly halves the
-                # filter parquet with zero training impact. Only float64 columns
-                # are cast, so integer/timestamp columns keep full precision.
                 _f64_to_f32 = {
                     c: "float32" for c in _to_save.columns
                     if _to_save[c].dtype == "float64"
@@ -1239,7 +668,6 @@ class AgamottoResearch:
                 _to_save.astype(_f64_to_f32).to_parquet(
                     save_path, index=False, compression="zstd",
                 )
-                # logger.info(f"Saved filtered signals for {regime_id} to {save_path}")
             except Exception as e:
                 logger.error(f"Failed to save filtered signals for {safe_name}: {e}")
 

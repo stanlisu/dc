@@ -26,17 +26,13 @@ from mjolnir.core.regime_filters import (
     ATOM_QUANTILE_LEVELS,
     DEFAULT_QUANTILE_WINDOW_BARS,
     RollingQuantileAtoms,
+    _window_days,
     apply_filter_mask,
     rolling_quantile_atoms_from_config,
+    rolling_quantile_cutoff,
 )
 
 BARS_PER_DAY = 288  # 5-minute bars
-
-# pandas 3 regressed the rolling-quantile WARMUP guarantee — see the xfail on
-# TestAdaptivity.test_level_shift_refires_where_fixed_goes_silent below.
-# Production (shield 3.0.2, hydra 3.0.2, shield2 3.0.3) is on pandas 3, so this
-# is the real-world path, not a CI-only artifact.
-_PANDAS3 = int(pd.__version__.split(".")[0]) >= 3
 
 # Fixed intraday pattern, identical every day (deterministic seed): a shuffled
 # grid over [-1, 1] so each day's quantile-q level is the same known value.
@@ -107,25 +103,115 @@ class TestDayShift:
         assert not m[BARS_PER_DAY + BARS_PER_DAY // 2:].any()
 
 
+class TestWindowDaysUnitProof:
+    """The bar-spacing conversion must not read raw .asi8 ints.
+
+    Root cause of the 2026-08-04 warmup failure: `_window_days` divided
+    `np.diff(ts.asi8)` by 1e9 assuming nanoseconds. `.asi8` is raw ints in the
+    index's OWN unit, so on a [us] index (parquet round-trip — the production
+    path — and pd.date_range's default on pandas 3) spacing was under-counted
+    1000x and every window collapsed to the old `max(1, ...)` floor of ONE day.
+
+    Parametrizing over the unit is the point: with the default unit only, this
+    reads as "a pandas 3 bug" and passes on pandas 2. It is not version-
+    specific — `[us]` reproduces it on 2.3.3 and 3.0.3 alike.
+    """
+
+    @pytest.mark.parametrize("unit", ["ns", "us", "ms", "s"])
+    @pytest.mark.parametrize(
+        "freq, bar_sec", [("5s", 5), ("30s", 30), ("5min", 300)])
+    @pytest.mark.parametrize("want_days", [1, 14, 30])
+    def test_window_days_independent_of_index_unit(
+            self, unit, freq, bar_sec, want_days):
+        idx = pd.date_range(
+            "2026-03-01", periods=1000, freq=freq).as_unit(unit)
+        window_bars = want_days * 86_400 // bar_sec
+        assert _window_days(idx, window_bars) == want_days
+
+    @pytest.mark.parametrize("unit", ["ns", "us"])
+    @pytest.mark.parametrize("tz", [None, "UTC"])
+    def test_production_hlp_window_is_fourteen_days(self, unit, tz):
+        # The exact shield2 hlp rerun config: 241,920 bars of 5s = 14 days.
+        # tz="UTC" + unit="us" is the REAL production dtype: bar parquets read
+        # back as datetime64[us, UTC] (verified on shield2, 2026-08-04), which
+        # is what made _window_days return 1 on every machine and every pandas.
+        idx = pd.date_range(
+            "2026-03-01", periods=1000, freq="5s", tz=tz).as_unit(unit)
+        assert _window_days(idx, 241_920) == 14
+
+    @pytest.mark.parametrize("unit", ["ns", "us"])
+    def test_default_window_is_thirty_days(self, unit):
+        idx = pd.date_range(
+            "2026-03-01", periods=1000, freq="5s").as_unit(unit)
+        assert _window_days(idx, DEFAULT_QUANTILE_WINDOW_BARS) == 30
+
+    def test_sub_day_window_raises_instead_of_flooring_to_one(self):
+        # The old `max(1, ...)` floor is what let the unit bug masquerade as a
+        # working 1-day window. A sub-day request must fail loud.
+        idx = pd.date_range("2026-03-01", periods=1000, freq="5s")
+        with pytest.raises(ValueError, match="rounds to 0"):
+            _window_days(idx, 100)  # 100 * 5s = 500s << 1 day
+
+
+class TestWarmupFailsClosedEveryUnit:
+    """End-to-end warmup guarantee, across index units.
+
+    TestWindowDaysUnitProof pins the helper; this pins the documented contract
+    the helper feeds: the first `window_days` per symbol get NaN cutoffs, so
+    the regime fires on NO bar. Runs the whole apply_filter_mask path on a [us]
+    index — the production (parquet) unit — not just the default.
+    """
+
+    @pytest.mark.parametrize("unit", ["ns", "us"])
+    @pytest.mark.parametrize("window_days", [3, 5])
+    def test_first_window_days_fire_on_no_bar(self, unit, window_days):
+        df = _frame([1.0] * 20)
+        df.index = df.index.as_unit(unit)
+        mask = apply_filter_mask(df, "deep_book", "short", _cfg(window_days))
+        warm = mask.iloc[:window_days * BARS_PER_DAY]
+        assert not warm.any(), (
+            f"{int(warm.sum())} of {len(warm)} warmup bars fired "
+            f"(unit={unit}, window_days={window_days}); first offender "
+            f"{warm[warm].index.min() if warm.any() else None}")
+        # Non-vacuous: the very next day DOES fire once the window is full.
+        nxt = mask.iloc[window_days * BARS_PER_DAY:
+                        (window_days + 1) * BARS_PER_DAY]
+        assert nxt.any()
+
+    @pytest.mark.parametrize("unit", ["ns", "us"])
+    @pytest.mark.parametrize("probe_day", [5, 8])
+    def test_no_same_day_or_past_cutoff_leakage(self, unit, probe_day):
+        """dc #25's invariant, re-proved per unit, ON THE CUTOFF ITSELF.
+
+        Asserting on the mask is weaker and can go vacuous: a mask only flips
+        where a cutoff crosses a bar's value, so a real leak can hide behind
+        "no bar happened to cross". The cutoff series is the causal object —
+        perturbing all of day d must leave every cutoff through the END of
+        day d bit-identical, and must move a later one.
+        """
+        df = _frame([1.0] * 12)
+        df.index = df.index.as_unit(unit)
+        window_days = 3
+        base = rolling_quantile_cutoff(
+            df, "depth_imbalance_L5", ATOM_QUANTILE_LEVELS["deep_book_short"],
+            window_days * BARS_PER_DAY).to_numpy()
+
+        pert = df.copy()
+        lo, hi = probe_day * BARS_PER_DAY, (probe_day + 1) * BARS_PER_DAY
+        pert.iloc[lo:hi, 0] += 10.0          # move the WHOLE day's distribution
+        after = rolling_quantile_cutoff(
+            pert, "depth_imbalance_L5", ATOM_QUANTILE_LEVELS["deep_book_short"],
+            window_days * BARS_PER_DAY).to_numpy()
+
+        # Through the end of the perturbed day: identical (NaN-aware).
+        np.testing.assert_array_equal(base[:hi], after[:hi])
+        # Non-vacuous: a LATER day's cutoff must have moved.
+        assert not np.array_equal(base[hi:], after[hi:], equal_nan=True), (
+            f"unit={unit}: perturbing day {probe_day} moved no future cutoff — "
+            "the test is vacuous, not the code correct")
+
+
 class TestAdaptivity:
-    @pytest.mark.xfail(
-        _PANDAS3,
-        strict=True,
-        reason=(
-            "KNOWN BUG, pandas 3 only (prod runs 3.0.2/3.0.3): the "
-            "rolling_quantile warmup no longer fails fully CLOSED. With "
-            "window_days=5, min_periods=5 and .shift(1) the first 5 days must "
-            "have NaN cutoffs and therefore fire on NO bar, but under pandas 3 "
-            "a single bar inside the warmup window fires (observed: "
-            "2026-01-05 23:45, 1 of 1440). Passes on pandas 2.3.3. Suspect a "
-            "resample('1D') label/closed or normalize()-reindex day-key change "
-            "in rolling_quantile_cutoff(). Surfaced 2026-08-04 when CI stopped "
-            "running agamotto's suite alone; PRE-EXISTING and unrelated to the "
-            "dc #29/#30 missing-column work (mjolnir_pkg is byte-identical to "
-            "main on this branch). Matters because this is the causal-cutoff "
-            "path from dc #25 — the same shift(1) that guarantees no "
-            "same-day lookahead — so it must be diagnosed, not silenced."),
-    )
     def test_level_shift_refires_where_fixed_goes_silent(self):
         # Month 1 at level 1.0, month 2 at DOUBLE the level (2.0).
         df = _frame([1.0] * 30 + [2.0] * 30)

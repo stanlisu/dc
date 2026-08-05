@@ -33,14 +33,25 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pytest pytest-cov pytest-asyncio
-          # pandas PINNED 2026-08-04 to match marvel/environment.yml and the
-          # servers. Unpinned, CI resolved to whatever was newest (3.0.5) while
-          # environment.yml declared 2.3.3 and prod ran 3.0.2/3.0.3 — three
-          # different pandas across dev, CI and prod. That MAJOR-version split
-          # is how mjolnir's rolling-quantile warmup bug stayed hidden: it
-          # fails on pandas 3 and passes on 2.3.3, and only the local Mac was
-          # on 2.3.3. Keep in lockstep with marvel environment.yml and
-          # marvel/.github/workflows/ci.yml.
+          # pandas PINNED 2026-08-04 to the version prod actually runs
+          # (shield/hydra 3.0.2, shield2 3.0.3). Unpinned, CI resolved to
+          # whatever was newest (3.0.5) while marvel/environment.yml still
+          # declares 2.3.3 — three different pandas across dev, CI and prod.
+          #
+          # Pinning is right, but the root cause it was first blamed for was
+          # WRONG: mjolnir's rolling-quantile warmup bug was NOT a pandas-3
+          # regression. `_window_days` read raw `.asi8` ints as nanoseconds;
+          # `.asi8` is in the index's OWN unit, and production bar parquets
+          # read back as datetime64[us, UTC] (verified on shield2), so the
+          # trailing window collapsed to 1 day on EVERY machine and BOTH
+          # pandas majors. pandas 3 only made [us] the pd.date_range default,
+          # which is why the synthetic test grid finally tripped over it. The
+          # regression tests now parametrize over index unit + tz so they fail
+          # on 2.x too — see mjolnir_pkg/tests/test_rolling_quantile_atoms.py
+          # (TestWindowDaysUnitProof).
+          #
+          # STILL DIVERGENT: marvel/environment.yml pins 2.3.3 while this and
+          # prod are on 3.0.x. Reconcile — a version split is how this hid.
           pip install 'pandas==3.0.3' numpy pyarrow joblib lightgbm xgboost scikit-learn statsmodels
           # -e on EVERY package, not just the first. Until 2026-08-04 this read
           # `pip install -e agamotto_pkg/ \ orb_pkg/ \ ...`, where -e binds only

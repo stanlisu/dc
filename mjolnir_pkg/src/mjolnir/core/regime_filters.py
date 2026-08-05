@@ -196,19 +196,45 @@ def _window_days(ts_sorted: pd.DatetimeIndex, window_bars: int) -> int:
 
     E.g. 518,400 bars at 5s spacing -> exactly 30 days. Uses the median
     positive spacing so occasional gaps don't skew the conversion.
+
+    2026-08-04 — UNIT-PROOF spacing. This used to read `np.diff(ts.asi8) / 1e9`,
+    assuming asi8 is nanoseconds. `.asi8` is raw ints in the INDEX'S OWN unit,
+    and the index is [us] whenever it round-trips through parquet (which is the
+    production path: research.py reads bars with pd.read_parquet, then
+    verticalize() stamps `timestamp` from that index) AND whenever it comes from
+    pd.date_range on pandas 3, where [us] is the new default. On a [us] index
+    the old expression under-counted bar spacing 1000x, so EVERY window
+    collapsed to the `max(1, ...)` floor: the 14-day hlp window and the 30-day
+    default both became ONE day. Timedelta.total_seconds() is unit-aware.
+    Reproduced on pandas 2.3.3 and 3.0.3 alike — this was never version-
+    specific, pandas 3 only changed the default unit so the synthetic
+    date_range test grid started hitting it too.
     """
     if len(ts_sorted) < 2:
         raise ValueError(
             "rolling_quantile atom mode needs >= 2 bars to infer bar "
             f"spacing; got {len(ts_sorted)} row(s)")
-    diffs = np.diff(ts_sorted.asi8)  # nanoseconds
-    pos = diffs[diffs > 0]
+    # Unit-aware: never read raw .asi8 ints here (see the note above).
+    sec = (ts_sorted[1:] - ts_sorted[:-1]).total_seconds().to_numpy()
+    pos = sec[sec > 0.0]
     if len(pos) == 0:
         raise ValueError(
             "rolling_quantile atom mode: all bar timestamps identical — "
             "cannot infer bar spacing")
-    bar_sec = float(np.median(pos)) / 1e9
-    return max(1, int(round(window_bars * bar_sec / 86_400.0)))
+    bar_sec = float(np.median(pos))
+    w_days = int(round(window_bars * bar_sec / 86_400.0))
+    if w_days < 1:
+        # No silent floor. The old `max(1, ...)` turned a 1000x unit error into
+        # a plausible-looking 1-day window and is precisely why the defect
+        # survived: the cutoffs stayed finite, the masks stayed sane, and only
+        # a warmup-length assertion ever noticed. A sub-day window is also
+        # unrepresentable by this per-UTC-day design, so it is a config error.
+        raise ValueError(
+            f"rolling_quantile atom mode: window_bars={window_bars} at "
+            f"{bar_sec:g}s bar spacing is {window_bars * bar_sec / 86_400.0:g} "
+            "days, which rounds to 0 — the per-day cutoff design needs a "
+            "trailing window of at least 1 full day")
+    return w_days
 
 
 def rolling_quantile_cutoff(
