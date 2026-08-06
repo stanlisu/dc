@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from agamotto import AgamottoResearch
+from agamotto.ladder import compute_ladder_multiplier, ladder_params
 from agamotto.utils import _symbol_to_native
 
 logger = logging.getLogger(__name__)
@@ -326,35 +327,61 @@ class OrbResearch(AgamottoResearch):
                 exit_low_col = f"{self.target_tf}_{native}_exit_low"
                 exit_high_col = f"{self.target_tf}_{native}_exit_high"
                 if exit_col in self.features.columns and entry_col in self.features.columns:
-                    fee = float(self.config.get("FEE", 0.0)) / 10000.0
+                    # FEE is required — no magic-number default (CLAUDE.md; the
+                    # FEE bug 2026-04-27). AgamottoResearch.engineer_features
+                    # already indexes config["FEE"] and orb delegates to it per
+                    # TF, so a config reaching here without FEE was already dead.
+                    fee = float(self.config["FEE"]) / 10000.0
                     raw = self.features[exit_col] / self.features[entry_col] - 1
                     sym_cols["return"] = raw
                     if (exit_low_col in self.features.columns
                             and exit_high_col in self.features.columns):
-                        # Ladder-adjusted cross-TF returns.
-                        # exit_low/exit_high are already the exit bar values (no shift needed).
-                        step_size = 0.0001
-                        ladder = int(self.config.get("LADDER", 1) or 0)
-                        entry_close = self.features[entry_col]
-                        close_safe = entry_close.replace(0, np.nan)
+                        # Per-leg ladder sizing on the CROSS-TF target
+                        # (2026-08-07). This block kept a private copy of the
+                        # maths — `min(long_layers, short_layers)`, a hardcoded
+                        # 0.0001 step that silently matched only LADDER_BPS == 1.0,
+                        # and one shared `LADDER` read through the banned
+                        # `get(K, X) or Y` — while the same-TF path above already
+                        # inherited the fixed version from AgamottoResearch. Two
+                        # copies of the target maths is exactly how the engines
+                        # drifted apart; both now route through agamotto/ladder.py.
+                        #
+                        # exit_low/exit_high are already the exit bar's values, so
+                        # unlike the same-TF path they take no shift(-1).
+                        ladder_long, ladder_short, step_bps = ladder_params(self.config)
+                        close_safe = self.features[entry_col].replace(0, np.nan)
                         exit_low = self.features[exit_low_col]
                         exit_high = self.features[exit_high_col]
-                        dist_long = ((close_safe - exit_low) / close_safe).clip(lower=0)
-                        long_layers = np.floor(dist_long / step_size).clip(0, ladder).fillna(0).astype(int)
-                        dist_short = ((exit_high - close_safe) / close_safe).clip(lower=0)
-                        short_layers = np.floor(dist_short / step_size).clip(0, ladder).fillna(0).astype(int)
-                        # 2026-06-20 refined ladder (parity with mjolnir dc 4fb9eb8): no base
-                        # rung + round-trip gate -> size = min(long_layers, short_layers),
-                        # same size both sides. <1bps dip OR rise -> 0.
-                        size = np.minimum(long_layers, short_layers)
+
+                        size_long = compute_ladder_multiplier(
+                            close_safe, exit_low, ladder_long, step_bps)
+                        # Mirror the short's adverse (upward) move about the entry
+                        # close so the same downward-measuring helper serves both.
+                        size_short = compute_ladder_multiplier(
+                            close_safe, 2.0 * close_safe - exit_high,
+                            ladder_short, step_bps)
+
                         fee_cost = fee * 2.0
-                        sym_cols["return_long"] = (raw - fee_cost) * size
-                        sym_cols["return_short"] = -(raw + fee_cost) * size
-                        sym_cols["return_long_raw"] = raw * size
-                        sym_cols["return_short_raw"] = raw * size
+                        # SIGN (changed 2026-08-07). `return_short` was negated
+                        # here while `return_short_raw` two lines down was not —
+                        # the two short columns of the same block disagreed, so
+                        # one of them was necessarily wrong. Agamotto and orb's
+                        # own same-TF path both keep the short target in
+                        # forward-return space (un-negated); that is what a
+                        # NEGATIVE threshold under `y_pred < thresh` expects
+                        # (CLAUDE.md). Negated, a good short scored HIGH and the
+                        # leg selected backwards. Nothing deployed moves: all five
+                        # orb settings are BASE_TF == TARGET_TF and take the
+                        # same-TF path, so this branch has never run in anger.
+                        sym_cols["return_long"] = (raw - fee_cost) * size_long
+                        sym_cols["return_short"] = (raw + fee_cost) * size_short
+                        sym_cols["return_long_raw"] = raw * size_long
+                        sym_cols["return_short_raw"] = raw * size_short
                     else:
+                        # No exit low/high aligned -> no ladder, size 1 per leg.
+                        # Same un-negated short convention as above.
                         sym_cols["return_long"] = raw - 2 * fee
-                        sym_cols["return_short"] = -(raw + 2 * fee)
+                        sym_cols["return_short"] = raw + 2 * fee
                         sym_cols["return_long_raw"] = raw.copy()
                         sym_cols["return_short_raw"] = raw.copy()
 
@@ -552,6 +579,10 @@ class OrbResearch(AgamottoResearch):
     # and a hardcoded 0.0001 step. Two copies of the target maths is exactly how
     # the engines drifted apart; see agamotto/ladder.py for the one
     # implementation and tests/test_kline_ladder_sizing.py for the parity test.
+    #
+    # The cross-TF target in verticalize() carried the SAME duplicate and was
+    # folded onto agamotto/ladder.py on 2026-08-07, so both of orb's target
+    # paths — same-TF and cross-TF — now honour LADDER_LONG / LADDER_SHORT.
 
     @staticmethod
     def _remap_tf_columns(df: pd.DataFrame, tf: str) -> pd.DataFrame:

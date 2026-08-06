@@ -270,3 +270,148 @@ def test_no_ladder_key_at_all_still_raises():
 
     with pytest.raises(KeyError, match="LADDER"):
         ladder_params({"LADDER_BPS": 1.0})
+
+
+# --------------------------------------------------------------------------- #
+# The CROSS-TF target (2026-08-07)
+#
+# OrbResearch has TWO target paths and 2026-08-06 fixed only one. `verticalize()`
+# builds the cross-TF target (TARGET_TF != BASE_TF) from the exit bar's own
+# low/high, and kept a private copy of the old maths: `min(long_layers,
+# short_layers)`, a step hardcoded to 0.0001 (silently correct only when
+# LADDER_BPS == 1.0), and one shared LADDER read through the banned
+# `get(K, X) or Y`. All five production orb settings are BASE_TF == TARGET_TF and
+# take the same-TF path, which is exactly why this branch drifted unnoticed.
+# --------------------------------------------------------------------------- #
+NATIVE = "BTCUSDT"
+SYMBOL = "BINANCE_PERP_BTC_USDT"
+
+
+def _orb_cross_tf(cfg, entry_close, exit_close, exit_low, exit_high):
+    """Run OrbResearch.verticalize() over a cross-TF fixture.
+
+    load()/engineer_features() are bypassed: verticalize() consumes
+    `self.features`, and every column lookup other than the four cross-TF ones
+    is guarded by `in self.features.columns`.
+
+    Args are array-likes of equal length; returns the vertical_features frame.
+    """
+    pytest.importorskip("orb.research", reason="orb package not installed")
+    from orb.research import OrbResearch
+
+    n = len(entry_close)
+    orb = OrbResearch.__new__(OrbResearch)
+    orb.config = {**cfg, "SYMBOLS": [SYMBOL]}
+    orb.timeframes = ["15m", "1h"]
+    orb.base_tf = "15m"
+    orb.target_tf = "1h"          # != base_tf -> the cross-TF branch
+    orb.features = pd.DataFrame({
+        f"15m_{NATIVE}_close": entry_close,
+        f"1h_{NATIVE}_exit_close": exit_close,
+        f"1h_{NATIVE}_exit_low": exit_low,
+        f"1h_{NATIVE}_exit_high": exit_high,
+        "year": [2026] * n,
+        "month": [1] * n,
+    }, index=pd.date_range("2026-01-01", periods=n, freq="15min"))
+    orb.verticalize()
+    return orb.vertical_features
+
+
+def test_cross_tf_dip_no_bounce_is_sized_not_zeroed():
+    """The same defect as the same-TF path, on the branch that kept the copy.
+
+    Exit bar digs 10bp under entry and never trades above it. Old:
+    short_layers == 0 -> min(...) == 0 -> BOTH legs labelled 0.0 despite a real
+    10bp loss on a fully-laddered long.
+    """
+    out = _orb_cross_tf(_cfg(), [100.0], [99.90], [99.90], [100.00])
+
+    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.01, abs=1e-9), (
+        "fully-laddered long into a falling exit bar must book 10 rungs of loss")
+    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-9), (
+        "short never got an adverse (upward) move: entry rung only")
+
+
+def test_cross_tf_per_leg_ladders_size_the_legs_differently():
+    """Same bar, same excursions, different rung counts — the point of the split."""
+    cfg = _cfg(LADDER_LONG=2, LADDER_SHORT=10)
+    # Exit bar digs 10bp below AND rallies 10bp above, so both ladders saturate
+    # and each leg reports exactly its own cap.
+    out = _orb_cross_tf(cfg, [100.0], [99.90], [99.90], [100.10])
+    pr = -0.001
+
+    assert out["return_long_raw"].iloc[0] == pytest.approx(pr * 2, abs=1e-12)
+    assert out["return_short_raw"].iloc[0] == pytest.approx(pr * 10, abs=1e-12)
+
+
+def test_cross_tf_short_target_is_not_negated():
+    """`return_short` was `-(raw + fee) * size` while `return_short_raw` was
+    `raw * size` — the two short columns of the SAME block disagreed in sign, so
+    one was necessarily wrong. Agamotto and orb's own same-TF path both keep the
+    short target in forward-return space; a NEGATIVE threshold under
+    `y_pred < thresh` (CLAUDE.md) depends on it. Negated, a good short scored
+    HIGH and the leg selected backwards.
+    """
+    out = _orb_cross_tf(_cfg(FEE=2.25), [100.0], [99.90], [99.90], [100.10])
+    short, short_raw = out["return_short"].iloc[0], out["return_short_raw"].iloc[0]
+
+    assert short < 0 and short_raw < 0, (
+        f"a falling exit bar must give a NEGATIVE short target on both columns, "
+        f"got return_short={short}, return_short_raw={short_raw}")
+    # Fee makes the short target strictly less adverse, never sign-flipped.
+    assert short > short_raw
+
+
+def test_cross_tf_honours_LADDER_BPS():
+    """The step was hardcoded to 0.0001, so LADDER_BPS was silently ignored
+    unless it happened to be 1.0."""
+    out = _orb_cross_tf(_cfg(LADDER_BPS=2.0), [100.0], [99.90], [99.90], [100.00])
+
+    # 10bp dip at 2bp per rung = 5 extra rungs + the entry rung = 6.
+    # The hardcoded 0.0001 gave 10 extra, capped at LADDER-1 = 9, i.e. 10.
+    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.001 * 6, abs=1e-12)
+
+
+def test_cross_tf_matches_the_same_tf_engine_bar_for_bar():
+    """Degenerate the cross-TF fixture onto the same-TF one: when the exit bar
+    IS the next base bar, both paths must label identically. A private copy of
+    the maths is how they drifted apart in the first place."""
+    from agamotto.research import AgamottoResearch
+
+    rng = np.random.default_rng(7)
+    n = 200
+    close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 3e-4, n))))
+    df = pd.DataFrame({
+        "open": close,
+        "close": close,
+        "high": close * (1 + np.abs(rng.normal(0, 4e-4, n))),
+        "low": close * (1 - np.abs(rng.normal(0, 4e-4, n))),
+    })
+
+    cfg = _cfg(LADDER_LONG=2, LADDER_SHORT=10, FEE=2.25)
+    ag = AgamottoResearch.__new__(AgamottoResearch)
+    ag.config = cfg
+    expected = ag._compute_ladder_returns(df, "close", "low", "high")
+
+    # exit bar == next base bar
+    got = _orb_cross_tf(
+        cfg,
+        entry_close=df["close"].tolist(),
+        exit_close=df["close"].shift(-1).tolist(),
+        exit_low=df["low"].shift(-1).tolist(),
+        exit_high=df["high"].shift(-1).tolist(),
+    )
+
+    cols = ["return_long", "return_short", "return_long_raw", "return_short_raw"]
+    for col in cols:
+        pd.testing.assert_series_equal(
+            got[col].iloc[:-1].reset_index(drop=True),      # last row has no exit bar
+            expected[col].iloc[:-1].reset_index(drop=True),
+            check_names=False, rtol=1e-12, atol=1e-15)
+
+
+def test_cross_tf_missing_ladder_key_raises():
+    """The fail-fast must reach this branch too, not just the same-TF one."""
+    with pytest.raises(KeyError, match="LADDER"):
+        _orb_cross_tf({"LADDER_BPS": 1.0, "FEE": 0.0},
+                      [100.0], [99.90], [99.90], [100.10])
