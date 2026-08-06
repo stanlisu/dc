@@ -34,6 +34,7 @@ except ImportError:
     except ImportError:
         pass
 
+from .features_scalefree import scale_free_levels
 from .ladder import compute_ladder_multiplier, ladder_params
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
@@ -462,6 +463,45 @@ class AgamottoResearch:
                     ma2.rename(f"{base}_mvg2"),
                     ma3.rename(f"{base}_mvg3"),
                 ] + volume_features + ta_features + rolling_stats)
+
+                # Scale-free forms of the seven raw price/volume levels. Pooling
+                # symbols makes a price-unit column act as a symbol ID; measured
+                # on 10 symbols x 360k rows of 15m, the raw levels are
+                # SIGN-INVERTED by pooling (sar reads +0.0042 pooled vs -0.0388
+                # within-symbol, 3/10 symbols disagreeing) while every transform
+                # scores 0/10 sign flips. See agamotto/features_scalefree.py.
+                #
+                # The raw columns STAY — research_filters gates regimes on them
+                # (`close > sar` :330, `close < bb_lower` :327, `macdhist > 0`
+                # :213). They are kept out of the MODEL by
+                # gauntlet/rolling_predict_returns.select_feature_columns.
+                _ta_by_name = {s.name: s for s in ta_features}
+                _src = {f"{base}_close": close, f"{base}_volume": df[f"{base}_volume"]}
+                for _n in ("sar", "bb_upper", "bb_lower", "macd", "macdhist", "obv", "ad"):
+                    if f"{base}_{_n}" in _ta_by_name:
+                        _src[f"{base}_{_n}"] = _ta_by_name[f"{base}_{_n}"]
+                _need = [f"{base}_{n}" for n in
+                         ("close", "sar", "bb_upper", "bb_lower", "macd",
+                          "macdhist", "obv", "ad", "volume")]
+                if all(k in _src for k in _need):
+                    engineered_frames.extend([
+                        s for _, s in scale_free_levels(
+                            pd.DataFrame(_src),
+                            prefix=f"{base}_",
+                            # agamotto stores obv/ad ALREADY differenced
+                            # (obv_raw.diff(14) above), so normalise only —
+                            # differencing again is a silent second difference.
+                            obv_is_cumulative=False,
+                        ).items()
+                    ])
+                else:
+                    # WHY safe: the TA-Lib block above swallows its own errors
+                    # with a warning, so these sources are legitimately absent on
+                    # a TA-Lib failure. Raising here would turn a degraded run
+                    # into a dead one. The warning names the gap explicitly.
+                    logger.warning(
+                        "%s: skipping scale-free level features, missing %s",
+                        base, [k for k in _need if k not in _src])
 
                 if dual_horizon:
                     engineered_frames.extend([

@@ -8,6 +8,8 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+from .features_scalefree import scale_free_levels
+
 logger = logging.getLogger(__name__)
 
 # Default rolling windows (in bars)
@@ -365,6 +367,30 @@ class MjolnirFeatures:
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
         df = self._compute_talib(df, close, high, low, volume)
+
+        # Scale-free forms of the seven raw price/volume levels. verticalize()
+        # pools symbols, so a price-unit column acts partly as a symbol ID;
+        # measured on 10 symbols x 360k rows of 15m, pooling SIGN-INVERTS them
+        # (sar reads +0.0042 pooled vs -0.0388 within-symbol, 3/10 symbols
+        # disagreeing) while every transform scores 0/10 sign flips. See
+        # mjolnir/core/features_scalefree.py.
+        #
+        # The raw columns STAY — regime filters gate on them. They are kept out
+        # of the MODEL by gauntlet/rolling_predict_returns.select_feature_columns.
+        need = ["close", "sar", "bb_upper", "bb_lower", "macd", "macdhist",
+                "obv", "ad", "volume"]
+        if all(c in df.columns for c in need):
+            # mjolnir stores obv/ad as raw cumulative talib.OBV/AD, so the
+            # default (differencing) is correct here — unlike agamotto, which
+            # already diffs them and must pass obv_is_cumulative=False.
+            df = pd.concat([df, scale_free_levels(df)], axis=1)
+        else:
+            # WHY safe: _compute_talib falls back to _numpy_indicators when
+            # TA-Lib is unavailable, which does not emit every column. Raising
+            # would turn a degraded run into a dead one; the warning names the
+            # gap so it cannot pass unnoticed.
+            logger.warning("skipping scale-free level features, missing %s",
+                           [c for c in need if c not in df.columns])
         return df
 
     def _compute_talib(
