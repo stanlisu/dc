@@ -547,65 +547,11 @@ class OrbResearch(AgamottoResearch):
 
         self.features = aligned
 
-    def _compute_ladder_returns(
-        self,
-        df: pd.DataFrame,
-        close_col: str,
-        low_col: str,
-        high_col: str,
-    ) -> pd.DataFrame:
-        """Compute ladder-adjusted return columns for a single symbol.
-
-        Mirrors the agamotto.research.AgamottoResearch.engineer_features ladder
-        logic exactly: same step_size (1 bps), same clipping, same column names.
-
-        Args:
-            df:        DataFrame with at least close_col, low_col, high_col.
-            close_col: Name of the close price column.
-            low_col:   Name of the low price column.
-            high_col:  Name of the high price column.
-
-        Returns:
-            DataFrame with columns: return_long, return_short,
-            return_long_raw, return_short_raw.
-        """
-        step_size = 0.0001
-        ladder = int(self.config.get("LADDER", 1) or 0)
-        # FEE is required (no fallback): see commit 0500d8fa for rationale.
-        # The historical `or 0.0` collapsed any falsy FEE to the default.
-        fee_rate = float(self.config["FEE"]) / 10000.0
-
-        close = df[close_col]
-        low_series = df[low_col]
-        high_series = df[high_col]
-
-        price_return = close.pct_change(fill_method=None).shift(-1)
-        close_safe = close.replace(0, np.nan)
-        low_next = low_series.shift(-1)
-        high_next = high_series.shift(-1)
-
-        distance_long = ((close_safe - low_next) / close_safe).replace(
-            [np.inf, -np.inf], np.nan)
-        long_layers = np.floor(distance_long / step_size).clip(
-            lower=0, upper=ladder).fillna(0).astype(int)
-
-        distance_short = ((high_next - close_safe) / close_safe).replace(
-            [np.inf, -np.inf], np.nan)
-        short_layers = np.floor(distance_short / step_size).clip(
-            lower=0, upper=ladder).fillna(0).astype(int)
-
-        # 2026-06-20 refined ladder (parity with mjolnir dc 4fb9eb8): no base rung +
-        # round-trip gate -> size = min(long_layers, short_layers), same both sides.
-        size = np.minimum(long_layers, short_layers)
-
-        fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
-        return_long = ((price_return - fee_cost) * size).rename("return_long")
-        return_short = ((price_return + fee_cost) * size).rename("return_short")
-        return_long_raw = (price_return * size).rename("return_long_raw")
-        return_short_raw = (price_return * size).rename("return_short_raw")
-
-        return pd.concat(
-            [return_long, return_short, return_long_raw, return_short_raw], axis=1)
+    # _compute_ladder_returns is INHERITED from AgamottoResearch (2026-08-06).
+    # It used to be duplicated here with `size = min(long_layers, short_layers)`
+    # and a hardcoded 0.0001 step. Two copies of the target maths is exactly how
+    # the engines drifted apart; see agamotto/ladder.py for the one
+    # implementation and tests/test_kline_ladder_sizing.py for the parity test.
 
     @staticmethod
     def _remap_tf_columns(df: pd.DataFrame, tf: str) -> pd.DataFrame:

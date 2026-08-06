@@ -34,6 +34,7 @@ except ImportError:
     except ImportError:
         pass
 
+from .ladder import compute_ladder_multiplier, ladder_params
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
 # Import filter definitions and evaluation logic from sub-module
@@ -192,6 +193,50 @@ class AgamottoResearch:
         combined.index = combined.index.tz_convert(None)
         self.raw = combined
 
+    def _compute_ladder_returns(
+        self,
+        df: pd.DataFrame,
+        close_col: str,
+        low_col: str,
+        high_col: str,
+    ) -> pd.DataFrame:
+        """Ladder-adjusted target columns for a single symbol's OHLC frame.
+
+        The one implementation for every kline engine — OrbResearch,
+        ScepterResearch and AetherResearch inherit it. Each leg is sized by its
+        OWN adverse excursion via `agamotto.ladder.compute_ladder_multiplier`;
+        neither leg gates the other. Mirrors the sizing inlined in
+        `engineer_features`, which walks multi-timeframe `{prefix}_close` columns
+        rather than a single symbol frame.
+
+        Returns:
+            DataFrame with return_long, return_short, return_long_raw,
+            return_short_raw — indexed like `df`.
+        """
+        ladder, step_bps = ladder_params(self.config)
+        fee_rate = float(self.config["FEE"]) / 10000.0
+
+        close = df[close_col]
+        close_safe = close.replace(0, np.nan)
+        price_return = close.pct_change(fill_method=None).shift(-1)
+        low_next = df[low_col].shift(-1)
+        high_next = df[high_col].shift(-1)
+
+        size_long = compute_ladder_multiplier(
+            close_safe, low_next, ladder, step_bps)
+        # Mirror the short's adverse (upward) move about the close so the same
+        # downward-measuring helper serves both legs.
+        size_short = compute_ladder_multiplier(
+            close_safe, 2.0 * close_safe - high_next, ladder, step_bps)
+
+        fee_cost = fee_rate * 2.0
+        return pd.DataFrame({
+            "return_long": (price_return - fee_cost) * size_long,
+            "return_short": (price_return + fee_cost) * size_short,
+            "return_long_raw": price_return * size_long,
+            "return_short_raw": price_return * size_short,
+        }, index=df.index)
+
     def engineer_features(self) -> None:
         if self.raw is None:
             raise RuntimeError("Call load() before engineer_features().")
@@ -199,9 +244,11 @@ class AgamottoResearch:
         df = self.raw
         engineered_frames = [df]
         
-        ladder = int(self.config.get("LADDER", 1) or 0)
+        # Both required — no magic-number defaults, no `get(K,X) or Y`
+        # (CLAUDE.md; the FEE bug 2026-04-27). `step_size` was hardcoded to
+        # 0.0001, which silently matched only configs with LADDER_BPS == 1.0.
+        ladder, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
-        step_size = 0.0001
         dual_horizon = bool(self.config.get("DUAL_HORIZON"))
 
         for col in df.columns:
@@ -235,27 +282,29 @@ class AgamottoResearch:
                 high_next = high_series.shift(-1)
                 close_safe = close.replace(0, np.nan)
 
-                distance_long = ((close_safe - low_next) / close_safe).replace([np.inf, -np.inf], np.nan)
-                long_layers = np.floor(distance_long / step_size)
-                long_layers = long_layers.clip(lower=0, upper=ladder)
-                long_layers = long_layers.fillna(0).astype(int)
+                # Per-leg ladder sizing (2026-08-06). Each leg is sized by its OWN
+                # adverse excursion; neither gates the other. The previous
+                # `size = min(long_layers, short_layers)` additionally required a
+                # FAVOURABLE excursion, which nothing in the executor does — see
+                # agamotto/ladder.py and tests/test_kline_ladder_sizing.py. It
+                # zeroed exactly the dip-and-keep-falling bars, whose losses are
+                # real and are realized live at the next non-BUY decision.
+                size_long = compute_ladder_multiplier(
+                    close_safe, low_next, ladder, step_bps)
+                # Mirror the short's adverse move (upward) about the close so the
+                # same downward-measuring helper applies to both legs.
+                size_short = compute_ladder_multiplier(
+                    close_safe, 2.0 * close_safe - high_next, ladder, step_bps)
 
-                distance_short = ((high_next - close_safe) / close_safe).replace([np.inf, -np.inf], np.nan)
-                short_layers = np.floor(distance_short / step_size)
-                short_layers = short_layers.clip(lower=0, upper=ladder)
-                short_layers = short_layers.fillna(0).astype(int)
-
-                size = np.minimum(long_layers, short_layers)
-
-                fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
+                fee_cost = fee_rate * 2.0
                 long_per_layer_return = price_return - fee_cost
-                price_return_long = (long_per_layer_return * size).rename(f"{base}_return_long")
+                price_return_long = (long_per_layer_return * size_long).rename(f"{base}_return_long")
 
                 short_raw_per_layer = price_return + fee_cost
-                price_return_short = (short_raw_per_layer * size).rename(f"{base}_return_short")
+                price_return_short = (short_raw_per_layer * size_short).rename(f"{base}_return_short")
 
-                price_return_long_raw = (price_return * size).rename(f"{base}_return_long_raw")
-                price_return_short_raw = (price_return * size).rename(f"{base}_return_short_raw")
+                price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
+                price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
 
                 if dual_horizon:
                     price_return_2bar = (close.shift(-2) / close_safe - 1)
@@ -264,21 +313,18 @@ class AgamottoResearch:
                     high_max2 = pd.concat(
                         [high_series.shift(-1), high_series.shift(-2)], axis=1).max(axis=1)
 
-                    distance_long2 = ((close_safe - low_min2) / close_safe).replace([np.inf, -np.inf], np.nan)
-                    long_layers2 = np.floor(distance_long2 / step_size)
-                    long_layers2 = long_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
-
-                    distance_short2 = ((high_max2 - close_safe) / close_safe).replace([np.inf, -np.inf], np.nan)
-                    short_layers2 = np.floor(distance_short2 / step_size)
-                    short_layers2 = short_layers2.clip(lower=0, upper=ladder).fillna(0).astype(int)
-
-                    size2 = np.minimum(long_layers2, short_layers2)
+                    # Same per-leg sizing as the 1-bar target, over the widened
+                    # 2-bar fill window. Was `min(long_layers2, short_layers2)`.
+                    size_long2 = compute_ladder_multiplier(
+                        close_safe, low_min2, ladder, step_bps)
+                    size_short2 = compute_ladder_multiplier(
+                        close_safe, 2.0 * close_safe - high_max2, ladder, step_bps)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
-                    return_long_2bar = ((price_return_2bar - fee_cost) * size2).rename(f"{base}_return_long_2bar")
-                    return_short_2bar = ((price_return_2bar + fee_cost) * size2).rename(f"{base}_return_short_2bar")
-                    return_long_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_long_2bar_raw")
-                    return_short_2bar_raw = (price_return_2bar * size2).rename(f"{base}_return_short_2bar_raw")
+                    return_long_2bar = ((price_return_2bar - fee_cost) * size_long2).rename(f"{base}_return_long_2bar")
+                    return_short_2bar = ((price_return_2bar + fee_cost) * size_short2).rename(f"{base}_return_short_2bar")
+                    return_long_2bar_raw = (price_return_2bar * size_long2).rename(f"{base}_return_long_2bar_raw")
+                    return_short_2bar_raw = (price_return_2bar * size_short2).rename(f"{base}_return_short_2bar_raw")
 
                 return_dip = (low_next / close_safe - 1).rename(f"{base}_return_dip")
                 return_rip = (high_next / close_safe - 1).rename(f"{base}_return_rip")

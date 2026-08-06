@@ -28,11 +28,17 @@ compute_ladder_multiplier = pytest.importorskip(
 
 class TestLadderMultiplierPureFunction:
 
+    # NOTE 2026-08-06: `step_bps` is now REQUIRED (was hardcoded 0.0001), and the
+    # cap is LADDER TOTAL rungs (was LADDER+1). LADDER counts every rung including
+    # the entry one — `knull/ladder.py:157` runs levels 1..ladder_max inclusive —
+    # so only LADDER-1 rungs are reachable by dipping. Canonical tests for this
+    # function live with the function, in marvel/tests/test_ladder_multiplier.py.
+
     def test_ladder_multiplier_no_dip(self):
         """When low_next == close (no dip), multiplier is 1x for every row."""
         close = pd.Series([100.0, 200.0])
         low_next = close.copy()  # no dip at all
-        result = compute_ladder_multiplier(close, low_next, ladder=2)
+        result = compute_ladder_multiplier(close, low_next, ladder=2, step_bps=1.0)
         expected = pd.Series([1, 1])
         pd.testing.assert_series_equal(result.reset_index(drop=True),
                                        expected.reset_index(drop=True),
@@ -43,35 +49,39 @@ class TestLadderMultiplierPureFunction:
         multiplier should be 1 + 1 = 2x (one extra layer triggered)."""
         close = pd.Series([100.0])
         low_next = pd.Series([99.99])  # 1bp dip
-        result = compute_ladder_multiplier(close, low_next, ladder=2)
+        result = compute_ladder_multiplier(close, low_next, ladder=2, step_bps=1.0)
         assert result.iloc[0] == 2  # 1 base + 1 layer
 
     def test_ladder_multiplier_capped(self):
-        """When dip is 10bp but LADDER=2, multiplier is capped at 1 + 2 = 3x."""
+        """When dip is 10bp but LADDER=2, multiplier is capped at LADDER = 2x.
+
+        Was 3x: the old cap allowed LADDER+1 rungs, one deeper than the executor
+        can fill.
+        """
         close = pd.Series([100.0])
         low_next = pd.Series([99.90])  # 10bp dip
-        result = compute_ladder_multiplier(close, low_next, ladder=2)
-        assert result.iloc[0] == 3  # 1 base + 2 layers (cap)
+        result = compute_ladder_multiplier(close, low_next, ladder=2, step_bps=1.0)
+        assert result.iloc[0] == 2  # base rung + 1 reachable extra = LADDER
 
     def test_ladder_multiplier_returns_series(self):
         """Return type is always a pd.Series."""
         close = pd.Series([100.0, 100.0])
         low_next = pd.Series([99.95, 100.0])
-        result = compute_ladder_multiplier(close, low_next, ladder=3)
+        result = compute_ladder_multiplier(close, low_next, ladder=3, step_bps=1.0)
         assert isinstance(result, pd.Series)
 
     def test_ladder_multiplier_zero_ladder(self):
-        """LADDER=0 means no rungs — multiplier is always 1x."""
+        """LADDER=0 means no extra rungs — multiplier is always 1x (entry only)."""
         close = pd.Series([100.0])
         low_next = pd.Series([99.0])  # large dip, but LADDER=0
-        result = compute_ladder_multiplier(close, low_next, ladder=0)
+        result = compute_ladder_multiplier(close, low_next, ladder=0, step_bps=1.0)
         assert result.iloc[0] == 1
 
     def test_ladder_multiplier_two_bps_dip(self):
         """2bp dip with LADDER=5 => 1 + 2 = 3x multiplier."""
         close = pd.Series([100.0])
         low_next = pd.Series([99.98])  # 2bp dip
-        result = compute_ladder_multiplier(close, low_next, ladder=5)
+        result = compute_ladder_multiplier(close, low_next, ladder=5, step_bps=1.0)
         assert result.iloc[0] == 3  # 1 base + 2 layers
 
 
@@ -93,7 +103,7 @@ class TestOrbLadderColumns:
                             reason="orb package not installed")
         from orb.research import OrbResearch  # noqa: F401
 
-        cfg = {"LADDER": 2, "FEE": 2.0}
+        cfg = {"LADDER": 2, "LADDER_BPS": 1.0, "FEE": 2.0}
         orb = OrbResearch.__new__(OrbResearch)
         orb.config = cfg
 

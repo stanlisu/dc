@@ -47,6 +47,8 @@ def _base_config(fee_value):
         "DATA": "liquid",
         "TIME_UNIT": "1h",
         "LADDER": 1,
+        "LADDER_BPS": 1.0,   # required since 2026-08-06; supplied so the FEE
+                             # assertions below fail on FEE and nothing else
         "MA_PERIODS": [7, 25, 99],
         "STATS_WINDOW": 14,
     }
