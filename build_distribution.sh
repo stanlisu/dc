@@ -104,7 +104,24 @@ build_algo() {
 
     # Obfuscate source with PyArmor, targeting linux.x86_64 for remote servers
     echo "  Obfuscating ${algo} (target: linux.x86_64)..."
-    pyarmor gen --platform linux.x86_64 -O "$build_dir/src" -r "$pkg_dir/src/$algo"
+    if ! pyarmor_out=$(pyarmor gen --platform linux.x86_64 -O "$build_dir/src" -r "$pkg_dir/src/$algo" 2>&1); then
+        echo "$pyarmor_out"
+        echo "ERROR: pyarmor gen returned non-zero exit code"
+        exit 1
+    fi
+    if echo "$pyarmor_out" | grep -q "ERROR"; then
+        echo "$pyarmor_out"
+        echo "ERROR: pyarmor gen output contained an ERROR (e.g. out of license)"
+        exit 1
+    fi
+    
+    # Verify the runtime package was actually generated
+    local runtime_dirs=("$build_dir/src"/pyarmor_runtime_*)
+    if [ ! -e "${runtime_dirs[0]}" ]; then
+        echo "$pyarmor_out"
+        echo "ERROR: pyarmor_runtime missing. Obfuscation failed silently."
+        exit 1
+    fi
 
     # Carry the vendored obfuscation codec map (a DATA file — pyarmor gen only
     # processes .py and drops it). codec.py loads map.json from next to itself,
