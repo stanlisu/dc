@@ -193,3 +193,80 @@ def test_both_engines_agree_bar_for_bar():
     o = orb._compute_ladder_returns(df, "close", "low", "high")
 
     pd.testing.assert_frame_equal(a, o)
+
+
+# --------------------------------------------------------------------------- #
+# Per-leg LADDER (2026-08-06)
+#
+# MEASURED: the two legs want opposite ladder depths. Direction-only IC
+# (features vs the PLAIN return, so uncontaminated by the size term), comparing
+# all bars against bars where size hit the cap:
+#
+#                  all bars   size>=cap    the multiplier upweights...
+#     15m long      0.0293      0.0261     LESS predictable bars
+#      1h long      0.0188      0.0174     LESS predictable bars
+#     15m short     0.0490      0.0580     MORE predictable bars
+#      1h short     0.0223      0.0270     MORE predictable bars
+#
+# and a LADDER sweep on 1.7-6.4M rows agrees: top-16 |IC| falls monotonically
+# with LADDER on longs (15m 0.0293 -> 0.0220 at L=20) and rises monotonically on
+# shorts (15m 0.0490 -> 0.0638). So one shared LADDER is wrong for one leg
+# whichever value is chosen.
+#
+# CAVEAT recorded here because the config cannot: `LADDER` is also what the
+# EXECUTOR fills (knull/ladder.py:157 `ladder_max = self._LADDER`). A per-leg
+# TARGET ladder that differs from it models rungs that will not fill — the same
+# defect as the min() gate. These keys are for research arms; reconcile with the
+# executor before any of it is deployed.
+# --------------------------------------------------------------------------- #
+def test_per_leg_ladders_are_read_independently():
+    from agamotto.ladder import ladder_params
+
+    long_l, short_l, step = ladder_params(
+        {"LADDER_LONG": 2, "LADDER_SHORT": 10, "LADDER_BPS": 1.0})
+
+    assert (long_l, short_l, step) == (2, 10, 1.0)
+
+
+def test_per_leg_ladders_actually_size_the_two_legs_differently():
+    """The whole point: same bar, same excursions, different rung counts."""
+    from agamotto.research import AgamottoResearch
+
+    r = AgamottoResearch.__new__(AgamottoResearch)
+    r.config = {"LADDER_LONG": 2, "LADDER_SHORT": 10, "LADDER_BPS": 1.0, "FEE": 0.0}
+    # bar 1 digs 10bp below AND rallies 10bp above -> both ladders saturate,
+    # so each leg reports exactly its own cap.
+    df = pd.DataFrame({
+        "open":  [100.0, 100.00],
+        "high":  [100.0, 100.10],
+        "low":   [100.0,  99.90],
+        "close": [100.0,  99.90],
+    })
+    out = r._compute_ladder_returns(df, "close", "low", "high")
+    pr = -0.001
+
+    assert out["return_long_raw"].iloc[0] == pytest.approx(pr * 2, abs=1e-12)
+    assert out["return_short_raw"].iloc[0] == pytest.approx(pr * 10, abs=1e-12)
+
+
+def test_plain_LADDER_still_works_for_both_legs():
+    """DEPRECATED back-compat: 159 kline settings carry only LADDER. The chain
+    must fall back to it rather than breaking every experiment at once."""
+    from agamotto.ladder import ladder_params
+
+    assert ladder_params({"LADDER": 7, "LADDER_BPS": 1.0}) == (7, 7, 1.0)
+
+
+def test_per_leg_key_overrides_the_shared_one_for_that_leg_only():
+    from agamotto.ladder import ladder_params
+
+    assert ladder_params(
+        {"LADDER": 7, "LADDER_LONG": 2, "LADDER_BPS": 1.0}) == (2, 7, 1.0)
+
+
+def test_no_ladder_key_at_all_still_raises():
+    """The fallback chain must END in a fail-fast (CLAUDE.md)."""
+    from agamotto.ladder import ladder_params
+
+    with pytest.raises(KeyError, match="LADDER"):
+        ladder_params({"LADDER_BPS": 1.0})

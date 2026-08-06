@@ -34,28 +34,57 @@ import numpy as np
 import pandas as pd
 
 
-def ladder_params(config: Dict) -> Tuple[int, float]:
-    """Read (LADDER, LADDER_BPS) from a setting.json dict, failing fast.
+def ladder_params(config: Dict) -> Tuple[int, int, float]:
+    """Read (LADDER_LONG, LADDER_SHORT, LADDER_BPS) from a setting.json dict.
 
-    Both are required. CLAUDE.md bans numeric config reads with magic-number
-    defaults and the `config.get(K, X) or Y` idiom — the previous
-    `int(config.get("LADDER", 1) or 0)` silently resized every trade in the book
-    when LADDER was absent, and the hardcoded 0.0001 step silently matched only
-    configs whose LADDER_BPS happened to be 1.0.
+    Per-leg since 2026-08-06. Measured on 1.7-6.4M rows, direction-only IC
+    (features vs the PLAIN return, so uncontaminated by the size term) moves in
+    OPPOSITE directions with ladder depth on the two legs:
+
+        top-16 |IC|      LADDER=1   LADDER=10   LADDER=20
+        15m long           0.0293     0.0245      0.0220    falling
+        15m short          0.0490     0.0563      0.0638    rising
+
+    and comparing all bars against cap-size bars shows why: the multiplier
+    upweights LESS predictable bars on longs (15m 0.0293 -> 0.0261) and MORE
+    predictable ones on shorts (0.0490 -> 0.0580). One shared value is therefore
+    wrong for one leg whichever number is chosen.
+
+    Resolution order per leg, ending in a fail-fast (CLAUDE.md):
+        LADDER_LONG / LADDER_SHORT  ->  LADDER  ->  KeyError
+
+    WARNING — target/executor divergence. `LADDER` is also what the EXECUTOR
+    fills (`knull/ladder.py:157`, `ladder_max = self._LADDER`). Setting a per-leg
+    TARGET ladder that differs from it trains on rungs that will never fill,
+    which is structurally the same defect as the `min()` gate this module
+    replaced. These keys are for research arms; reconcile them with the executor
+    before anything built on them is deployed.
 
     Raises:
-        KeyError: if either key is missing or null.
+        KeyError: if LADDER_BPS is missing, or if a leg has neither its own key
+            nor the shared LADDER.
     """
-    if config.get("LADDER") is None:
-        raise KeyError(
-            "LADDER is required in setting.json (total ladder rungs, including "
-            "the entry rung) — no default, see CLAUDE.md 'no silent fallbacks'")
     if config.get("LADDER_BPS") is None:
         raise KeyError(
             "LADDER_BPS is required in setting.json (adverse move between rungs, "
             "in bps; matches knull/ladder.py:186 bps_frac = LADDER_BPS * 1e-4) — "
             "no default, see CLAUDE.md 'no silent fallbacks'")
-    return int(config["LADDER"]), float(config["LADDER_BPS"])
+
+    def _leg(key: str) -> int:
+        val = config.get(key)
+        if val is None:
+            # DEPRECATED: drop after 2027-01-01. 159 kline settings carry only
+            # the shared LADDER; breaking them all at once to force per-leg keys
+            # would strand every experiment. Chain ends in the raise below.
+            val = config.get("LADDER")
+        if val is None:
+            raise KeyError(
+                f"{key} (or the shared LADDER) is required in setting.json — "
+                "total ladder rungs for this leg, including the entry rung. "
+                "No default, see CLAUDE.md 'no silent fallbacks'")
+        return int(val)
+
+    return _leg("LADDER_LONG"), _leg("LADDER_SHORT"), float(config["LADDER_BPS"])
 
 
 def compute_ladder_multiplier(close, adverse_extreme, ladder: int,

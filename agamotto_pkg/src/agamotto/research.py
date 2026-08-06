@@ -213,7 +213,7 @@ class AgamottoResearch:
             DataFrame with return_long, return_short, return_long_raw,
             return_short_raw — indexed like `df`.
         """
-        ladder, step_bps = ladder_params(self.config)
+        ladder_long, ladder_short, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
 
         close = df[close_col]
@@ -223,11 +223,11 @@ class AgamottoResearch:
         high_next = df[high_col].shift(-1)
 
         size_long = compute_ladder_multiplier(
-            close_safe, low_next, ladder, step_bps)
+            close_safe, low_next, ladder_long, step_bps)
         # Mirror the short's adverse (upward) move about the close so the same
         # downward-measuring helper serves both legs.
         size_short = compute_ladder_multiplier(
-            close_safe, 2.0 * close_safe - high_next, ladder, step_bps)
+            close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
         fee_cost = fee_rate * 2.0
         return pd.DataFrame({
@@ -247,7 +247,7 @@ class AgamottoResearch:
         # Both required — no magic-number defaults, no `get(K,X) or Y`
         # (CLAUDE.md; the FEE bug 2026-04-27). `step_size` was hardcoded to
         # 0.0001, which silently matched only configs with LADDER_BPS == 1.0.
-        ladder, step_bps = ladder_params(self.config)
+        ladder_long, ladder_short, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
         dual_horizon = bool(self.config.get("DUAL_HORIZON"))
 
@@ -290,11 +290,11 @@ class AgamottoResearch:
                 # zeroed exactly the dip-and-keep-falling bars, whose losses are
                 # real and are realized live at the next non-BUY decision.
                 size_long = compute_ladder_multiplier(
-                    close_safe, low_next, ladder, step_bps)
+                    close_safe, low_next, ladder_long, step_bps)
                 # Mirror the short's adverse move (upward) about the close so the
                 # same downward-measuring helper applies to both legs.
                 size_short = compute_ladder_multiplier(
-                    close_safe, 2.0 * close_safe - high_next, ladder, step_bps)
+                    close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
                 fee_cost = fee_rate * 2.0
                 long_per_layer_return = price_return - fee_cost
@@ -316,9 +316,9 @@ class AgamottoResearch:
                     # Same per-leg sizing as the 1-bar target, over the widened
                     # 2-bar fill window. Was `min(long_layers2, short_layers2)`.
                     size_long2 = compute_ladder_multiplier(
-                        close_safe, low_min2, ladder, step_bps)
+                        close_safe, low_min2, ladder_long, step_bps)
                     size_short2 = compute_ladder_multiplier(
-                        close_safe, 2.0 * close_safe - high_max2, ladder, step_bps)
+                        close_safe, 2.0 * close_safe - high_max2, ladder_short, step_bps)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
                     return_long_2bar = ((price_return_2bar - fee_cost) * size_long2).rename(f"{base}_return_long_2bar")
