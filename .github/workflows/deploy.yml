@@ -53,7 +53,12 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          # `tr -d '\r'` matters: a key pasted from a CRLF clipboard, or through
+          # an editor that rewrote line endings, keeps its \r and OpenSSH then
+          # rejects the whole file with the opaque `error in libcrypto`.
+          # printf '%s\n' (not echo) guarantees exactly one trailing newline,
+          # which OpenSSH also requires.
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           # Fail loud if the secret is unset/empty — otherwise the deploy
           # steps die later with opaque auth errors (run 30084051919 wrote an
@@ -62,6 +67,29 @@ jobs:
             echo "::error::DEPLOY_SSH_KEY secret is empty or unset — add it in repo Settings → Secrets → Actions"
             exit 1
           fi
+          # A NON-EMPTY key is not a VALID key, and only -s was ever checked. So
+          # a malformed secret sailed through this step and died three steps
+          # later as `Load key: error in libcrypto` / `Permission denied
+          # (publickey)` addressed to a HOST — which reads like a server-side
+          # authorized_keys problem. On 2026-08-07 that misdirection cost a
+          # round trip: the key was re-pasted on hydra, but the secret lives in
+          # THIS repo's Actions secrets and was never the host's to fix.
+          #
+          # ssh-keygen -y derives the public key from the private one, so it
+          # actually parses the key material and fails HERE, naming the real
+          # reason, on the step that owns the secret.
+          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null 2>~/.ssh/_keyerr; then
+            echo "::error::DEPLOY_SSH_KEY is present but is NOT A VALID private key. This is a SECRET problem, not a host problem — do not touch authorized_keys on hydra/shield/shield2."
+            echo "ssh-keygen said: $(cat ~/.ssh/_keyerr)"
+            echo "First line of the decoded secret: $(head -1 ~/.ssh/id_ed25519)"
+            echo "Line count: $(wc -l < ~/.ssh/id_ed25519)"
+            echo "Re-paste the FULL private key including its BEGIN/END lines. Piping the file avoids the clipboard mangling that causes this:"
+            echo "  gh secret set DEPLOY_SSH_KEY --repo stanlisu/dc < /path/to/deploy_key"
+            rm -f ~/.ssh/_keyerr
+            exit 1
+          fi
+          rm -f ~/.ssh/_keyerr
+          echo "DEPLOY_SSH_KEY parsed OK: $(ssh-keygen -l -f ~/.ssh/id_ed25519)"
           # keyscans: shield (192.168.72.135) is LAN-only and unreachable from
           # GitHub-hosted runners; under bash -e a failed keyscan killed the
           # whole step. Tolerate per-host scan failures — unreachable hosts
