@@ -287,3 +287,43 @@ hydra runs the b5e71bd packages, i.e. WITHOUT 104d740's LADDER fix.
 Unaffected by any of this: hydra's C++ mjolnir shadow (libmjolnir_core.so,
 core-81b35d8) ships separately — see ~/mjolnir_shadow_bundle/deploy.log.
 ========================================================================
+
+========================================================================
+2026-08-07T14:05Z  build + deploy ALL 9 -> hydra, shield, shield2
+dc @ b508934 (Merge PR #34 fix/agamotto-ws-buffer-loud-fallback); full rebuild
+------------------------------------------------------------------------
+Ran as part of a whole-fleet repo sync (marvel/dc/stan_sim/xmen/sentinel across
+local, shield, shield2, hydra). Local dc was pulled 6 commits ac59ec5 -> b508934
+BEFORE building, so these artifacts carry current source, not the 09:20Z build.
+
+**This closes the hydra gap left open at 09:40Z above.** That entry held hydra
+because pid 48689/48710 (live knull agamotto 15m LTP) was up. It is gone now:
+
+PRE-FLIGHT (listed, not counted — a bare count matches the checking pipeline):
+  hydra   14:00Z  zero run_knull / trade_execution / mjolnir_bridge
+  shield  14:00Z  zero bots (one unrelated research job in ~/nws_ab/, outside
+                  /home/stan/sandbox/marvel — cannot import these packages)
+  shield2 14:00Z  zero bots
+
+BUILD  printf '4\n' | ./build_distribution.sh   (choice 4 = all marvel hosts)
+  9/9 algos built, 0 errors, no 'out of license'. exit 0.
+
+RSYNC  rsync -az --delete build_dist/<algo>_pkg/ -> /home/stan/sandbox/marvel/
+  hydra: 9/9 OK    shield: 9/9 OK    shield2: 9/9 OK
+
+VERIFIED on each host, with that host's own interpreter
+(shield = /opt/miniconda3/envs/py313, hydra+shield2 = ~/miniconda3/envs/py313):
+  import mjolnir.trading.MjolnirTrading  -> <class ...>       all three
+  import mjolnir.core.ladder             -> ok                all three
+  import agamotto.research               -> ok                all three
+  import agamotto                        -> ok                all three
+  codec default().encode_feature("trade_imbalance") -> f091   all three
+  codec default().encode_regime("trade_imbalance")  -> r068   all three
+  map.json md5 33f9f0fa1f1985567cef0a131fb4e403               all three
+    == local dc/obfuscation/map.json, and == the 09:40Z deploy's md5
+  => append-only invariant holds; 0 added, 0 removed.
+
+hydra now runs the b508934 packages, i.e. WITH 104d740's LADDER fix, which it
+had been missing since the 09:40Z hold.
+Unaffected: hydra's C++ mjolnir shadow (libmjolnir_core.so) ships separately.
+========================================================================
