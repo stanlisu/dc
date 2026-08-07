@@ -91,7 +91,7 @@ int main(int argc, char** argv)
             ++bars;
             if (!core->isWarm()) continue;
             if (!warm_announced) {
-                std::printf("[shadow] WARM after %zu bars (buffered=%d)\n", bars,
+                std::printf("[shadow] WARM after %zu bars (bars_fed=%d)\n", bars,
                             core->barsBuffered());
                 warm_announced = true;
             }
@@ -114,7 +114,10 @@ int main(int argc, char** argv)
                 ticks, bars, warm_bars, fired);
     if (bars == 0) { std::printf("=== FAIL: no bars were produced ===\n"); return 1; }
     if (!warm_announced) {
-        std::printf("=== FAIL: never reached warmup (buffered=%d) — the gate never released ===\n",
+        // Run this with the PRODUCTION algo_params (warmup_fire_gate_bars=1080),
+        // not a lowered gate — a replay under a small gate is exactly what let
+        // the buffer-vs-counter defect through.
+        std::printf("=== FAIL: never reached warmup (bars_fed=%d) — the gate never released ===\n",
                     core->barsBuffered());
         return 1;
     }

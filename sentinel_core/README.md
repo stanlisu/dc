@@ -77,6 +77,13 @@ parity break rather than a rounding difference. Every `tests/*_driver.cpp` must
 have a recipe in the script; one without an entry fails the build instead of
 being skipped.
 
+`warmup_gate_driver` is the exception to "each harness is driven by a Python
+script": it is a self-contained C++ unit test over `src/warmup_gate.hpp` with no
+TA-Lib, LightGBM, weights or stack, so it just runs (`./build-linux/warmup_gate_driver`,
+exit 0 = pass). It pins the semantics the port got wrong — the warmup gate counts
+bars **ever fed**, not bar-buffer occupancy, so a gate above `BUFFER_MAXLEN`
+still opens. See DEPLOY_SHADOW.md.
+
 ### Two prerequisites, both of which fail loud
 
 **1. `mjolnir/_obf` must be generated.** It is derived and gitignored, so a

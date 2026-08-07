@@ -77,7 +77,7 @@ Mismatches here change the signal without erroring:
 | key | live value | why it matters |
 |---|---|---|
 | `bar_sec` / `target_sec` | 30 / 30 | bar cadence and the cycle columns |
-| `warmup_fire_gate_bars` | 1080 | nothing fires before this many bars |
+| `warmup_fire_gate_bars` | 1080 | nothing fires before this many bars have been FED |
 | `min_signal_count` | 1 | vote threshold |
 | `reverse` | 1 | flips side when -1 |
 | `hold_ttl_bars` | 2 | holds a fired signal through N non-firing bars |
@@ -86,11 +86,30 @@ Mismatches here change the signal without erroring:
 Required keys have **no defaults** — a missing key raises at construction rather
 than silently picking a plausible value.
 
+### `warmup_fire_gate_bars` is CUMULATIVE, and may exceed the 1000-bar buffer
+
+The gate counts bars **ever fed** (`src/warmup_gate.hpp`), matching the
+reference's `_bars_fed`. It is deliberately *above* `BUFFER_MAXLEN` = 1000: the
+buffer is trimmed to 1000 because the feature panel and the regime quantiles are
+defined over exactly that window, and 1080 means "let 1080 bars flow through
+before trusting the most recent 1000". Widening the buffer to match the gate
+would change every quantile — i.e. change which regime fires — and break the
+2085/2085 corr 1.000000 parity, so `BUFFER_MAXLEN` stays at 1000.
+
+The port originally compared the gate against `mBuf.size()`, which saturates at
+1000, so the gate could never open. On hydra, pid 501412 logged
+`warming bars=1000` 103 times over 3d22h and emitted zero `[MJDEC]` lines. The
+count is now cumulative on both sides of the comparison **and** in the progress
+log, so a stalled gate shows as a number that stops climbing rather than one
+that looks like a full buffer. Covered by `tests/warmup_gate_driver.cpp`.
+
 ## What to expect in the log
 
 ```
 [Mjolnir] SHADOW start core=core-<sha> product_id=... dry_run=0 guard_ms=1000
-[Mjolnir] warming bars=NNN            (until warmup_fire_gate_bars)
+[Mjolnir] warming bars=NNN            (cumulative bars fed; climbs until
+                                       warmup_fire_gate_bars — a number that
+                                       STOPS climbing is a stalled gate)
 [MJDEC] bar_ts=... side=-1 y_pred=... thr=... n_trig=1 regime=r068
 [Mjolnir] shutdown ticks=... bars=... fires=... conv_err=...
 ```

@@ -10,6 +10,7 @@
 //
 // Design rules carried from the reference, each load-bearing:
 //   * BUFFER_MAXLEN = 1000 bars (trading.py) — the feature window
+//   * the warmup gate counts bars EVER FED, not buffer occupancy (warmup_gate.hpp)
 //   * the scored row is iloc[-2], NOT the closing bar
 //   * regime predicates are evaluated over the FULL panel (quantiles!)
 //   * hold-TTL holds a fired signal through <= HOLD_TTL_BARS None cycles;
@@ -21,6 +22,7 @@
 #include "feature_engine.hpp"
 #include "regime_gate.hpp"
 #include "model_runner.hpp"
+#include "warmup_gate.hpp"
 
 #include <algorithm>
 #include <array>
@@ -180,6 +182,8 @@ class Core final : public ICore {
 
         mBuilder.reset(new BarBuilder(mBarSec, mTargetSec));
         mFeatures.reset(new FeatureEngine({30, 60, 300, 900}, mBarSec, mTargetSec));
+        // Gate may legitimately exceed BUFFER_MAXLEN — see warmup_gate.hpp.
+        mWarmup.reset(new WarmupGate(mWarmupBars));
 
         // Optional bar dump for reconciliation against the reference bot.
         // Written HERE, in the private core, because the bar schema is IP — the
@@ -227,6 +231,9 @@ class Core final : public ICore {
             if (mBuilder->onTrade(ev.last_px, ev.last_qty, is_buyer_maker,
                                   static_cast<int64_t>(ev.exchange_ts_ns / 1000000), 1, &closed)) {
                 mBuf.push_back(closed);
+                // Counted HERE, before the trim below, so the gate measures bars
+                // ever fed rather than buffer occupancy. Keep the two adjacent.
+                mWarmup->countBarFed();
                 dumpBar(closed);
                 while (mBuf.size() > static_cast<size_t>(BUFFER_MAXLEN)) mBuf.pop_front();
                 mPendingBarTsNs = closed.bucket_ms * 1000000LL;
@@ -281,8 +288,14 @@ class Core final : public ICore {
         return true;
     }
 
-    bool isWarm() const override { return static_cast<int>(mBuf.size()) >= mWarmupBars; }
-    int  barsBuffered() const override { return static_cast<int>(mBuf.size()); }
+    // The contract documents this pair as "bars accumulated vs the warmup gate"
+    // (mjolnir_core.hpp), i.e. a CUMULATIVE count — the reference's `_bars_fed`.
+    // Both used to read mBuf.size(), which saturates at BUFFER_MAXLEN: with
+    // warmup_fire_gate_bars=1080 > 1000 the gate could never open, and the
+    // strategy's "warming bars=" line reported a constant 1000 rather than a
+    // count that visibly stops climbing. See warmup_gate.hpp.
+    bool isWarm() const override { return mWarmup->isWarm(); }
+    int  barsBuffered() const override { return static_cast<int>(mWarmup->barsFed()); }
 
     // ---- anchor bus -------------------------------------------------------
     bool isAnchor() const override { return mIsAnchor; }
@@ -454,6 +467,7 @@ class Core final : public ICore {
 
     std::unique_ptr<BarBuilder> mBuilder;
     std::unique_ptr<FeatureEngine> mFeatures;
+    std::unique_ptr<WarmupGate> mWarmup;
     std::deque<Bar> mBuf;
     std::vector<StackEntry> mStack;
     std::map<std::string, std::unique_ptr<ModelRunner>> mModels;
