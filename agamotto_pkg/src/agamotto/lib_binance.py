@@ -291,6 +291,16 @@ def fetch_futures_klines(
 ) -> List[List[str]]:
     interval_ms = _interval_to_millis(interval)
 
+    # Binance caps a single /klines page at 1500 rows, so a caller asking for
+    # more than that is served over several pages. This is the size of ONE
+    # page — the only number a "did the exchange run out of data?" test may be
+    # compared against. Comparing a page against the caller's unclamped total
+    # made a full 1500-row page look short for any `limit > 1500`, breaking the
+    # loop after a single request and silently returning far fewer rows than
+    # asked for. Clamping the caller's request to the endpoint's documented
+    # ceiling is bounding an INPUT, not a derived quantity.
+    page_limit = min(limit, 1500)
+
     rows: List[List[str]] = []
     current_start = start_ms
 
@@ -300,7 +310,7 @@ def fetch_futures_klines(
             "interval": interval,
             "startTime": current_start,
             "endTime": end_ms,
-            "limit": min(limit, 1500),
+            "limit": page_limit,
         }
 
         payload = None
@@ -344,15 +354,19 @@ def fetch_futures_klines(
 
         current_start = next_start
 
-        if len(payload) < limit:
+        # A page shorter than what we ASKED THE ENDPOINT FOR means the exchange
+        # has no more data in the window; a full page does not, however large
+        # the caller's total was.
+        if len(payload) < page_limit:
             break
 
         # Only rate-limit BETWEEN requests that will actually be issued. The
         # `while current_start < end_ms` guard above exits right after this
-        # sleep whenever the caller's window is an exact multiple of `limit`
-        # (the live path asks for 700 bars and gets exactly 700), so sleeping
-        # first was pure dead time — ~1.24 s per live cycle across the symbol
-        # thread pool. The pause between two REAL consecutive pages is kept.
+        # sleep whenever the caller's window is an exact multiple of the page
+        # size (the live path asks for 700 bars and gets exactly 700), so
+        # sleeping first was pure dead time — ~1.24 s per live cycle across the
+        # symbol thread pool. The pause between two REAL consecutive pages is
+        # kept, so sleeps are always exactly requests - 1.
         if current_start >= end_ms:
             break
 
