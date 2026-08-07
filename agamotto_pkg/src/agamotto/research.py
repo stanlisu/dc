@@ -34,7 +34,7 @@ except ImportError:
     except ImportError:
         pass
 
-from .features_scalefree import scale_free_levels
+from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
 from .ladder import compute_ladder_multiplier, ladder_params
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
@@ -648,6 +648,14 @@ class AgamottoResearch:
                 f"{prefix}_return_rip": "return_rip",
             }
 
+            # engineer_features() computes the scale-free level replacements
+            # (SCALE_FREE_FEATURES) into the wide frame; they must be carried
+            # through to the vertical panel or the trainer never sees them.
+            # Driven off the canonical list, never a second hardcoded copy —
+            # the two drifting apart is exactly the defect this replaces.
+            for _sf_name in SCALE_FREE_FEATURES:
+                base_rename_map[f"{prefix}_{_sf_name}"] = _sf_name
+
             long_return_col = f"{prefix}_return_long"
             short_return_col = f"{prefix}_return_short"
             long_return_raw_col = f"{prefix}_return_long_raw"
@@ -673,6 +681,25 @@ class AgamottoResearch:
                     rename_map[col2] = suffix
 
             valid_cols = [c for c in rename_map if c in df.columns]
+
+            # Tripwire for the defect this loop replaces: a feature computed by
+            # engineer_features but absent from rename_map was dropped here
+            # SILENTLY (valid_cols iterates the map, not the frame), so the
+            # trainer saw a panel that quietly lacked it. Scoped to the
+            # scale-free names because plenty of {prefix}_* columns — raw OHLCV,
+            # TA intermediates — are dropped legitimately. No silent fallback:
+            # a twin present in the frame but missing from the map raises.
+            _dropped_sf = [
+                f"{prefix}_{n}" for n in SCALE_FREE_FEATURES
+                if f"{prefix}_{n}" in df.columns and f"{prefix}_{n}" not in valid_cols
+            ]
+            if _dropped_sf:
+                raise KeyError(
+                    f"verticalize: {sym} — engineer_features produced "
+                    f"{_dropped_sf} but rename_map does not carry them, so they "
+                    f"would be dropped from the vertical panel without warning. "
+                    f"Add them to base_rename_map."
+                )
 
             subset = df.loc[:, valid_cols + ["year", "month"]].copy()
             subset.rename(columns={orig: rename_map[orig] for orig in valid_cols}, inplace=True)

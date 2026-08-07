@@ -56,6 +56,61 @@ def resolve_fill_mode(config: Dict) -> str:
     return mode
 
 
+def resolve_ladder(config: Dict) -> int:
+    """Read the REQUIRED ``LADDER`` key. No default.
+
+    Single source of truth for the key on the mjolnir/stormbreaker target
+    path. It used to be read as ``int(config.get("LADDER", 1) or 0)`` —
+    a magic-number default AND the banned ``get(K, X) or Y`` idiom in one
+    expression (CLAUDE.md "NEVER add silent fallbacks"), sitting in the
+    same function as the ``LADDER_FILL_MODE`` default that was removed in
+    ``b5e71bd``. Two distinct silent paths:
+
+      * key ABSENT -> ``1``. All six ``pred_stormbreaker.base.*_1`` arms
+        omitted ``LADDER`` entirely and were therefore trained on a
+        1-rung target while every ``pred_mjolnir.base.*_1`` arm set the
+        key explicitly (one of them at ``10``) — a different target, with
+        nothing in the logs saying so.
+      * key present but FALSY-non-zero (``null``, ``""``, ``false``) ->
+        ``0`` via the ``or``, i.e. an unusable rung cap accepted in
+        silence instead of a type error. (``LADDER: 0`` itself survived
+        the ``or`` unchanged, because the right operand was also ``0`` —
+        the idiom was still banned, and still hid the other two cases.)
+
+    ``LADDER`` is the rung cap on the TARGET the model is trained on
+    (:func:`compute_ladder_returns` clips ``low_layers``/``high_layers``
+    to it), so defaulting it silently changes what is being learned.
+
+    Args:
+        config: Dictionary loaded from setting.json.
+
+    Returns:
+        The rung cap as a non-negative int.
+
+    Raises:
+        KeyError:   LADDER absent from config.
+        ValueError: LADDER present but not a whole, non-negative number.
+    """
+    if "LADDER" not in config:
+        raise KeyError(
+            "LADDER is required in setting.json and has NO default "
+            f"(VERSION={config.get('VERSION', '<unset>')!r}). It caps the rungs "
+            "of the ladder TARGET, so defaulting it silently changes what the "
+            "model is trained on. Set it explicitly to a whole number >= 0.")
+    value = config["LADDER"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "LADDER must be a whole number of rungs, got "
+            f"{value!r} of type {type(value).__name__}.")
+    if float(value) != int(value):
+        raise ValueError(
+            f"LADDER must be a WHOLE number of rungs, got {value!r}.")
+    ladder = int(value)
+    if ladder < 0:
+        raise ValueError(f"LADDER must be >= 0 rungs, got {ladder}.")
+    return ladder
+
+
 def compute_ladder_returns(
     config: Dict,
     df: pd.DataFrame,
@@ -100,7 +155,7 @@ def compute_ladder_returns(
             f"horizon_bars must be >= 1, got {horizon_bars}")
 
     step_size = 0.0001
-    ladder = int(config.get("LADDER", 1) or 0)
+    ladder = resolve_ladder(config)
     # FEE is required (no fallback): see commit 0500d8fa for rationale.
     # The historical `or 0.0` collapsed any falsy FEE to the default.
     fee_rate = float(config["FEE"]) / 10000.0

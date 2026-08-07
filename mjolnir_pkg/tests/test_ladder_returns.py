@@ -138,3 +138,32 @@ def test_flat_mode_size_one(df):
 def test_unknown_mode_raises(df):
     with pytest.raises(ValueError, match="LADDER_FILL_MODE"):
         _call(df, "bogus")
+
+
+# ── LADDER is REQUIRED (no magic default, no `X or Y`) ───────────────────────
+# Was `int(config.get("LADDER", 1) or 0)`: an absent key silently became 1 (all
+# six pred_stormbreaker.base.*_1 arms), and a null/""/False value silently
+# became 0. LADDER caps the rungs of the TARGET, so either path changes what
+# the model is trained on with nothing in the logs. CLAUDE.md bans both the
+# magic default and the `get(K, X) or Y` idiom.
+
+def test_ladder_missing_raises(df):
+    fake = types.SimpleNamespace(config={"FEE": FEE, "LADDER_FILL_MODE": "ladder"})
+    with pytest.raises(KeyError, match="LADDER is required"):
+        MjolnirResearch._compute_ladder_returns(
+            fake, df, "close", "low", "high", horizon_bars=1)
+
+
+@pytest.mark.parametrize("bad", [None, "", False, 1.5, -1])
+def test_ladder_non_whole_or_negative_raises(df, bad):
+    """The old `or 0` swallowed None/""/False into a silent 0 rung cap."""
+    with pytest.raises(ValueError, match="LADDER"):
+        _call(df, "ladder", ladder=bad)
+
+
+def test_ladder_zero_is_accepted_and_not_collapsed(df):
+    """`LADDER: 0` is a legitimate value (entry rung only -> size 0) and must
+    survive as 0, not be re-read as the old default of 1."""
+    out = _call(df, "ladder", ladder=0)
+    assert (out["return_long_raw"].fillna(0.0) == 0.0).all()
+    assert (out["return_short_raw"].fillna(0.0) == 0.0).all()
