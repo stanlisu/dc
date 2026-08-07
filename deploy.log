@@ -251,3 +251,39 @@ REMAINING WHEN A WINDOW OPENS:
   then the import check per dc/README.md on each host
   (shield's python is /opt/miniconda3/envs/py313, not ~/miniconda3).
 ========================================================================
+
+========================================================================
+2026-08-07T09:40Z  deploy ALL 9 -> shield, shield2   (hydra STILL PENDING)
+dc @ ac59ec5 (build logged at 09:20Z above; no rebuild, same artifacts)
+------------------------------------------------------------------------
+Both targets went idle, so the held deploy went out to two of the three.
+
+PRE-FLIGHT (listed, not counted — a bare count matches the checking pipeline):
+  shield2 09:38:48Z  zero py313 python, and its fee0_3tf.sh driver was gone too,
+                     so nothing could relaunch generate_daily_pnl mid-rsync
+  shield  09:39:58Z  zero py313 python / research procs
+
+RSYNC  rsync -az --delete build_dist/<algo>_pkg/ -> /home/stan/sandbox/marvel/
+  shield2: 9/9 OK      shield: 9/9 OK
+
+VERIFIED on each host, with that host's own interpreter
+(shield = /opt/miniconda3/envs/py313, shield2 = ~/miniconda3/envs/py313):
+  import mjolnir.trading.MjolnirTrading      -> <class ...>          both
+  import mjolnir.core.ladder                 -> ok                   both
+  import agamotto.research                   -> ok                   both
+    (ladder.py + research.py are THE two files this build changed)
+  codec default().encode_feature("trade_imbalance") -> f091          both
+  codec default().encode_regime("trade_imbalance")  -> r068          both
+  map.json md5 33f9f0fa1f1985567cef0a131fb4e403                      both
+  => same map as before the deploy; append-only invariant holds, 0 added,
+     0 removed.
+
+HYDRA NOT DEPLOYED. pid 48689/48710, the LIVE knull agamotto 15m LTP bot, was
+still up at 09:41:39Z (44m51s). rsync --delete replaces the whole package tree
+including pyarmor_runtime_000000/, so a live bot that imports anything lazily
+after the swap breaks. hydra will not clear on its own — it needs a deliberate
+window (bounce the bot around the rsync), which is an operator call. Until then
+hydra runs the b5e71bd packages, i.e. WITHOUT 104d740's LADDER fix.
+Unaffected by any of this: hydra's C++ mjolnir shadow (libmjolnir_core.so,
+core-81b35d8) ships separately — see ~/mjolnir_shadow_bundle/deploy.log.
+========================================================================
