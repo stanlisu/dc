@@ -211,3 +211,43 @@ Import + encode_feature verified on hydra, shield, shield2 post-deploy.
 PRE-FLIGHT: zero bot/pipeline processes on all 3 targets (listed, not counted).
 PyArmor 9.2.3 trial completed all 9 packages with no license error.
 ========================================================================
+
+========================================================================
+2026-08-07T09:20Z  build ALL 9 -> build_dist/   ***DEPLOY HELD***
+dc @ ac59ec5 (main, after #32)
+------------------------------------------------------------------------
+BUILT, NOT DEPLOYED. ./build_distribution.sh --build-only, PyArmor 9.2.3
+trial, linux.x86_64, all 9 packages, no license error. Artifacts sit in
+build_dist/ awaiting a clear window.
+
+WHY A REBUILD AT ALL: two shipped source files changed since the last deploy
+(b5e71bd, 2026-08-07T07:42):
+  agamotto_pkg/src/agamotto/research.py
+  mjolnir_pkg/src/mjolnir/core/ladder.py       (both from 104d740, LADDER is
+  required — magic default + `or` idiom removed)
+Everything else in b5e71bd..ac59ec5 is CI config, deploy.log, or sentinel_core
+(C++, ships separately as libmjolnir_core.so — see the hydra bundle deploy.log).
+
+WHY HELD: dc/README.md — "Never deploy onto a host with running bots. rsync
+uses --delete; a bot that imports a package mid-sync gets a torn tree."
+All three targets were busy at 09:15Z (listed, not counted):
+  hydra   pid 48689/48710  LIVE knull agamotto 15m LTP bot (agamotto_bridge.py
+                           + run_knull.py), up ~18min
+  shield  another Claude session driving pred_orb.base.1h_1 queries
+  shield2 pid 937821  gauntlet/generate_daily_pnl.py -c pred_agamotto.base.1h_1,
+                      in flight — and agamotto/research.py is exactly what it
+                      imports, i.e. the file this deploy changes
+Operator decision: HOLD, retry when clear. hydra will not clear on its own —
+the bot is live, so it needs a deliberate maintenance window.
+
+MAP PRE-CHECK (done, so the eventual rsync carries no map surprise):
+  build_dist map.json = 72 regimes / 107 features, ONE checksum across all 8
+  coded packages: 33f9f0fa1f1985567cef0a131fb4e403
+  Deployed map.json on hydra / shield / shield2: identical checksum.
+  => no map change in this deploy; append-only invariant trivially holds.
+
+REMAINING WHEN A WINDOW OPENS:
+  rsync -az --delete build_dist/<algo>_pkg/ <host>:/home/stan/sandbox/marvel/<algo>_pkg/
+  then the import check per dc/README.md on each host
+  (shield's python is /opt/miniconda3/envs/py313, not ~/miniconda3).
+========================================================================
