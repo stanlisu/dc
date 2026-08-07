@@ -60,11 +60,21 @@ jobs:
           # which OpenSSH also requires.
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # Fail loud if the secret is unset/empty — otherwise the deploy
-          # steps die later with opaque auth errors (run 30084051919 wrote an
-          # empty key file because DEPLOY_SSH_KEY was never configured).
-          if [ ! -s ~/.ssh/id_ed25519 ]; then
-            echo "::error::DEPLOY_SSH_KEY secret is empty or unset — add it in repo Settings → Secrets → Actions"
+          # THE UNSET CASE, and why the old `-s` test could never catch it.
+          # An unset secret expands to the empty string, and both `echo ""` and
+          # `printf '%s\n' ""` still write ONE NEWLINE — a 1-byte file. `-s` only
+          # asks "size > 0", so it passed on a file containing nothing but "\n".
+          # The guard added specifically to catch run 30084051919's empty key was
+          # therefore incapable of catching it, and stayed that way until
+          # 2026-08-07, when `gh api repos/stanlisu/dc/actions/secrets` returned
+          # `total_count: 0` — the secret had NEVER existed. Every "malformed
+          # key" diagnosis before that, including TODO.md P7.1's, was inferred
+          # from this guard passing and was wrong.
+          #
+          # Test the CONTENT, not the size: strip whitespace and require
+          # something left.
+          if [ -z "$(tr -d '[:space:]' < ~/.ssh/id_ed25519)" ]; then
+            echo "::error::DEPLOY_SSH_KEY is UNSET or blank — the file contains only whitespace. This is NOT a malformed key and NOT a host problem. Create the secret: gh secret set DEPLOY_SSH_KEY --repo stanlisu/dc < /path/to/deploy_key  (and put the matching .pub in ~/.ssh/authorized_keys on 13.115.134.141 and 3.112.232.77)"
             exit 1
           fi
           # A NON-EMPTY key is not a VALID key, and only -s was ever checked. So
