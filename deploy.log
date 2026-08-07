@@ -191,3 +191,23 @@ FOLLOW-UPS:
   - The 5 TA-Lib parity failures are a real open gate on the C++ port.
   - No committed build recipe for tests/*_parity_driver.cpp (CLAUDE.md wants a
     committed script + README, not a hand-rebuilt command line).
+
+========================================================================
+2026-08-07T07:42:55Z  build + deploy ALL 9 -> hydra, shield, shield2
+dc @ b5e71bd  marvel @ b831c2e79
+------------------------------------------------------------------------
+WHY: agamotto filter parquets for pred_agamotto.base.1h_1 were written
+2026-08-06 14:25, BEFORE the package carrying dc 3fe8e57 was installed, so
+the panel held the 7 raw levels with no scale-free twins. Rebuilding to
+guarantee every host runs the same bytes before re-running Step 1.
+
+VERIFIED: map.json = 107 features on all 3 hosts (100 + 7 twins).
+  ad_slope f101 | bb_pctb f102 | bb_width f103 | macd_norm f104
+  macdhist_norm f105 | obv_slope f106 | sar_dist f107
+Append-only invariant holds: 0 added / 0 removed vs the previously deployed
+map, all pre-existing codes unchanged.
+Import + encode_feature verified on hydra, shield, shield2 post-deploy.
+
+PRE-FLIGHT: zero bot/pipeline processes on all 3 targets (listed, not counted).
+PyArmor 9.2.3 trial completed all 9 packages with no license error.
+========================================================================
