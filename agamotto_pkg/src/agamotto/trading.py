@@ -466,24 +466,46 @@ class AgamottoTrading(AgamottoResearch):
             ]
             if kline_buffer.is_ready(native_symbols, feature_tf):
                 frames = []
+                unusable: List[str] = []
                 for native in native_symbols:
                     df = kline_buffer.get_dataframe(native, feature_tf)
-                    if df is not None and not df.empty:
-                        # Rename from {sym}_{tf}_{col} to {sym}_{col}
-                        rename_map = {
-                            c: c.replace(f"_{feature_tf}_", "_", 1)
-                            for c in df.columns
-                            if f"_{feature_tf}_" in c
-                        }
-                        if rename_map:
-                            df = df.rename(columns=rename_map)
-                        frames.append(df)
+                    if df is None or df.empty:
+                        unusable.append(native)
+                        continue
+                    # Rename from {sym}_{tf}_{col} to {sym}_{col}
+                    rename_map = {
+                        c: c.replace(f"_{feature_tf}_", "_", 1)
+                        for c in df.columns
+                        if f"_{feature_tf}_" in c
+                    }
+                    if rename_map:
+                        df = df.rename(columns=rename_map)
+                    frames.append(df)
                 if len(frames) == len(native_symbols):
                     combined = pd.concat(frames, axis=1).sort_index()
                     self._process_combined(combined, limit)
                     return
+                # A caller that wired up a WS buffer believes this cycle is
+                # cheap; falling back to REST costs ~10s inside the decision
+                # window. Name the symbols so the fault is actionable, never
+                # just "incomplete".
                 logger.warning(
-                    "WS buffer read incomplete, falling back to REST")
+                    "WS kline buffer read INCOMPLETE for tf=%s — FALLING BACK "
+                    "TO REST (slow path): %d/%d symbols usable, "
+                    "empty/missing=%s",
+                    feature_tf, len(frames), len(native_symbols),
+                    unusable[:20])
+            else:
+                missing = [
+                    n for n in native_symbols
+                    if kline_buffer.get_dataframe(n, feature_tf) is None
+                ]
+                logger.warning(
+                    "WS kline buffer NOT READY for tf=%s — FALLING BACK TO "
+                    "REST (slow path): %d/%d symbols absent from the buffer: "
+                    "%s",
+                    feature_tf, len(missing), len(native_symbols),
+                    missing[:20])
 
         # --- REST path (original) ---
         end_ts = pd.Timestamp.utcnow()
