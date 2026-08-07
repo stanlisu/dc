@@ -48,6 +48,10 @@ driver_sources() {
         btc_cross_parity_driver) echo "src/bar_builder.cpp src/feature_engine.cpp src/talib_block.cpp|TALIB" ;;
         regime_parity_driver)    echo "src/bar_builder.cpp src/feature_engine.cpp src/regime_gate.cpp src/talib_block.cpp|TALIB" ;;
         model_parity_driver)     echo "src/model_runner.cpp src/regime_gate.cpp|LGBM" ;;
+        # Header-only unit test: no extra TUs, no libs. NOSRC is the explicit
+        # "zero sources" marker — an empty string is how driver_sources reports
+        # "no recipe", so the two must not look alike.
+        warmup_gate_driver)      echo "|NOSRC" ;;
         m1_gate_driver)          echo "src/bar_builder.cpp src/feature_engine.cpp src/regime_gate.cpp src/model_runner.cpp src/talib_block.cpp|TALIB,LGBM" ;;
         # Goes through the PUBLIC contract (makeCore), so it also needs
         # core_impl.cpp — and therefore the build-sha define.
