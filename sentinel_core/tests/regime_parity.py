@@ -23,7 +23,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bar_parity import BAR_SEC, TARGET_SEC, gen_events, load_reference  # noqa: E402
-from feature_parity import ref_bars_df  # noqa: E402
+from feature_parity import (  # noqa: E402
+    assert_reference_used_talib, ref_bars_df, require_reference_talib)
 
 REGIMES = [
     ("trade_imbalance", "long"), ("trade_imbalance", "short"),
@@ -57,12 +58,19 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
+    # Five regimes below (rsi_oversold, rsi_overbought, macd_bullish,
+    # macd_bearish, adx_trend) read TA-Lib columns directly, so a reference
+    # without TA-Lib grades them against numpy stubs and NaN.
+    ta_ver = require_reference_talib()
+    print(f"[regime_parity] reference TA-Lib {ta_ver}")
+
     events = gen_events(seed=args.seed)
     bars = ref_bars_df(load_reference(Path(args.ref_bar)), events)
     feat_mod = load_reference(Path(args.ref_feat))
     fe = feat_mod.MjolnirFeatures(feature_windows=[30, 60, 300, 900],
                                   bar_tf="5s", target_tf="5s")
     panel = fe.compute(bars)
+    assert_reference_used_talib(panel, "reference panel")
 
     # Import as a package member: regime_filters uses relative imports
     # (the codec), so loading it as a standalone file always ImportErrors.

@@ -24,7 +24,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bar_parity import BAR_SEC, TARGET_SEC, gen_events, load_reference  # noqa: E402
-from feature_parity import ref_bars_df  # noqa: E402
+from feature_parity import (  # noqa: E402
+    assert_reference_used_talib, ref_bars_df, require_reference_talib)
 
 
 def main() -> int:
@@ -36,6 +37,9 @@ def main() -> int:
     ap.add_argument("--anchor-seed", type=int, default=7)
     ap.add_argument("--peer-seed", type=int, default=21)
     args = ap.parse_args()
+
+    ta_ver = require_reference_talib()
+    print(f"[btc_cross_parity] reference TA-Lib {ta_ver}")
 
     a_ev = gen_events(seed=args.anchor_seed)
     p_ev = gen_events(seed=args.peer_seed)
@@ -49,6 +53,8 @@ def main() -> int:
 
     a_panel = fe.compute(ref_bars_df(bar_mod, a_ev))
     p_panel = fe.compute(ref_bars_df(bar_mod, p_ev))
+    assert_reference_used_talib(a_panel, "anchor panel")
+    assert_reference_used_talib(p_panel, "peer panel")
     # The reference reindexes the anchor onto the peer's index internally.
     ref = fe.add_btc_cross_features(p_panel, a_panel)
 

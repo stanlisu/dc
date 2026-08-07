@@ -29,6 +29,118 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bar_parity import BAR_SEC, TARGET_SEC, gen_events, load_reference  # noqa: E402
 
+# ----------------------------------------------------------------------------
+# Reference-environment gate — the TA-Lib asymmetry
+# ----------------------------------------------------------------------------
+# The C++ side links libta-lib UNCONDITIONALLY: CMakeLists.txt raises
+# FATAL_ERROR when find_library misses it, and Dockerfile.build asserts the
+# pinned version by interrogating the built library. The REFERENCE has no such
+# gate — features.py wraps its whole TA-Lib block in `except ImportError` and
+# drops to `_numpy_indicators`, which stubs adx/dx/cci/willr/stoch/sar/obv/ad/
+# mfi/plus_di/minus_di/cmo to NaN outright, hand-rolls a non-Wilder RSI with
+# min_periods=1, and emits a MACD with no warmup NaN.
+#
+# So a reference without TA-Lib compares the C++ against DIFFERENT MATH and
+# reports failures that are pure environment. That is exactly what happened on
+# dev105 (2026-08-04): five regimes "failed" — rsi_oversold, rsi_overbought,
+# macd_bullish, macd_bearish, adx_trend — and adx_trend fired 0 times on the
+# reference for the dull reason that `NaN > 25` is False on every bar. The C++
+# was correct throughout; installing TA-Lib 0.6.4 made all 30 masks identical
+# with no source change.
+#
+# Refuse to run instead of grading against a degraded reference. Such a harness
+# is worse than none: it manufactures failures that send the next person to
+# debug correct C++, and it would just as happily bless a WRONG C++ that
+# matched the numpy stubs.
+
+# Set to NaN by features.py `_numpy_indicators`; real numbers on the TA-Lib
+# path. If every one of these is entirely NaN, the reference took the fallback.
+_TALIB_ONLY_COLS = ("stoch_k", "stoch_d", "cci", "adx", "dx", "plus_di",
+                    "minus_di", "willr", "cmo", "sar", "obv", "ad", "mfi")
+
+
+def _pinned_talib_version() -> str:
+    """The version the C++ links, read from its single source of truth."""
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile.build"
+    m = re.search(r"^ARG\s+TALIB_VERSION=(\S+)", dockerfile.read_text(), re.M)
+    if not m:
+        raise SystemExit(
+            f"cannot read ARG TALIB_VERSION from {dockerfile} — refusing to "
+            "guess the pin the C++ was built against")
+    return m.group(1)
+
+
+def require_reference_talib() -> str:
+    """Fail loudly unless the reference will take the TA-Lib path, at the pin.
+
+    Returns the underlying TA-Lib C library version actually in use.
+    """
+    pinned = _pinned_talib_version()
+    try:
+        import talib  # noqa: PLC0415
+    except ImportError as exc:
+        raise SystemExit(
+            "=== BLOCKED: the reference has no TA-Lib — this is NOT a parity "
+            f"result ===\n  ({type(exc).__name__}: {exc})\n"
+            "  features.py would silently fall back to `_numpy_indicators`, "
+            "which stubs\n"
+            "  adx/dx/cci/willr/stoch/sar/obv/ad/mfi to NaN and hand-rolls "
+            "RSI/MACD, so every\n"
+            "  TA-Lib-derived comparison would grade the C++ against different "
+            "math.\n"
+            f"  Production runs TA-Lib {pinned}; install the SAME version, e.g.:\n"
+            "    TA_INCLUDE_PATH=$HOME/.local/include "
+            "TA_LIBRARY_PATH=$HOME/.local/lib \\\n"
+            f"      python3.11 -m pip install --user 'TA-Lib=={pinned}'\n"
+            "  (the C library itself can be copied out of the "
+            "mjolnir-core-build image,\n"
+            "   which pins it; then export "
+            "LD_LIBRARY_PATH=$HOME/.local/lib)") from exc
+
+    # The WRAPPER version is not the thing that computes indicators — the C
+    # library is. talib.__ta_version__ reports the library, so ask that.
+    raw = getattr(talib, "__ta_version__", None)
+    if raw is None:
+        raise SystemExit(
+            "talib exposes no __ta_version__ — cannot confirm the C library "
+            f"matches the pinned {pinned}, and an unverified version is a "
+            "silent parity break, not a rounding difference.")
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    got = raw.split()[0]
+    if got != pinned:
+        raise SystemExit(
+            f"=== BLOCKED: TA-Lib version mismatch — reference {got}, C++ "
+            f"pinned {pinned} ===\n"
+            "  TA-Lib has changed indicator internals across releases, so this "
+            "is a silent\n"
+            "  parity break rather than a rounding difference. Align the "
+            "reference to the pin.")
+    return got
+
+
+def assert_reference_used_talib(panel, where: str) -> None:
+    """Defence in depth: prove the panel actually came from the TA-Lib path.
+
+    ``require_reference_talib`` checks the precondition; this checks the
+    OUTCOME, so a future refactor that reroutes features.py past TA-Lib for
+    some other reason cannot quietly reintroduce the stub panel.
+    """
+    present = [c for c in _TALIB_ONLY_COLS if c in panel.columns]
+    if not present:
+        raise SystemExit(
+            f"=== BLOCKED: {where} has none of the TA-Lib columns "
+            f"{list(_TALIB_ONLY_COLS)} ===\n"
+            "  Nothing TA-Lib-derived could be verified.")
+    if all(panel[c].isna().all() for c in present):
+        raise SystemExit(
+            f"=== BLOCKED: every TA-Lib column in {where} is entirely NaN "
+            "— the reference took `_numpy_indicators` ===\n"
+            "  TA-Lib imports, yet the panel carries its stub signature, so "
+            "the reference is\n"
+            "  NOT the math the C++ implements. Do not read the comparison "
+            "below as parity.")
+
 
 def ref_bars_df(mod, events):
     bldr = mod.LiveBarBuilder(bar_sec=BAR_SEC, target_sec=TARGET_SEC)
@@ -66,6 +178,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
+    ta_ver = require_reference_talib()
+    print(f"[feature_parity] reference TA-Lib {ta_ver}")
+
     events = gen_events(seed=args.seed)
 
     bar_mod = load_reference(Path(args.ref_bar))
@@ -75,6 +190,7 @@ def main() -> int:
     fe = feat_mod.MjolnirFeatures(feature_windows=[30, 60, 300, 900],
                                   bar_tf="5s", target_tf="5s")
     ref = fe.compute(bars)
+    assert_reference_used_talib(ref, "reference panel")
 
     proc = subprocess.run([args.driver, str(BAR_SEC), str(TARGET_SEC)],
                           input="\n".join(events), capture_output=True, text=True)
