@@ -30,6 +30,49 @@ jobs:
           python obfuscation/build_map.py
           python obfuscation/sync_vendor.py
 
+      # TA-Lib is NOT optional for this suite, despite features.py wrapping its
+      # import in `except ImportError`. That fallback (`_numpy_indicators`) stubs
+      # adx/dx/cci/willr/stoch/sar/obv/ad/mfi/plus_di/minus_di/cmo to NaN,
+      # hand-rolls a non-Wilder RSI and emits a MACD with no warmup NaN — so a
+      # CI without TA-Lib does not skip those features, it computes DIFFERENT
+      # MATH and reports failures that are pure environment.
+      #
+      # That is not hypothetical: `3fe8e57` added test_scale_free_levels.py,
+      # whose columns only exist on the TA-Lib path, and CI has been RED on
+      # every push since 2026-08-06 11:40 with "TA-Lib error for BTCUSDT: No
+      # module named 'talib'". Because deploy.yml gates on
+      # `workflow_run.conclusion == 'success'`, Deploy was SKIPPED — never
+      # attempted — for every commit after that, stranding seven of them
+      # undeployed. The C++ side has always linked libta-lib unconditionally
+      # (sentinel_core/CMakeLists.txt raises FATAL_ERROR without it); only the
+      # Python reference was allowed to degrade quietly.
+      #
+      # Version is pinned to the SAME source of truth the C++ builds against —
+      # sentinel_core/Dockerfile.build's `ARG TALIB_VERSION` — and read from
+      # that file rather than duplicated here, so the two cannot drift. The
+      # post-install assert makes a partial build fail here instead of
+      # surfacing as a mysterious numeric mismatch later.
+      - name: Install TA-Lib (C library + python bindings)
+        run: |
+          set -euo pipefail
+          TALIB_VERSION="$(sed -n 's/^ARG TALIB_VERSION=\(.*\)$/\1/p' sentinel_core/Dockerfile.build)"
+          [ -n "$TALIB_VERSION" ] || { echo "ERROR: cannot read ARG TALIB_VERSION from sentinel_core/Dockerfile.build — refusing to guess the pin the C++ was built against"; exit 1; }
+          echo "Building TA-Lib ${TALIB_VERSION} (pin read from Dockerfile.build)"
+          cd /tmp
+          wget -q "https://github.com/TA-Lib/ta-lib/releases/download/v${TALIB_VERSION}/ta-lib-${TALIB_VERSION}-src.tar.gz"
+          tar xzf "ta-lib-${TALIB_VERSION}-src.tar.gz"
+          cd "ta-lib-${TALIB_VERSION}"
+          ./configure --prefix=/usr >/dev/null
+          make -j"$(nproc)" >/dev/null
+          sudo make install
+          sudo ldconfig
+          cd / && rm -rf "/tmp/ta-lib-${TALIB_VERSION}"*
+          pip install TA-Lib
+          # Assert the binding really loaded and links the pinned version. Fail
+          # here, not 500 lines into a numeric diff. Mirrors the same check
+          # Dockerfile.build:35-36 runs against the C++ build.
+          TALIB_VERSION="$TALIB_VERSION" python -c 'import os, talib; v = talib.__ta_version__; v = v.decode() if isinstance(v, bytes) else str(v); want = os.environ["TALIB_VERSION"]; assert want in v, f"FAIL: expected TA-Lib {want}, got {v}"; print(f"TALIB VERSION OK: {v}")'
+
       - name: Install dependencies
         run: |
           pip install pytest pytest-cov pytest-asyncio
