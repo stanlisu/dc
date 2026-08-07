@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 from .features import MjolnirFeatures, _TF_SECONDS
 from .multi_tf_merge import merge_cross_tf_features
 from .regime_filters import apply_filter_mask
-from .ladder import compute_ladder_returns
+from .ladder import compute_ladder_returns, resolve_fill_mode
 
 
 def _obf():
@@ -354,7 +354,7 @@ def stream_filter_parquets(
             # limit_then_taker looks 2h ahead; gate on target cols too.
             if "return" in feats.columns:
                 keep = feats["return"].notna()
-                if str(config.get("LADDER_FILL_MODE", "ladder")).lower() == "limit_then_taker":
+                if resolve_fill_mode(config) == "limit_then_taker":
                     for _tcol in ("return_long", "return_short"):
                         if _tcol in feats.columns:
                             keep &= feats[_tcol].notna()

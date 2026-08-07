@@ -24,7 +24,7 @@ from .aligner import StreamAligner
 from .multi_tf_merge import merge_cross_tf_features
 from .utils import normalize_symbol, get_dates_in_range
 from .regime_filters import apply_filter_mask, rolling_quantile_atoms_from_config
-from .ladder import compute_ladder_returns
+from .ladder import compute_ladder_returns, resolve_fill_mode
 from .streaming import (
     stream_filter_parquets,
     _FILTER_ROW_GROUP_SIZE,
@@ -501,7 +501,7 @@ class MjolnirResearch:
             # the target columns too so NaN targets can never reach training.
             if "return" in feats.columns:
                 keep = feats["return"].notna()
-                if str(self.config.get("LADDER_FILL_MODE", "ladder")).lower() == "limit_then_taker":
+                if resolve_fill_mode(self.config) == "limit_then_taker":
                     for _tcol in ("return_long", "return_short"):
                         if _tcol in feats.columns:
                             keep &= feats[_tcol].notna()

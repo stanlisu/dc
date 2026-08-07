@@ -142,7 +142,9 @@ class TestMjolnirLadderColumns:
                             reason="mjolnir package not installed")
         from agamotto.research_mjolnir import MjolnirResearch  # noqa: F401
 
-        cfg = {"LADDER": 2, "FEE": 2.0}
+        # LADDER_FILL_MODE is a REQUIRED key (no default) — "ladder" is the
+        # value this config silently received before the key became required.
+        cfg = {"LADDER": 2, "FEE": 2.0, "LADDER_FILL_MODE": "ladder"}
         mjolnir = MjolnirResearch.__new__(MjolnirResearch)
         mjolnir.config = cfg
 
@@ -179,7 +181,9 @@ class TestMjolnirLadderVariableHorizon:
 
     def _new_mjolnir(self, ladder=2, fee=0.0):
         from agamotto.research_mjolnir import MjolnirResearch  # noqa: F401
-        cfg = {"LADDER": ladder, "FEE": fee}
+        # LADDER_FILL_MODE is a REQUIRED key (no default) — "ladder" is the
+        # value this config silently received before the key became required.
+        cfg = {"LADDER": ladder, "FEE": fee, "LADDER_FILL_MODE": "ladder"}
         mj = MjolnirResearch.__new__(MjolnirResearch)
         mj.config = cfg
         return mj

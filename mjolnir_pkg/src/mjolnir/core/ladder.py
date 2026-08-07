@@ -14,6 +14,47 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+VALID_FILL_MODES = ("ladder", "flat", "limit_then_taker")
+
+
+def resolve_fill_mode(config: Dict) -> str:
+    """Read the REQUIRED ``LADDER_FILL_MODE`` key. No default.
+
+    Single source of truth for the key. It used to be read as
+    ``config.get("LADDER_FILL_MODE", "ladder")`` at THREE independent
+    sites (``ladder.py``, ``research.py::verticalize``,
+    ``streaming.py::stream_research``); an arm whose ``setting.json``
+    omitted the key therefore got a silently DIFFERENT TARGET from one
+    that set it — ``mjolnir.base.5s_1`` (omitted -> "ladder") vs
+    ``mjolnir.base.30s_1`` ("limit_then_taker") — with nothing in the
+    logs to say so. Magic-value defaults on required numeric/string
+    config are banned by CLAUDE.md's no-silent-fallback rule, so a
+    missing key now raises.
+
+    Args:
+        config: Dictionary loaded from setting.json.
+
+    Returns:
+        The lower-cased fill mode, guaranteed to be in VALID_FILL_MODES.
+
+    Raises:
+        KeyError:   LADDER_FILL_MODE absent from config.
+        ValueError: LADDER_FILL_MODE present but not a known mode.
+    """
+    if "LADDER_FILL_MODE" not in config:
+        raise KeyError(
+            "LADDER_FILL_MODE is required in setting.json and has NO default "
+            f"(VERSION={config.get('VERSION', '<unset>')!r}). It selects the "
+            "target construction, so defaulting it silently changes what the "
+            f"model is trained on. Set it explicitly to one of "
+            f"{VALID_FILL_MODES}.")
+    mode = str(config["LADDER_FILL_MODE"]).lower()
+    if mode not in VALID_FILL_MODES:
+        raise ValueError(
+            "LADDER_FILL_MODE must be 'ladder', 'flat' or 'limit_then_taker', "
+            f"got {mode!r}")
+    return mode
+
 
 def compute_ladder_returns(
     config: Dict,
@@ -139,7 +180,7 @@ def compute_ladder_returns(
     ret_long_px = price_return
     ret_short_px = price_return
 
-    fill_mode = str(config.get("LADDER_FILL_MODE", "ladder")).lower()
+    fill_mode = resolve_fill_mode(config)
     if fill_mode == "flat":
         # Two-way TAKER model — fixed size 1 per bar, filled at the decision
         # (horizon-close) price, no laddered size and no maker rungs. This is
@@ -177,10 +218,9 @@ def compute_ladder_returns(
         # consumer applies the direction.
         ret_long_px = (exit_long / close_safe - 1.0).where(full)
         ret_short_px = (exit_short / close_safe - 1.0).where(full)
-    elif fill_mode != "ladder":
-        raise ValueError(
-            "LADDER_FILL_MODE must be 'ladder', 'flat' or 'limit_then_taker', "
-            f"got {fill_mode!r}")
+    # No trailing `elif fill_mode != "ladder": raise` — resolve_fill_mode()
+    # already rejected anything outside VALID_FILL_MODES, so reaching here
+    # means fill_mode == "ladder" (the close-to-close mark, set above).
 
     fee_cost = (fee_rate * 2.0) if fee_rate else 0.0
     # Targets are UNSIGNED market returns (the trade direction is applied by the
