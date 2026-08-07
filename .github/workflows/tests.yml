@@ -67,10 +67,23 @@ jobs:
           sudo make install
           sudo ldconfig
           cd / && rm -rf "/tmp/ta-lib-${TALIB_VERSION}"*
-          pip install TA-Lib
+          # --no-binary is LOad-BEARING, not a preference. A plain
+          # `pip install TA-Lib` grabs the manylinux wheel, which BUNDLES its own
+          # C library and ignores the one just built into /usr — the first
+          # attempt at this step installed wrapper 0.7.1 carrying TA-Lib 0.7.1
+          # and the source build below it was dead weight. Forcing a source
+          # build makes the wrapper link the system library, i.e. the pinned
+          # version. The wrapper is held to the 0.6 series because a 0.7 wrapper
+          # expects a 0.7 C API.
+          #
+          # 0.6.4 is what PRODUCTION runs — verified 2026-08-07 on both hydra
+          # and shield: `talib.__ta_version__` -> "0.6.4 (Jul 30 2025)". It is
+          # also the sentinel_core pin, so CI, prod and the C++ now agree.
+          pip install --no-binary ta-lib 'TA-Lib>=0.6,<0.7'
           # Assert the binding really loaded and links the pinned version. Fail
           # here, not 500 lines into a numeric diff. Mirrors the same check
-          # Dockerfile.build:35-36 runs against the C++ build.
+          # Dockerfile.build:35-36 runs against the C++ build. This assert has
+          # already earned its keep — it is what caught the bundled-wheel case.
           TALIB_VERSION="$TALIB_VERSION" python -c 'import os, talib; v = talib.__ta_version__; v = v.decode() if isinstance(v, bytes) else str(v); want = os.environ["TALIB_VERSION"]; assert want in v, f"FAIL: expected TA-Lib {want}, got {v}"; print(f"TALIB VERSION OK: {v}")'
 
       - name: Install dependencies
