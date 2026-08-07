@@ -185,6 +185,55 @@ class TestWsBufferPath:
 
         assert inst.raw.index.tz is None
 
+    def test_not_ready_fallback_names_the_missing_symbols(self, caplog):
+        """A REST fallback here costs ~10s inside the decision window and the
+        caller who wired up a buffer believes the cycle is cheap. CLAUDE.md
+        bans the silent version: the log must say WHY and WHICH symbols.
+        """
+        inst = _make_trading_instance()
+        buf = KlineBuffer()
+        buf.initialize("BTCUSDT", "15m",
+                       _make_kline_df("BTCUSDT", "15m", n_bars=100))
+        inst._kline_buffer = buf
+
+        mock_df = _make_kline_df("BTCUSDT", "15m", n_bars=100)
+        with patch("agamotto.trading.fetch_futures_klines") as mock_rest, \
+             patch("agamotto.trading.klines_to_dataframe",
+                   return_value=mock_df), \
+             patch.object(inst, "engineer_features"), \
+             patch.object(inst, "verticalize"), \
+             caplog.at_level("WARNING"):
+            mock_rest.return_value = [[0] * 12]
+            inst._fetch_and_prepare_data(limit=100)
+
+        assert "NOT READY" in caplog.text
+        assert "FALLING BACK TO REST" in caplog.text
+        assert "ETHUSDT" in caplog.text          # the symbol that was absent
+
+    def test_incomplete_read_fallback_names_the_empty_symbols(self, caplog):
+        """``is_ready`` passes (both keys present) but one entry is empty."""
+        inst = _make_trading_instance()
+        buf = KlineBuffer()
+        buf.initialize("BTCUSDT", "15m",
+                       _make_kline_df("BTCUSDT", "15m", n_bars=100))
+        buf.initialize("ETHUSDT", "15m", pd.DataFrame())
+        inst._kline_buffer = buf
+        assert buf.is_ready(["BTCUSDT", "ETHUSDT"], "15m") is True
+
+        mock_df = _make_kline_df("BTCUSDT", "15m", n_bars=100)
+        with patch("agamotto.trading.fetch_futures_klines") as mock_rest, \
+             patch("agamotto.trading.klines_to_dataframe",
+                   return_value=mock_df), \
+             patch.object(inst, "engineer_features"), \
+             patch.object(inst, "verticalize"), \
+             caplog.at_level("WARNING"):
+            mock_rest.return_value = [[0] * 12]
+            inst._fetch_and_prepare_data(limit=100)
+            assert mock_rest.call_count > 0
+
+        assert "INCOMPLETE" in caplog.text
+        assert "ETHUSDT" in caplog.text
+
     def test_feature_tf_reads_correct_tf_from_buffer(self):
         """When FEATURE_TF is set, buffer should be read with that TF."""
         inst = _make_trading_instance(config_overrides={
