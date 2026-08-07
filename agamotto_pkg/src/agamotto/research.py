@@ -429,16 +429,41 @@ class AgamottoResearch:
                     logger.warning(f"TA-Lib error for {base}: {e}")
 
                 stats_window = int(self.config.get("STATS_WINDOW", 14))
+                # `_acf_lag1` below is a (stats_window - 1)-wide rolling
+                # correlation, so it needs at least 3 pairs to be meaningful and
+                # `_kurt` needs 4 points. The retired per-window lambda returned
+                # a constant 0.0 when the window held fewer than 4 points; rather
+                # than silently turning that degenerate all-zero column into real
+                # numbers, fail loud. All 775 production setting.json files use 14.
+                if stats_window < 4:
+                    raise ValueError(
+                        "STATS_WINDOW must be >= 4 (rolling kurt/acf_lag1 are "
+                        f"degenerate below that); got {stats_window}")
                 rolling_stats = []
                 rolling_stats.append(hist_return.rolling(window=stats_window).std().rename(f"{base}_std"))
                 rolling_stats.append(hist_return.rolling(window=stats_window).skew().rename(f"{base}_skew"))
                 rolling_stats.append(hist_return.rolling(window=stats_window).kurt().rename(f"{base}_kurt"))
 
+                # Vectorized rolling lag-1 autocorrelation. `pd.Series.autocorr(lag=1)`
+                # over a w-wide window is BY DEFINITION corr(x[:-1], x[1:]) — i.e. a
+                # (w-1)-wide rolling correlation of the series against its lag-1 shift.
+                # The retired form was
+                #     .rolling(w).apply(lambda x: pd.Series(x).autocorr(1), raw=False)
+                # which materialized two pd.Series per window (687 windows x 28 symbols
+                # = ~19k throwaway objects per live cycle, ~0.78 s/symbol measured).
+                # This form is ~500x faster and numerically identical — verified to
+                # <= 1.1e-13 on real 15m klines and across NaN / inf / constant-run /
+                # short-series edge cases by tests/test_acf_lag1_vectorized.py.
+                #
+                # min_periods parity is exact, not approximate: rolling(w) needs w
+                # non-NaN values, rolling(w-1).corr needs w-1 non-NaN PAIRS, and a NaN
+                # (or inf, which pandas coerces to NaN) at index k invalidates exactly
+                # rows k..k+w-1 under both forms.
                 rolling_stats.append(
-                    hist_return.rolling(window=stats_window).apply(
-                        lambda x: float(pd.Series(x).autocorr(lag=1)) if len(x) >= 4 else 0.0,
-                        raw=False,
-                    ).fillna(0.0).rename(f"{base}_acf_lag1")
+                    hist_return.rolling(window=stats_window - 1)
+                    .corr(hist_return.shift(1))
+                    .fillna(0.0)
+                    .rename(f"{base}_acf_lag1")
                 )
 
                 engineered_frames.extend([

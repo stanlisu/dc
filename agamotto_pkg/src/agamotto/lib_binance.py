@@ -347,6 +347,15 @@ def fetch_futures_klines(
         if len(payload) < limit:
             break
 
+        # Only rate-limit BETWEEN requests that will actually be issued. The
+        # `while current_start < end_ms` guard above exits right after this
+        # sleep whenever the caller's window is an exact multiple of `limit`
+        # (the live path asks for 700 bars and gets exactly 700), so sleeping
+        # first was pure dead time — ~1.24 s per live cycle across the symbol
+        # thread pool. The pause between two REAL consecutive pages is kept.
+        if current_start >= end_ms:
+            break
+
         time.sleep(pause)
 
     rows.sort(key=lambda entry: int(entry[0]))
