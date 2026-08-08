@@ -103,14 +103,24 @@ def test_horizon_2_window(df):
 
 
 def test_ladder_mode_is_close_to_close(df):
-    """Regression guard: 'ladder' == (price_return - fee) * entry_layers."""
+    """Regression guard: 'ladder' == (price_return - fee) * entry_layers.
+
+    Sizing updated 2026-08-08: `1 + clip(floor(adverse/step + 1e-9), 0, LADDER-1)`
+    — the entry rung always fills, and LADDER is the TOTAL rung count. See
+    test_tick_ladder_sizing.py for the executor citations.
+    """
     out = _call(df, "ladder")
     price_return = df["close"].pct_change(1, fill_method=None).shift(-1)
     # entry layers from the next-bar excursion (horizon_bars=1).
     low_next = df["low"].shift(-1)
     high_next = df["high"].shift(-1)
-    n_long = np.floor(((df["close"] - low_next) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
-    n_short = np.floor(((high_next - df["close"]) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
+    max_extra = max(LADDER - 1, 0)
+    n_long = 1 + np.floor(
+        ((df["close"] - low_next) / df["close"]).clip(lower=0) / STEP + 1e-9
+    ).clip(0, max_extra).fillna(0)
+    n_short = 1 + np.floor(
+        ((high_next - df["close"]) / df["close"]).clip(lower=0) / STEP + 1e-9
+    ).clip(0, max_extra).fillna(0)
     exp_long = (price_return - FEE_COST) * n_long
     exp_short = (price_return + FEE_COST) * n_short
     pd.testing.assert_series_equal(
@@ -161,9 +171,24 @@ def test_ladder_non_whole_or_negative_raises(df, bad):
         _call(df, "ladder", ladder=bad)
 
 
-def test_ladder_zero_is_accepted_and_not_collapsed(df):
-    """`LADDER: 0` is a legitimate value (entry rung only -> size 0) and must
-    survive as 0, not be re-read as the old default of 1."""
+def test_ladder_zero_is_entry_rung_only(df):
+    """REVERSED and renamed 2026-08-08 (was
+    `test_ladder_zero_is_accepted_and_not_collapsed`, which asserted the target
+    was 0.0 throughout).
+
+    `LADDER: 0` means no LADDERED rungs — but the entry rung still fills, so the
+    target is the plain close-to-close return at size 1, not 0. Asserting 0
+    modelled a position that never opened. Mirrors the same reversal made for
+    kline in dc `b696288` (`test_laddered_2bar_zero_when_no_ladder`).
+
+    NOTE: LADDER 0 and 1 are now indistinguishable in the target (both give
+    `max_extra = 0` -> size 1), so this no longer discriminates "0 survived" from
+    "0 was re-read as the old default of 1". `test_ladder_missing_raises` is what
+    guards the missing-key path now.
+    """
     out = _call(df, "ladder", ladder=0)
-    assert (out["return_long_raw"].fillna(0.0) == 0.0).all()
-    assert (out["return_short_raw"].fillna(0.0) == 0.0).all()
+    price_return = df["close"].pct_change(1, fill_method=None).shift(-1)
+    pd.testing.assert_series_equal(
+        out["return_long_raw"], price_return.rename("return_long_raw"))
+    pd.testing.assert_series_equal(
+        out["return_short_raw"], price_return.rename("return_short_raw"))

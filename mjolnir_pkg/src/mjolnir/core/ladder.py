@@ -16,6 +16,25 @@ import pandas as pd
 
 VALID_FILL_MODES = ("ladder", "flat", "limit_then_taker")
 
+# Adverse move between rungs, in bps. Was an inline `step_size = 0.0001`; named
+# here so the sizing helper can take it as an argument and be compared against
+# agamotto's, which reads a real LADDER_BPS config key.
+#
+# NOT read from config, deliberately. No tick setting.json declares a top-level
+# LADDER_BPS (checked 2026-08-08 across all 10: the 4 pred_mjolnir.base.* and
+# the 6 pred_stormbreaker.base.*). Only 2 declare it anywhere at all —
+# pred_mjolnir.base.{30s,1m}_1, under EXECUTORS.ltp and EXECUTORS.sumo, both
+# 1.0, i.e. exactly this constant. The other 8 have no LADDER_BPS on any path,
+# so there is nothing to read and `config.get("LADDER_BPS", 1.0)` would be the
+# banned magic-number default (CLAUDE.md "no silent fallbacks").
+#
+# KNOWN GAP: the executor's rung spacing therefore is NOT verified to match the
+# target's for those 8 arms — it is merely undeclared on both sides. Promoting
+# this to a required top-level key across the 10 settings files is a separate
+# change. If a tick arm ever wants non-1bp spacing, thread the value through
+# explicitly and fail fast when it is missing — do NOT default it.
+LADDER_STEP_BPS = 1.0
+
 
 def resolve_fill_mode(config: Dict) -> str:
     """Read the REQUIRED ``LADDER_FILL_MODE`` key. No default.
@@ -77,9 +96,12 @@ def resolve_ladder(config: Dict) -> int:
         the ``or`` unchanged, because the right operand was also ``0`` —
         the idiom was still banned, and still hid the other two cases.)
 
-    ``LADDER`` is the rung cap on the TARGET the model is trained on
-    (:func:`compute_ladder_returns` clips ``low_layers``/``high_layers``
-    to it), so defaulting it silently changes what is being learned.
+    ``LADDER`` is the TOTAL rung count of the TARGET the model is trained
+    on, INCLUDING the entry rung: :func:`compute_ladder_multiplier` returns
+    a size in ``[1, LADDER]``, so ``LADDER`` and ``LADDER - 1`` differ by a
+    whole rung of position and defaulting it silently changes what is being
+    learned. ``LADDER: 0`` and ``LADDER: 1`` both mean "entry rung only"
+    (size == 1) — since 2026-08-08 neither means "no position".
 
     Args:
         config: Dictionary loaded from setting.json.
@@ -109,6 +131,86 @@ def resolve_ladder(config: Dict) -> int:
     if ladder < 0:
         raise ValueError(f"LADDER must be >= 0 rungs, got {ladder}.")
     return ladder
+
+
+def compute_ladder_multiplier(close, adverse_extreme, ladder: int,
+                              step_bps: float) -> pd.Series:
+    """Number of rungs filled, in [1, ladder], for ONE position direction.
+
+    DUPLICATE OF `agamotto_pkg/src/agamotto/ladder.py::compute_ladder_multiplier`
+    (dc `b696288`), WHICH IS THE SOURCE OF TRUTH. Kept byte-equivalent, not
+    imported, because the tick deploy path cannot see agamotto: xmen vendors
+    ONLY `mjolnir_pkg` (`build_distribution.sh:43,76-84`, `XMEN_ALGO="mjolnir"`)
+    and launches with `PYTHONPATH="$XROOT:$XROOT/mjolnir_pkg/src"`
+    (`xmen/launch_xmen_bot.sh:45`) — there is no `agamotto_pkg` in the xmen
+    checkout at all. `mjolnir/trading.py` imports `core.research`, which imports
+    this module (`core/research.py:27`), so a cross-package import here would
+    kill the live bot at boot with ModuleNotFoundError. orb gets away with
+    `from agamotto.ladder import ...` (`orb/research.py:12`) only because marvel
+    deploys all nine packages together.
+
+    `mjolnir_pkg/tests/test_tick_ladder_sizing.py::test_parity_with_agamotto_*`
+    is the guard that keeps the two copies from drifting.
+
+    WHY A BASE RUNG (changed 2026-08-08). The previous mjolnir sizing was
+    `size = floor(adverse / step).clip(0, LADDER)` — "2026-06-20 refinement #1:
+    use n layers, NOT 1 + n — no free base rung". That premise holds only where
+    the entry order needs price to come to it, and nothing in the executor works
+    that way:
+
+      * `knull/ladder.py:170` sets `_level[symbol] = 1` as soon as
+        `filled_qty >= rung_qty` — rung 1 fills at ENTRY, with no adverse move.
+        Only rungs 2..ladder_max need a further `LADDER_BPS` against entry
+        (`:177` advance loop, `:190` `bps_frac`, `:201,208` the triggers).
+      * `knull/execution_style.py:181,193-194` — LadderMakerStyle rests the
+        entry post-only but `should_reprice_entry()` returns True ("Maker
+        chases: _handle_entering runs its idempotent reprice"), so the entry
+        follows the book instead of waiting for a dip.
+      * `knull/execution_style.py:385,401` — TakerStyle sets `ioc_open` True and
+        crosses the touch outright. `_regen_a26/setting.json` has
+        `TRADING_MODE: "Taker"`, so the tick arms measured here fill immediately
+        today, and move to LadderMaker next.
+
+    (marvel/knull and xmen/knull are line-identical for both files, checked
+    2026-08-08 — the tick bot runs the xmen copy.)
+
+    So a signalled bar ALWAYS opens its first rung, and a bar whose adverse
+    excursion was under one step was being labelled as a position that never
+    opened — discarding exactly the bars where the trade was immediately right.
+
+    Args:
+        close: Series of close prices at the signal bar.
+        adverse_extreme: the forward price extreme in the ADVERSE direction —
+            the forward-window low for a long. For a short, mirror it before
+            calling (`2*close - high_window`) so the distance is still measured
+            downward.
+        ladder: TOTAL rung count including the entry rung (setting.json LADDER).
+        step_bps: adverse move between rungs, in bps.
+
+    Returns:
+        Integer Series in [1, ladder], indexed like `close`.
+    """
+    step_size = float(step_bps) * 1e-4
+    # Only ladder-1 rungs are reachable by MOVING; rung 1 fills at entry. LADDER
+    # is the TOTAL rung count (`knull/ladder.py:142` ladder_max = self._LADDER,
+    # with levels running 1..ladder_max inclusive via the `:177` advance loop),
+    # so capping at LADDER here instead would silently redefine LADDER between
+    # the tick and kline algos.
+    # max(...,0) keeps LADDER=0/1 meaning "entry rung only" rather than a
+    # negative clip bound.
+    max_extra = max(int(ladder) - 1, 0)
+    close_s = pd.Series(close).replace(0, np.nan)
+    other = pd.Series(adverse_extreme)
+    # clip(lower=0): a FAVOURABLE excursion fills no extra rung and must never
+    # push the multiplier below the base rung.
+    distance = ((close_s - other) / close_s).clip(lower=0).replace(
+        [np.inf, -np.inf], np.nan)
+    # +1e-9 so an exact k-step excursion counts k rungs despite binary float
+    # representation. Measured: a 2.0bp dip at 1bp steps evaluated to
+    # 1.9999999999999998, so floor() returned 1 rung instead of 2.
+    layers = np.floor(distance / step_size + 1e-9).clip(
+        0, max_extra).fillna(0).astype(int)
+    return pd.Series(1 + layers, index=close_s.index)
 
 
 def compute_ladder_returns(
@@ -154,7 +256,6 @@ def compute_ladder_returns(
         raise ValueError(
             f"horizon_bars must be >= 1, got {horizon_bars}")
 
-    step_size = 0.0001
     ladder = resolve_ladder(config)
     # FEE is required (no fallback): see commit 0500d8fa for rationale.
     # The historical `or 0.0` collapsed any falsy FEE to the default.
@@ -164,10 +265,18 @@ def compute_ladder_returns(
     low_series = df[low_col]
     high_series = df[high_col]
 
-    # Forward h-bar price return: close[t+h] / close[t] - 1.
-    price_return = close.pct_change(
-        horizon_bars, fill_method=None).shift(-horizon_bars)
     close_safe = close.replace(0, np.nan)
+    # Forward h-bar price return: close[t+h] / close[t] - 1, off close_safe so a
+    # ZERO close yields NaN (droppable) rather than +/-inf (which poisons the
+    # target and every fit downstream). Identical to `close` on valid data —
+    # they differ only where close == 0.
+    #
+    # Off raw `close` this was `(x - 0)/0 = inf`. It used to be masked by
+    # accident: close_safe[t] was NaN there, so the old sizing floored to 0 rungs
+    # and `inf * 0` collapsed to NaN. The base rung (2026-08-08) makes size >= 1,
+    # so the inf would now survive into the label. Guard it at the source.
+    price_return = close_safe.pct_change(
+        horizon_bars, fill_method=None).shift(-horizon_bars)
 
     # Forward-rolling min low / max high over (t, t+horizon_bars]:
     # shift(-1) so position t holds low[t+1], then reverse-rolling so
@@ -188,21 +297,21 @@ def compute_ladder_returns(
         .iloc[::-1]
     )
 
-    # Per-1bps fill layers from each side's forward excursion, capped at
-    # LADDER. low_layers = how far price DUG DOWN below cost (long entries /
-    # short exits); high_layers = how far it RALLIED UP above cost (short
-    # entries / long exits).
-    # 2026-06-20 refinement #1: use n layers, NOT 1 + n — no free base rung,
-    # so an excursion of < 1bps fills nothing.
-    distance_long = ((close_safe - low_window) / close_safe).replace(
-        [np.inf, -np.inf], np.nan)
-    low_layers = np.floor(distance_long / step_size).clip(
-        lower=0, upper=ladder).fillna(0).astype(int)
-
-    distance_short = ((high_window - close_safe) / close_safe).replace(
-        [np.inf, -np.inf], np.nan)
-    high_layers = np.floor(distance_short / step_size).clip(
-        lower=0, upper=ladder).fillna(0).astype(int)
+    # Rungs filled on each side's forward ADVERSE excursion, in [1, LADDER].
+    # low_layers = how far price DUG DOWN below cost (long entries); high_layers
+    # = how far it RALLIED UP above cost (short entries).
+    #
+    # 2026-08-08: the base rung is back. "2026-06-20 refinement #1: use n
+    # layers, NOT 1 + n — no free base rung" assumed the entry needs price to
+    # come to it; the executor fills rung 1 on entry unconditionally (Taker
+    # crosses; LadderMaker chases the book). See compute_ladder_multiplier's
+    # docstring for the citations and for why this is a copy of agamotto's.
+    low_layers = compute_ladder_multiplier(
+        close_safe, low_window, ladder, LADDER_STEP_BPS)
+    # Mirror the short's adverse (upward) move about the close so the same
+    # downward-measuring helper serves both legs.
+    high_layers = compute_ladder_multiplier(
+        close_safe, 2.0 * close_safe - high_window, ladder, LADDER_STEP_BPS)
 
     # 2026-06-20 refinement #2 (Stan — mark-to-market exit): size each position
     # by its ENTRY-side penetration and mark the WHOLE opened stack at the
