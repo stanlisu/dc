@@ -327,3 +327,32 @@ hydra now runs the b508934 packages, i.e. WITH 104d740's LADDER fix, which it
 had been missing since the 09:40Z hold.
 Unaffected: hydra's C++ mjolnir shadow (libmjolnir_core.so) ships separately.
 ========================================================================
+
+========================================================================
+2026-08-08 10:48Z  BUILD + DEPLOY  agamotto_pkg -> shield ONLY
+------------------------------------------------------------------------
+What: ./build_distribution.sh agamotto, deploy target 2 (shield).
+      shield:/home/stan/sandbox/marvel/agamotto_pkg/ now carries the
+      2026-08-08T10:48:26 pyarmor build.
+
+Why:  new optional setting.json key WRITE_VERTICAL_FEATURES_CSV gates the
+      unconditional vertical_features.csv write in AgamottoResearch.create().
+      ABSENT = True (back-compat: ~775 existing settings predate the key, and
+      the marvel-explore panel workflows consume the file). Artifact-only —
+      filter parquets are bit-identical either way, covered by
+      agamotto_pkg/tests/test_vertical_features_csv_flag.py (7 tests; full
+      agamotto suite 296 passed / 21 skipped).
+
+Measured: pred_orb.base.15m_1 wrote 4,996,355 rows x 324 cols = 18.9 GB at
+      ~11 MB/s to the NAS mirror = ~26 min of a 9h29m Step 1, read by nothing
+      in the pipeline. The four pred_orb.base.*_1 settings now set it false.
+
+NOT deployed to hydra or shield2 — deliberately. Hydra was running a live bot
+      (run_knull.py --venue ltp, DRY_RUN false) at the time; those two hosts
+      still run the older build, where the key is ignored and the CSV is
+      written as before (no breakage, just no saving).
+
+Pre-flight: shield idle (no run_pipeline / *_research / rolling_predict /
+      run_knull / trade_execution; load 0.15). Post-check: import OK on
+      shield under PYTHONPATH=agamotto_pkg/src:.
+========================================================================

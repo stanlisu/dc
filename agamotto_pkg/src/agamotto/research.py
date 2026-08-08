@@ -572,9 +572,34 @@ class AgamottoResearch:
             
         os.makedirs(out_dir, exist_ok=True)
         
-        if hasattr(self, 'vertical_features') and self.vertical_features is not None:
+        # WRITE_VERTICAL_FEATURES_CSV — genuinely optional, ABSENT MEANS TRUE.
+        #
+        # Not a magic default for a required key (CLAUDE.md): this flag can only
+        # skip an ARTIFACT, never change a computed value — the filter parquets,
+        # the regime masks and every downstream number are bit-identical either
+        # way. Defaulting it False instead would silently break the marvel-explore
+        # panel workflows, whose panel path IS this file (gauntlet's
+        # regime_discover.py defaults to
+        # ~/marvel-explore/<algo>_perwindow_<tf>_<market>/vertical_features.csv),
+        # and every one of the ~775 existing setting.json files predates the key.
+        # Same shape as the optional MAX_ROWS / WORKERS reads in
+        # marvel's gauntlet/regime_ic_rank.py:114-119.
+        #
+        # Why it exists: nothing in the gauntlet pipeline itself reads this file,
+        # and it is expensive. Measured on shield 2026-08-07 for
+        # pred_orb.base.15m_1 — 4,996,355 rows x 324 cols = 18.9 GB at ~11 MB/s to
+        # the NAS-backed local mirror, i.e. ~26 min of a 9h29m Step 1.
+        write_vertical_csv = self.config.get("WRITE_VERTICAL_FEATURES_CSV", True)
+        if (write_vertical_csv
+                and hasattr(self, 'vertical_features')
+                and self.vertical_features is not None):
             v_out_path = os.path.join(out_dir, "vertical_features.csv")
             self.vertical_features.to_csv(v_out_path, index=False)
+        elif not write_vertical_csv:
+            logger.info(
+                "WRITE_VERTICAL_FEATURES_CSV=false — skipping vertical_features.csv "
+                "(filter parquets are unaffected)"
+            )
 
         if "REGIME_STACK_PATH" not in self.config:
             raise ValueError("REGIME_STACK_PATH not set in config — cannot run research without a regime list")
