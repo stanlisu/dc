@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,149 @@ DEFAULT_WINDOWS: List[int] = [30, 60, 300, 900]
 MA_PERIODS = [7, 25, 99]
 # Bar-TF → seconds mapping (used for boundary-aligned target computation)
 _TF_SECONDS: dict = {"5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900}
+# Reverse map, built once. Every value in _TF_SECONDS is distinct, so a measured
+# bar spacing names exactly one TF or none at all (in which case we raise).
+_SECONDS_TO_TF: Dict[int, str] = {v: k for k, v in _TF_SECONDS.items()}
+assert len(_SECONDS_TO_TF) == len(_TF_SECONDS), "_TF_SECONDS values must be distinct"
+
+
+def infer_bar_seconds(index: pd.Index) -> Optional[float]:
+    """Modal spacing of *index*, in SECONDS, or ``None`` when undecidable.
+
+    ``None`` means "too few rows to judge" — the caller must keep looking or
+    raise, never treat it as agreement.
+
+    The MODE, not the mean: zero-trade bars, gaps at the seams between daily
+    parquets and duplicate-dropped rows all drag the mean, while the mode is the
+    grid step itself.
+
+    Duration arithmetic goes through ``Timedelta.total_seconds()`` and NEVER a
+    raw int64 view (``.asi8`` / ``.astype("int64")`` / ``.view("int64")``). Those
+    return the index's OWN unit, which is ``[us]`` for anything that round-trips
+    through parquet — exactly the trap that made ``_window_days`` read 5s bars as
+    0.005s (CLAUDE.md "Duration arithmetic"; dc ``25eb57a``, 2026-08-04). Bar
+    parquets are the very frames that hit this, so it is not hypothetical here.
+    """
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 10:
+        return None
+    deltas = pd.Series(index.sort_values()).diff().dropna()
+    deltas = deltas[deltas > pd.Timedelta(0)]
+    if deltas.empty:
+        return None
+    return float(deltas.mode().iloc[0].total_seconds())
+
+
+def resolve_bar_grid(
+    config: Mapping,
+    symbol_bars: Mapping[str, pd.DataFrame],
+) -> Tuple[str, int]:
+    """``(bar_tf, horizon_bars)`` MEASURED from the bars actually loaded.
+
+    THE ONE derivation. Both ``core/research.py`` sites (``engineer_features``,
+    which hands ``bar_tf`` to :class:`MjolnirFeatures`, and ``verticalize``,
+    which hands ``horizon_bars`` to the ladder) and ``core/streaming.py``'s two
+    equivalents call this and nothing else, so they cannot drift apart.
+
+    WHAT THIS REPLACES. All four sites carried the identical expression::
+
+        bar_tf = "5s" if cfg.get("TRAIN_BARS_DIR") else time_unit
+        horizon_bars = max(1, _TF_SECONDS[time_unit] // _TF_SECONDS[bar_tf])
+
+    ``bar_tf`` was inferred from WHETHER ``TRAIN_BARS_DIR`` was set, never from
+    WHAT IT POINTED AT. Every arm that had one pointed at a ``base.5s_1/bars``
+    directory, so the guess held — but only by convention, and nothing checked
+    it. Point ``TRAIN_BARS_DIR`` at 15s bars and a 1m target still computed
+    ``horizon_bars = 60/5 = 12`` when the truth is ``60/15 = 4``: a 3x wrong
+    forward window on the ladder low/high lookahead AND a 3x wrong
+    ``_bar_seconds`` inside the boundary-aligned target, silently, with no error.
+    That blocks coarser base grids (the cheap way to shrink a 195 GB panel) and
+    is a live correctness hazard for any non-5s base.
+
+    Measurement is the ground truth, so no new config key is required and no
+    ``setting.json`` has to change. ``TRAIN_BARS_DIR`` was only ever a proxy for
+    "the base bars are finer than TIME_UNIT"; the measured spacing subsumes it,
+    which is why the flag is not read here at all.
+
+    ``max(1, ...)`` is gone. It clamped a quantity DERIVED from other config,
+    banned by name in CLAUDE.md with two prior incidents. A ``TIME_UNIT`` finer
+    than the bars is a config error — the target boundary cannot land inside a
+    bar — and became a plausible 1-bar ladder instead of a raise.
+
+    Args:
+        config:      Parsed setting.json. Only ``TIME_UNIT`` is read.
+        symbol_bars: Per-symbol bar frames, DatetimeIndex'd, as ``load()``
+                     produces them.
+
+    Returns:
+        ``(bar_tf, horizon_bars)`` — the measured base-bar TF, and how many of
+        those bars span one ``TIME_UNIT`` target boundary.
+
+    Raises:
+        KeyError:   ``TIME_UNIT`` names a TF outside ``_TF_SECONDS``.
+        ValueError: bars are empty / too short to measure, symbols disagree on
+                    spacing, the spacing is not a known TF, ``TIME_UNIT`` is
+                    finer than the bars, or the ratio is not a whole number.
+    """
+    time_unit = config.get("TIME_UNIT", "5s")
+    if time_unit not in _TF_SECONDS:
+        raise KeyError(
+            f"TIME_UNIT={time_unit!r} is not a known timeframe — known: "
+            f"{sorted(_TF_SECONDS)}"
+        )
+
+    measured = {}
+    for sym, bars in symbol_bars.items():
+        secs = infer_bar_seconds(getattr(bars, "index", None))
+        if secs is not None:
+            measured[sym] = secs
+    if not measured:
+        raise ValueError(
+            "cannot measure base-bar spacing: no loaded symbol had >= 10 bars "
+            f"with a positive time delta (symbols: {sorted(symbol_bars)}). "
+            "Refusing to guess the bar timeframe — every feature window, the "
+            "target boundary and the ladder horizon depend on it."
+        )
+
+    distinct = sorted(set(measured.values()))
+    if len(distinct) > 1:
+        raise ValueError(
+            f"symbols disagree on base-bar spacing: {measured!r}. One "
+            "experiment cannot mix bar grids — the target horizon is a single "
+            "scalar shared by every symbol."
+        )
+
+    bar_seconds = distinct[0]
+    if bar_seconds != int(bar_seconds) or int(bar_seconds) not in _SECONDS_TO_TF:
+        raise ValueError(
+            f"measured base-bar spacing {bar_seconds:g}s is not a known "
+            f"timeframe — known: "
+            f"{[f'{tf}={s}s' for s, tf in sorted(_SECONDS_TO_TF.items())]}. "
+            "These bars were built on a grid mjolnir cannot describe; rebuild "
+            "them with build_bars.py at a supported TIME_UNIT."
+        )
+    bar_tf = _SECONDS_TO_TF[int(bar_seconds)]
+
+    target_seconds = _TF_SECONDS[time_unit]
+    bar_sec = _TF_SECONDS[bar_tf]
+    if target_seconds < bar_sec:
+        raise ValueError(
+            f"TIME_UNIT={time_unit!r} ({target_seconds}s) is FINER than the "
+            f"measured base bars ({bar_tf}, {bar_sec}s): the target boundary "
+            "would fall inside a single bar, so there is no forward window to "
+            "predict. Point TRAIN_BARS_DIR at bars at or below TIME_UNIT, or "
+            "raise TIME_UNIT to at least the bar TF. (This used to floor to a "
+            "1-bar ladder via max(1, ...) and train on a target nothing "
+            "produces.)"
+        )
+    if target_seconds % bar_sec:
+        raise ValueError(
+            f"TIME_UNIT={time_unit!r} ({target_seconds}s) is not a whole "
+            f"multiple of the measured base bars ({bar_tf}, {bar_sec}s): the "
+            "target boundary does not land on a bar close, so the forward "
+            "window would straddle bars. Choose a TIME_UNIT divisible by the "
+            "bar TF."
+        )
+    return bar_tf, int(target_seconds // bar_sec)
 
 
 class MjolnirFeatures:

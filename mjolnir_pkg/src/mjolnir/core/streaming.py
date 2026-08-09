@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
-from .features import MjolnirFeatures, _TF_SECONDS
+from .features import MjolnirFeatures, resolve_bar_grid
 from .multi_tf_merge import merge_cross_tf_features
 from .regime_filters import apply_filter_mask
 from .ladder import compute_ladder_returns, resolve_fill_mode
@@ -208,7 +208,14 @@ def stream_filter_parquets(
     from .research import _DEFAULT_FEATURE_WINDOWS
     feature_windows = list(_DEFAULT_FEATURE_WINDOWS)
     time_unit = cfg.get("TIME_UNIT", "5s")
-    bar_tf = "5s" if cfg.get("TRAIN_BARS_DIR") else time_unit
+    # Same single derivation research.py::engineer_features uses — MEASURED from
+    # the bars, never inferred from whether TRAIN_BARS_DIR is set. Resolved once
+    # here and reused for the ladder below; see features.resolve_bar_grid.
+    bar_tf, horizon_bars = resolve_bar_grid(cfg, symbol_bars)
+    logger.info(
+        "Base bar grid: measured %s bars, TIME_UNIT=%s -> horizon_bars=%d",
+        bar_tf, time_unit, horizon_bars,
+    )
 
     feat_engine = MjolnirFeatures(
         feature_windows=feature_windows,
@@ -337,8 +344,7 @@ def stream_filter_parquets(
             # mode (e.g. mjolnir.base.30s_1 = 5s bars predicting 30s
             # boundary closes) it is TIME_UNIT_seconds /
             # bar_tf_seconds, so a 5s/30s experiment uses horizon=6.
-            horizon_bars = max(
-                1, _TF_SECONDS[time_unit] // _TF_SECONDS[bar_tf])
+            # Resolved once above, alongside bar_tf, from the SAME helper.
             if all(
                 c in feats.columns for c in ("close", "low", "high")
             ):

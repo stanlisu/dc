@@ -18,7 +18,7 @@ import pandas as pd
 import pyarrow as pa  # noqa: F401  -- imported here so missing pyarrow fails at import time
 import pyarrow.parquet as pq
 
-from .features import MjolnirFeatures, _TF_SECONDS
+from .features import MjolnirFeatures, resolve_bar_grid
 from .loader import MjolnirLoader
 from .aligner import StreamAligner
 from .multi_tf_merge import merge_cross_tf_features
@@ -344,10 +344,22 @@ class MjolnirResearch:
             )
         feature_windows = list(_DEFAULT_FEATURE_WINDOWS)
         time_unit = cfg.get("TIME_UNIT", "5s")
-        # bar_tf: the actual resolution of the base bars being loaded.
-        # When TRAIN_BARS_DIR is set, we are loading 5s bars as the training
-        # base regardless of TIME_UNIT (which controls the target boundary).
-        bar_tf = "5s" if cfg.get("TRAIN_BARS_DIR") else time_unit
+        # bar_tf / horizon_bars: MEASURED from the bars load() actually put in
+        # _symbol_bars, never inferred from whether TRAIN_BARS_DIR is set. See
+        # features.resolve_bar_grid for the full rationale — in short, the old
+        # `"5s" if cfg.get("TRAIN_BARS_DIR") else time_unit` read a 15s
+        # TRAIN_BARS_DIR as 5s and gave a 1m target horizon_bars=12 instead of 4.
+        #
+        # Resolved ONCE here and cached for verticalize(), which is the only
+        # other consumer. Two independent copies of this derivation is how the
+        # defect survived; there is now one.
+        bar_tf, horizon_bars = resolve_bar_grid(cfg, self._symbol_bars)
+        self._bar_tf: str = bar_tf
+        self._horizon_bars: int = horizon_bars
+        logger.info(
+            "Base bar grid: measured %s bars, TIME_UNIT=%s -> horizon_bars=%d",
+            bar_tf, time_unit, horizon_bars,
+        )
 
         feat_engine = MjolnirFeatures(
             feature_windows=feature_windows,
@@ -460,13 +472,27 @@ class MjolnirResearch:
         Adds 'symbol' and 'timestamp' columns (timestamp comes from index).
         Drops rows with NaN targets (last target_horizon bars per symbol).
         """
-        if not hasattr(self, "_symbol_features") or not self._symbol_features:
-            raise RuntimeError("Call engineer_features() before verticalize().")
+        # engineer_features() produces BOTH prerequisites: the per-symbol frames
+        # and the measured bar grid (features.resolve_bar_grid), so one guard
+        # covers both.
+        if (not hasattr(self, "_symbol_features") or not self._symbol_features
+                or not hasattr(self, "_horizon_bars")):
+            raise RuntimeError(
+                "Call engineer_features() before verticalize() — it produces "
+                "the per-symbol feature frames AND resolves the measured bar "
+                "grid (bar_tf / horizon_bars) the ladder needs."
+            )
 
         frames = []
         symbols = self.config.get("SYMBOLS", [])
         # Map native -> canonical symbol name
         native_to_sym = {normalize_symbol(s): s for s in symbols}
+
+        # Ladder horizon, resolved ONCE by engineer_features() from the MEASURED
+        # bar spacing and cached. Read it here rather than recomputing: the
+        # second, independent copy of the derivation is exactly what let the
+        # TRAIN_BARS_DIR guess rot unnoticed at this site.
+        horizon_bars = self._horizon_bars
 
         # Pop from _symbol_features to free originals as we go (saves ~50% memory)
         import gc
@@ -486,10 +512,6 @@ class MjolnirResearch:
             # the maker-first executor cannot trade — every signal where
             # price gaps the predicted direction immediately gets credit
             # in research but never fills live.
-            time_unit = self.config.get("TIME_UNIT", "5s")
-            bar_tf = "5s" if self.config.get("TRAIN_BARS_DIR") else time_unit
-            horizon_bars = max(
-                1, _TF_SECONDS[time_unit] // _TF_SECONDS[bar_tf])
             if all(c in feats.columns for c in ("close", "low", "high")):
                 ladder_cols = self._compute_ladder_returns(
                     feats, "close", "low", "high", horizon_bars=horizon_bars)
