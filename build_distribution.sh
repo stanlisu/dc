@@ -152,22 +152,52 @@ build_algo() {
     echo "  Done building $algo."
 }
 
-deploy_algo() {
-    local algo="$1"
-    local host="$2"
-    local build_dir="$BUILD_ROOT/${algo}_pkg"
+# ---- rsync is NOT the deploy. Install + verification are. --------------------
+#
+# For three days (2026-08-06 -> 2026-08-09) every deploy to shield was a silent
+# no-op for 8 of the 9 packages, and nothing said so. The old `deploy_algo`
+# rsynced the fresh build into $REMOTE_BASE/<algo>_pkg/ and printed success, but
+# python imported a FROZEN COPY in site-packages that rsync cannot reach:
+# measured on shield, `mjolnir.core.ladder` resolved to a 2026-08-06 copy
+# while the deployed tree held the 2026-08-08 build. shield2 carried a third
+# version again. It cost a panel rebuild before anyone noticed.
+#
+# The cause was pip argument binding in .github/workflows/deploy.yml:
+#   pip install -e A/ B/ C/ ...   # -e binds ONLY to A/
+# so agamotto was editable (rsync authoritative, always correct) and the other
+# eight were installed as physical copies (rsync irrelevant). The same defect
+# was found and fixed in tests.yml on 2026-08-04; deploy.yml was missed.
+#
+# The fix is editable EVERYWHERE — one copy of the code per host, the rsynced
+# tree, authoritative forever — plus a verification that fails loudly, because
+# the failure mode here is silence: a stale package imports perfectly, so an
+# import smoke-test returns green on exactly the state we need to detect.
+host_python() {
+    # shield's py313 is /opt/miniconda3, not ~/miniconda3 (see README + memory).
+    case "$1" in
+        "$SHIELD_HOST") echo "/opt/miniconda3/envs/py313/bin/python" ;;
+        *)              echo "\$HOME/miniconda3/envs/py313/bin/python" ;;
+    esac
+}
 
-    if [ ! -d "$build_dir" ]; then
-        echo "ERROR: Build dir $build_dir not found for $algo."
-        return 1
+# ONE implementation, shared with .github/workflows/deploy.yml. Having two —
+# CI's (rsync + install) and this script's (rsync only) — is the other half of
+# why the hosts diverged: whichever path you happened to use decided whether
+# the deploy was real.
+DEPLOY_FAILED=""
+deploy_host() {
+    local host="$1"
+    local algos_csv; algos_csv=$(printf '%s,' "${ALGOS[@]}"); algos_csv="${algos_csv%,}"
+    echo ""
+    if bash "$SCRIPT_DIR/scripts/deploy_host.sh" \
+            --host "$host" \
+            --python "$(host_python "$host")" \
+            --algos "$algos_csv" \
+            --remote-base "$REMOTE_BASE"; then
+        return 0
     fi
-
-    echo "  Deploying ${algo}_pkg -> $host..."
-
-    local remote_path="$host:$REMOTE_BASE/${algo}_pkg/"
-    rsync -az --delete "$build_dir/" "$remote_path"
-    echo "    -> $remote_path"
-
+    DEPLOY_FAILED="$DEPLOY_FAILED $host"
+    return 1
 }
 
 # Sync the mjolnir build into the LOCAL xmen clone (git-tracked — see XMEN_LOCAL
@@ -275,22 +305,22 @@ echo ""
 read -p "Choose [1-7]: " choice
 
 deploy_marvel_all() {
-    for algo in "${ALGOS[@]}"; do
-        deploy_algo "$algo" "$HYDRA_HOST"
-        deploy_algo "$algo" "$SHIELD_HOST"
-        deploy_algo "$algo" "$SHIELD2_HOST"
-    done
+    # `|| true` so one failing host does not skip the others under `set -e`;
+    # DEPLOY_FAILED is what makes the script exit non-zero at the end.
+    deploy_host "$HYDRA_HOST"  || true
+    deploy_host "$SHIELD_HOST" || true
+    deploy_host "$SHIELD2_HOST" || true
 }
 
 case "$choice" in
     1)
-        for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$HYDRA_HOST"; done
+        deploy_host "$HYDRA_HOST" || true
         ;;
     2)
-        for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$SHIELD_HOST"; done
+        deploy_host "$SHIELD_HOST" || true
         ;;
     3)
-        for algo in "${ALGOS[@]}"; do deploy_algo "$algo" "$SHIELD2_HOST"; done
+        deploy_host "$SHIELD2_HOST" || true
         ;;
     4)
         deploy_marvel_all
@@ -308,4 +338,12 @@ case "$choice" in
 esac
 
 echo ""
+if [ -n "$DEPLOY_FAILED" ]; then
+    echo "========================================================================"
+    echo "DEPLOY FAILED:$DEPLOY_FAILED"
+    echo "Those hosts are NOT running the build you just made. Do not log this as"
+    echo "delivered, and do not run research or bots against them until fixed."
+    echo "========================================================================"
+    exit 1
+fi
 echo "Done."
