@@ -108,31 +108,48 @@ jobs:
           ssh-keyscan -T 10 -H 192.168.72.135 >> ~/.ssh/known_hosts 2>/dev/null || true
           ssh-keyscan -T 10 -H 3.112.232.77 >> ~/.ssh/known_hosts 2>/dev/null || true
 
+      # ONE deploy implementation for all three hosts.
+      #
+      # Until 2026-08-09 each host ran, inline:
+      #     pip install -e A/ B/ C/ ...
+      # where pip binds `-e` ONLY to the path that immediately follows it. So
+      # agamotto was editable — its .pth points at the rsynced tree, and every
+      # rsync took effect — while the other EIGHT were installed as physical
+      # copies frozen in site-packages, which no later rsync can reach. Measured
+      # on shield 2026-08-09: `mjolnir.core.ladder` imported a 2026-08-06
+      # site-packages copy while the deployed tree held the 2026-08-08 build;
+      # shield2 held a third version again. Every deploy since 2026-08-06 was a
+      # silent no-op for 8 of 9 packages, and the job reported success.
+      #
+      # The identical defect was found and fixed in tests.yml on 2026-08-04
+      # (see its `-e on EVERY package` comment) — deploy.yml was missed, which
+      # is why this is now a shared script instead of three copied lines.
+      #
+      # `scripts/deploy_host.sh` does: pre-flight bot check -> rsync -> editable
+      # install with -e on EVERY path -> verify identity+digest+import on the
+      # host. It exits non-zero if the deployed bytes are not the imported
+      # bytes, so a silent stale deploy fails the job.
       - name: Deploy to Hydra
         run: |
-          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
-          for algo in "${ALGOS[@]}"; do
-            rsync -az --delete "build_dist/${algo}_pkg/" "stan@13.115.134.141:/home/stan/sandbox/marvel/${algo}_pkg/"
-          done
-          ssh stan@13.115.134.141 '~/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+          bash scripts/deploy_host.sh \
+            --host stan@13.115.134.141 \
+            --python '$HOME/miniconda3/envs/py313/bin/python'
 
       - name: Deploy to Shield
         # Shield is a LAN address (192.168.72.135) — unreachable from
         # GitHub-hosted runners. Fail fast + continue so Shield2 still runs;
         # deploy Shield manually via build_distribution.sh until a
-        # self-hosted/VPN runner exists.
+        # self-hosted/VPN runner exists. NOTE: this is why shield had drifted
+        # furthest — CI has never once installed on it.
         continue-on-error: true
         run: |
-          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
-          for algo in "${ALGOS[@]}"; do
-            rsync -az --delete -e "ssh -o ConnectTimeout=15" "build_dist/${algo}_pkg/" "stan@192.168.72.135:/home/stan/sandbox/marvel/${algo}_pkg/"
-          done
-          ssh -o ConnectTimeout=15 stan@192.168.72.135 '/opt/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+          bash scripts/deploy_host.sh \
+            --host stan@192.168.72.135 \
+            --python '/opt/miniconda3/envs/py313/bin/python' \
+            --ssh-opts '-o ConnectTimeout=15'
 
       - name: Deploy to Shield2
         run: |
-          ALGOS=(agamotto orb aether scepter mjolnir stormbreaker vibranium valkyrie vomir)
-          for algo in "${ALGOS[@]}"; do
-            rsync -az --delete "build_dist/${algo}_pkg/" "stan@3.112.232.77:/home/stan/sandbox/marvel/${algo}_pkg/"
-          done
-          ssh stan@3.112.232.77 '~/miniconda3/envs/py313/bin/pip install -e ~/sandbox/marvel/agamotto_pkg/ ~/sandbox/marvel/orb_pkg/ ~/sandbox/marvel/scepter_pkg/ ~/sandbox/marvel/mjolnir_pkg/ ~/sandbox/marvel/vomir_pkg/ ~/sandbox/marvel/vibranium_pkg/ ~/sandbox/marvel/valkyrie_pkg/ ~/sandbox/marvel/aether_pkg/ ~/sandbox/marvel/stormbreaker_pkg/'
+          bash scripts/deploy_host.sh \
+            --host stan@3.112.232.77 \
+            --python '$HOME/miniconda3/envs/py313/bin/python'
