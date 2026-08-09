@@ -48,17 +48,22 @@ import pytest
 
 from agamotto.ladder import compute_ladder_multiplier as agamotto_multiplier
 from mjolnir.core.ladder import (
-    LADDER_STEP_BPS,
     compute_ladder_multiplier,
     compute_ladder_returns,
+    resolve_ladder_bps,
 )
 
-STEP = 0.0001  # 1 bp — LADDER_STEP_BPS * 1e-4
+# The rung spacing every fixture below runs at. Was the module constant
+# `LADDER_STEP_BPS = 1.0`; since 2026-08-09 it is the REQUIRED top-level
+# LADDER_BPS key, so it lives here as fixture data like LADDER and FEE do.
+STEP_BPS = 1.0
+STEP = STEP_BPS * 1e-4  # 1 bp as a fraction
 LADDER = 3
 
 
-def _cfg(ladder=LADDER, fee=0.0, mode="ladder"):
-    return {"LADDER": ladder, "FEE": fee, "LADDER_FILL_MODE": mode}
+def _cfg(ladder=LADDER, fee=0.0, mode="ladder", step_bps=STEP_BPS):
+    return {"LADDER": ladder, "LADDER_BPS": step_bps, "FEE": fee,
+            "LADDER_FILL_MODE": mode}
 
 
 def _frame(close0, close1, low1, high1):
@@ -194,7 +199,7 @@ def test_multiplier_never_leaves_one_to_ladder():
     """Invariant sweep over pathological adverse extremes."""
     close = pd.Series([100.0] * 7)
     adverse = pd.Series([100.0, 99.999, 99.0, 0.0, np.nan, 1e9, -50.0])
-    m = compute_ladder_multiplier(close, adverse, LADDER, LADDER_STEP_BPS)
+    m = compute_ladder_multiplier(close, adverse, LADDER, STEP_BPS)
     assert m.min() >= 1
     assert m.max() <= LADDER
 
@@ -222,8 +227,8 @@ def test_parity_with_agamotto_multiplier_long(ladder):
     df = _random_walk()
     close_safe = df["close"].replace(0, np.nan)
     low_next = df["low"].shift(-1)
-    mine = compute_ladder_multiplier(close_safe, low_next, ladder, LADDER_STEP_BPS)
-    theirs = agamotto_multiplier(close_safe, low_next, ladder, LADDER_STEP_BPS)
+    mine = compute_ladder_multiplier(close_safe, low_next, ladder, STEP_BPS)
+    theirs = agamotto_multiplier(close_safe, low_next, ladder, STEP_BPS)
     assert len(mine) >= 200
     pd.testing.assert_series_equal(mine, theirs)
 
@@ -234,8 +239,8 @@ def test_parity_with_agamotto_multiplier_short(ladder):
     df = _random_walk(seed=23)
     close_safe = df["close"].replace(0, np.nan)
     adverse = 2.0 * close_safe - df["high"].shift(-1)
-    mine = compute_ladder_multiplier(close_safe, adverse, ladder, LADDER_STEP_BPS)
-    theirs = agamotto_multiplier(close_safe, adverse, ladder, LADDER_STEP_BPS)
+    mine = compute_ladder_multiplier(close_safe, adverse, ladder, STEP_BPS)
+    theirs = agamotto_multiplier(close_safe, adverse, ladder, STEP_BPS)
     pd.testing.assert_series_equal(mine, theirs)
 
 
@@ -249,7 +254,7 @@ def test_parity_with_agamotto_full_target_at_horizon_one():
     from agamotto.research import AgamottoResearch
 
     df = _random_walk(seed=5)
-    cfg = {"LADDER": 4, "LADDER_BPS": LADDER_STEP_BPS, "FEE": 1.75,
+    cfg = {"LADDER": 4, "LADDER_BPS": STEP_BPS, "FEE": 1.75,
            "LADDER_FILL_MODE": "ladder"}
     ag = AgamottoResearch.__new__(AgamottoResearch)
     ag.config = cfg
@@ -287,3 +292,124 @@ def test_limit_then_taker_still_overrides_the_exit_price():
     size = 2  # 1.0bp dip -> entry rung + 1
     assert out["return_long_raw"].iloc[0] == pytest.approx(
         (99.95 / 100.00 - 1.0) * size, rel=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# 6. LADDER_BPS is REQUIRED, and must agree with the executor's
+# --------------------------------------------------------------------------- #
+# Was the module constant `LADDER_STEP_BPS = 1.0` while LADDER / FEE /
+# LADDER_FILL_MODE in the same function were already required config reads. The
+# constant left the executor's rung spacing and the target's merely both
+# UNDECLARED rather than verified equal, so an arm running non-1bp spacing would
+# have trained on rungs that never fill — the same shape as the missing base
+# rung fixed in `0744ea0`. CLAUDE.md bans the magic-number default that reading
+# it as `config.get("LADDER_BPS", 1.0)` would have been.
+
+def test_missing_ladder_bps_raises_rather_than_defaulting():
+    cfg = {"LADDER": LADDER, "FEE": 0.0, "LADDER_FILL_MODE": "ladder"}
+    with pytest.raises(KeyError, match="LADDER_BPS is required"):
+        compute_ladder_returns(cfg, _random_walk(), "close", "low", "high")
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
+def test_non_positive_or_non_finite_ladder_bps_raises(bad):
+    """A zero step makes `distance / step_size` infinite, which the clip then
+    renders as "every bar at the rung cap" — an out-of-range result silently
+    made plausible, the failure shape CLAUDE.md's clamp rule exists to stop."""
+    with pytest.raises(ValueError, match="LADDER_BPS"):
+        resolve_ladder_bps(_cfg(step_bps=bad))
+
+
+@pytest.mark.parametrize("bad", [None, "", "1.0", True, [1.0]])
+def test_non_numeric_ladder_bps_raises(bad):
+    with pytest.raises(ValueError, match="LADDER_BPS must be a number"):
+        resolve_ladder_bps(_cfg(step_bps=bad))
+
+
+def test_executors_block_disagreeing_with_top_level_raises():
+    """THE gap this closes. `merge_venue_config` overlays the venue block and
+    the block WINS (`knull/venue_config.py:107-109`), so a per-venue LADDER_BPS
+    that differs from the top-level one IS the live rung spacing — the target
+    would be built at a spacing the executor never fills at."""
+    cfg = _cfg()
+    cfg["EXECUTORS"] = {"ltp": {"LADDER_BPS": 1.0}, "sumo": {"LADDER_BPS": 2.0}}
+    with pytest.raises(ValueError, match=r"EXECUTORS\.sumo\.LADDER_BPS=2\.0"):
+        resolve_ladder_bps(cfg)
+
+
+def test_legacy_executor_block_is_checked_too():
+    """`_select_venue_block` (`knull/venue_config.py:157-158`) falls back to a
+    legacy single-venue `executor` block when EXECUTORS is absent, and
+    pred_mjolnir.base.{5s,15s}_1 carry LADDER_BPS there. Checking only EXECUTORS
+    would pass those two vacuously."""
+    cfg = _cfg()
+    cfg["executor"] = {"EXEC_VENUE": "ltp", "LADDER_BPS": 2.0}
+    with pytest.raises(ValueError, match=r"executor\.LADDER_BPS=2\.0"):
+        resolve_ladder_bps(cfg)
+
+
+def test_agreeing_executor_blocks_pass():
+    cfg = _cfg()
+    cfg["EXECUTORS"] = {"ltp": {"LADDER_BPS": 1.0},
+                        "sumo": {"LADDER_BPS": 1.0, "OKX_ACCOUNT": "x"}}
+    assert resolve_ladder_bps(cfg) == 1.0
+    # A block that simply omits the key inherits the top-level value at merge —
+    # nothing to disagree with, so it must not raise.
+    cfg["EXECUTORS"]["binance"] = {"CAPITAL": 100}
+    assert resolve_ladder_bps(cfg) == 1.0
+
+
+def test_ladder_bps_actually_changes_the_rung_count():
+    """Required is not enough — the value must be HONOURED. At 2bp spacing a
+    1.0bp dip no longer buys a laddered rung, so size falls from 2 to 1."""
+    df = _frame(100.0, 100.02, 99.99, 100.02)
+    out1 = compute_ladder_returns(_cfg(step_bps=1.0), df, "close", "low", "high")
+    out2 = compute_ladder_returns(_cfg(step_bps=2.0), df, "close", "low", "high")
+    pr = df["close"].iloc[1] / df["close"].iloc[0] - 1.0
+    assert out1["return_long_raw"].iloc[0] / pr == 2
+    assert out2["return_long_raw"].iloc[0] / pr == 1
+
+
+@pytest.mark.parametrize("mode", ["ladder", "flat", "limit_then_taker"])
+def test_config_resolved_1bp_reproduces_the_old_hardcoded_target(mode):
+    """THE no-rebuild guard. All 10 tick arms declare LADDER_BPS: 1.0, the same
+    value the deleted `LADDER_STEP_BPS` constant held, so the target column is
+    unchanged and the ~195 GB of cached tick filter parquets stay valid.
+
+    Pins that by rebuilding the target from the multiplier at a LITERAL 1.0 step
+    — the pre-change code path — and requiring the config-driven build to match
+    it bar-for-bar. The `size` term is the ONLY thing the step feeds, so
+    reproducing it at the literal reproduces the whole target.
+    """
+    df = _random_walk(seed=17)
+    ladder, fee_bps = 4, 1.75
+    got = compute_ladder_returns(
+        _cfg(ladder=ladder, fee=fee_bps, mode=mode), df,
+        "close", "low", "high", horizon_bars=1)
+
+    # Pre-change sizing, step as a literal exactly as the constant supplied it.
+    close_safe = df["close"].replace(0, np.nan)
+    low_next, high_next = df["low"].shift(-1), df["high"].shift(-1)
+    size_long = compute_ladder_multiplier(close_safe, low_next, ladder, 1.0)
+    size_short = compute_ladder_multiplier(
+        close_safe, 2.0 * close_safe - high_next, ladder, 1.0)
+    if mode == "flat":
+        size_long = size_short = 1
+    # The fixture is a strictly positive random walk, so no NaN sizes to mask.
+    assert compute_ladder_multiplier(
+        close_safe, low_next, ladder, STEP_BPS).equals(
+            compute_ladder_multiplier(close_safe, low_next, ladder, 1.0))
+
+    price_return = close_safe.pct_change(1, fill_method=None).shift(-1)
+    if mode == "limit_then_taker":
+        # Exit price differs; only the SIZE term is under test here, so recover
+        # it by dividing the target back out where the return is non-zero.
+        nz = got["return_long_raw"].notna() & price_return.ne(0)
+        assert nz.sum() > 100
+    else:
+        pd.testing.assert_series_equal(
+            got["return_long_raw"],
+            (price_return * size_long).rename("return_long_raw"))
+        pd.testing.assert_series_equal(
+            got["return_short_raw"],
+            (price_return * size_short).rename("return_short_raw"))

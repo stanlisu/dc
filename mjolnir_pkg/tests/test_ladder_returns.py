@@ -23,7 +23,8 @@ import pytest
 
 from mjolnir.core.research import MjolnirResearch
 
-STEP = 0.0001  # 1 bp
+STEP_BPS = 1.0     # rung spacing; setting.json LADDER_BPS, required since 2026-08-09
+STEP = STEP_BPS * 1e-4  # 1 bp as a fraction
 FEE = 1.75     # taker bps; fee_cost = FEE/1e4 * 2 = 3.5 bps round trip
 FEE_COST = FEE / 10000.0 * 2.0
 LADDER = 3
@@ -31,7 +32,8 @@ LADDER = 3
 
 def _call(df, mode, horizon_bars=1, ladder=LADDER, fee=FEE):
     fake = types.SimpleNamespace(
-        config={"LADDER": ladder, "FEE": fee, "LADDER_FILL_MODE": mode})
+        config={"LADDER": ladder, "LADDER_BPS": STEP_BPS, "FEE": fee,
+                "LADDER_FILL_MODE": mode})
     return MjolnirResearch._compute_ladder_returns(
         fake, df, "close", "low", "high", horizon_bars=horizon_bars)
 

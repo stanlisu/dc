@@ -16,24 +16,110 @@ import pandas as pd
 
 VALID_FILL_MODES = ("ladder", "flat", "limit_then_taker")
 
-# Adverse move between rungs, in bps. Was an inline `step_size = 0.0001`; named
-# here so the sizing helper can take it as an argument and be compared against
-# agamotto's, which reads a real LADDER_BPS config key.
-#
-# NOT read from config, deliberately. No tick setting.json declares a top-level
-# LADDER_BPS (checked 2026-08-08 across all 10: the 4 pred_mjolnir.base.* and
-# the 6 pred_stormbreaker.base.*). Only 2 declare it anywhere at all —
-# pred_mjolnir.base.{30s,1m}_1, under EXECUTORS.ltp and EXECUTORS.sumo, both
-# 1.0, i.e. exactly this constant. The other 8 have no LADDER_BPS on any path,
-# so there is nothing to read and `config.get("LADDER_BPS", 1.0)` would be the
-# banned magic-number default (CLAUDE.md "no silent fallbacks").
-#
-# KNOWN GAP: the executor's rung spacing therefore is NOT verified to match the
-# target's for those 8 arms — it is merely undeclared on both sides. Promoting
-# this to a required top-level key across the 10 settings files is a separate
-# change. If a tick arm ever wants non-1bp spacing, thread the value through
-# explicitly and fail fast when it is missing — do NOT default it.
-LADDER_STEP_BPS = 1.0
+
+def resolve_ladder_bps(config: Dict) -> float:
+    """Read the REQUIRED top-level ``LADDER_BPS`` key. No default.
+
+    The adverse move between ladder rungs, in bps — the TARGET-side twin of the
+    executor's ``bps_frac = LADDER_BPS * 1e-4`` (``knull/ladder.py:190``). It is
+    the *between-ladder* adverse trigger measured against average cost, NOT the
+    within-ladder rung spacing (which is 1 tick); see
+    ``.claude/memory/reference_ladder_bps_trigger.md``.
+
+    Until 2026-08-08 this was the module constant ``LADDER_STEP_BPS = 1.0``,
+    while ``LADDER``, ``FEE`` and ``LADDER_FILL_MODE`` in the very same function
+    were already required-no-default config reads. The justification was that no
+    tick ``setting.json`` declared the key, so there was nothing to read — true,
+    but it left the executor's rung spacing and the target's merely both
+    UNDECLARED rather than verified equal. An arm running non-1bp spacing would
+    have trained on rungs that never fill, which is structurally the same defect
+    as the missing base rung fixed in ``0744ea0``. All 10 tick arms (4
+    ``pred_mjolnir.base.*_1`` + 6 ``pred_stormbreaker.base.*_1``) now declare
+    ``LADDER_BPS: 1.0`` top-level, so the resolved value is unchanged and the
+    cached filter parquets stay valid.
+
+    WHY TOP-LEVEL, PLUS A CROSS-CHECK. The target is venue-agnostic: research
+    hands this function the RAW ``setting.json`` dict
+    (``core/research.py:714``, ``core/streaming.py:345``) — the per-venue merge
+    happens only at bot boot, in ``knull.venue_config.merge_venue_config``. So
+    there is no venue in scope to read. But top-level alone would not close the
+    gap either, because that merge overlays the venue block and **the block wins
+    on conflict** (``knull/venue_config.py:107-109``): the executor's EFFECTIVE
+    spacing is the venue block's ``LADDER_BPS`` whenever it is present. Hence
+    every declared per-venue value must equal the top-level one. This is
+    stricter than agamotto's ``agamotto/ladder.py::ladder_params``, which only
+    requires the key to exist.
+
+    BOTH executor schemas are checked. ``_select_venue_block``
+    (``knull/venue_config.py:143-162``) resolves the venue block from
+    ``EXECUTORS[venue]`` when that container exists, and otherwise falls back to
+    a legacy single-venue ``executor`` block. 2 of the 4 tick arms that declare
+    ``LADDER_BPS`` at all carry it under the legacy key
+    (``pred_mjolnir.base.{5s,15s}_1``), so checking only ``EXECUTORS`` would
+    pass them vacuously — the exact hole this function exists to close.
+
+    Args:
+        config: Dictionary loaded from setting.json (UNMERGED — top-level plus
+            an optional ``EXECUTORS`` container or legacy ``executor`` block).
+
+    Returns:
+        The rung spacing in bps, guaranteed finite and > 0.
+
+    Raises:
+        KeyError:   LADDER_BPS absent from the top level of config.
+        ValueError: LADDER_BPS is not a finite number, is <= 0, or disagrees
+            with an executor block's ``LADDER_BPS``.
+    """
+    if "LADDER_BPS" not in config:
+        raise KeyError(
+            "LADDER_BPS is required at the TOP LEVEL of setting.json and has NO "
+            f"default (VERSION={config.get('VERSION', '<unset>')!r}). It is the "
+            "adverse move between ladder rungs, in bps, and it sizes the TARGET "
+            "the model is trained on — defaulting it silently trains on rungs "
+            "the executor may never fill. Set it explicitly to the same value "
+            "the executor uses (knull/ladder.py:190).")
+    value = config["LADDER_BPS"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "LADDER_BPS must be a number of bps, got "
+            f"{value!r} of type {type(value).__name__}.")
+    step_bps = float(value)
+    # > 0, not >= 0: a zero step makes `distance / step_size` infinite, which the
+    # clip in compute_ladder_multiplier then turns into "every bar at the rung
+    # cap" — an out-of-range result silently rendered plausible, exactly the
+    # failure shape CLAUDE.md's clamp rule exists to stop. Negative is nonsense
+    # outright (rungs fill on ADVERSE movement).
+    if not np.isfinite(step_bps) or step_bps <= 0:
+        raise ValueError(
+            f"LADDER_BPS must be a finite number of bps > 0, got {step_bps!r}.")
+
+    # Target/executor agreement. Report EVERY offending block in one message —
+    # fixing one and re-running to discover the next wastes a pipeline start.
+    blocks = []
+    executors = config.get("EXECUTORS")
+    if isinstance(executors, dict):
+        blocks = [(f"EXECUTORS.{venue}", blk)
+                  for venue, blk in sorted(executors.items())]
+    elif isinstance(config.get("executor"), dict):
+        # DEPRECATED: drop after 2026-09-01, with knull/venue_config.py's own
+        # legacy branch. Checked, not ignored — it is a live source of the
+        # executor's spacing for pred_mjolnir.base.{5s,15s}_1.
+        blocks = [("executor", config["executor"])]
+
+    offenders = [
+        (label, blk["LADDER_BPS"]) for label, blk in blocks
+        if isinstance(blk, dict) and "LADDER_BPS" in blk
+        and float(blk["LADDER_BPS"]) != step_bps]
+    if offenders:
+        detail = ", ".join(f"{label}.LADDER_BPS={val!r}" for label, val in offenders)
+        raise ValueError(
+            f"LADDER_BPS={step_bps!r} at the top level disagrees with "
+            f"{detail} (VERSION={config.get('VERSION', '<unset>')!r}). The "
+            "executor merge overlays the venue block and the block WINS "
+            "(knull/venue_config.py:107-109), so the live rung spacing "
+            "would differ from the one this target is built at — the model "
+            "would be trained on rungs that never fill. Make them equal.")
+    return step_bps
 
 
 def resolve_fill_mode(config: Dict) -> str:
@@ -224,7 +310,8 @@ def compute_ladder_returns(
     """Compute ladder-adjusted return columns for a single symbol.
 
     Mirrors the agamotto.research.AgamottoResearch.engineer_features ladder
-    logic (same step_size = 1 bps, same clipping, same column names),
+    logic (both read the step from the required LADDER_BPS key, same clipping,
+    same column names),
     generalized to a variable forward horizon so the fill window matches
     the prediction window.
 
@@ -257,6 +344,10 @@ def compute_ladder_returns(
             f"horizon_bars must be >= 1, got {horizon_bars}")
 
     ladder = resolve_ladder(config)
+    # Rung spacing: REQUIRED top-level key, cross-checked against every
+    # EXECUTORS[<venue>] block so the target's rungs are the ones the executor
+    # actually fills. Was the module constant LADDER_STEP_BPS = 1.0.
+    step_bps = resolve_ladder_bps(config)
     # FEE is required (no fallback): see commit 0500d8fa for rationale.
     # The historical `or 0.0` collapsed any falsy FEE to the default.
     fee_rate = float(config["FEE"]) / 10000.0
@@ -307,11 +398,11 @@ def compute_ladder_returns(
     # crosses; LadderMaker chases the book). See compute_ladder_multiplier's
     # docstring for the citations and for why this is a copy of agamotto's.
     low_layers = compute_ladder_multiplier(
-        close_safe, low_window, ladder, LADDER_STEP_BPS)
+        close_safe, low_window, ladder, step_bps)
     # Mirror the short's adverse (upward) move about the close so the same
     # downward-measuring helper serves both legs.
     high_layers = compute_ladder_multiplier(
-        close_safe, 2.0 * close_safe - high_window, ladder, LADDER_STEP_BPS)
+        close_safe, 2.0 * close_safe - high_window, ladder, step_bps)
 
     # 2026-06-20 refinement #2 (Stan — mark-to-market exit): size each position
     # by its ENTRY-side penetration and mark the WHOLE opened stack at the
