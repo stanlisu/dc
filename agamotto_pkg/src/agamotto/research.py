@@ -36,6 +36,7 @@ except ImportError:
 
 from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
 from .ladder import compute_ladder_multiplier, ladder_params
+from .mm_target import TARGET_MODE_MM, compute_mm_target, target_mode
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
 # Import filter definitions and evaluation logic from sub-module
@@ -214,6 +215,16 @@ class AgamottoResearch:
             DataFrame with return_long, return_short, return_long_raw,
             return_short_raw — indexed like `df`.
         """
+        # TARGET_MODE='mm' prices what knull's MarketMaker actually earns — a
+        # post-only entry ladder, a resting close at avg_cost +/- MM_PROFIT_AIM,
+        # and a crossing exit when the passive rung does not fill in time —
+        # instead of a close-to-close return scaled by rung count. 15m only; see
+        # agamotto/mm_target.py. Absent TARGET_MODE keeps the ladder target, so
+        # every pre-existing arm is untouched.
+        if target_mode(self.config) == TARGET_MODE_MM:
+            return compute_mm_target(df, close_col, low_col, high_col,
+                                     self.config)
+
         ladder_long, ladder_short, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
 
@@ -251,6 +262,10 @@ class AgamottoResearch:
         ladder_long, ladder_short, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
         dual_horizon = bool(self.config.get("DUAL_HORIZON"))
+        # Resolved ONCE, not per symbol: this and `_compute_ladder_returns` are
+        # two copies of the same arithmetic, and the design's whole reason for a
+        # shared module is to stop them diverging. Both must switch together.
+        mm_mode = target_mode(self.config) == TARGET_MODE_MM
 
         for col in df.columns:
             if col.endswith("_close"):
@@ -297,15 +312,33 @@ class AgamottoResearch:
                 size_short = compute_ladder_multiplier(
                     close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
-                fee_cost = fee_rate * 2.0
-                long_per_layer_return = price_return - fee_cost
-                price_return_long = (long_per_layer_return * size_long).rename(f"{base}_return_long")
+                if mm_mode:
+                    # Same four names, MM economics. The fee is absorbed per
+                    # branch inside the target (taker pays MM_TAKER_FEE_BPS,
+                    # maker pays nothing), so there is no separate fee-adjusted
+                    # variant — `return_long` IS `return_long_raw` here.
+                    mm_cols = compute_mm_target(
+                        pd.DataFrame({"close": close, "low": low_series,
+                                      "high": high_series}),
+                        "close", "low", "high", self.config)
+                    price_return_long = mm_cols["return_long"].rename(
+                        f"{base}_return_long")
+                    price_return_short = mm_cols["return_short"].rename(
+                        f"{base}_return_short")
+                    price_return_long_raw = mm_cols["return_long_raw"].rename(
+                        f"{base}_return_long_raw")
+                    price_return_short_raw = mm_cols["return_short_raw"].rename(
+                        f"{base}_return_short_raw")
+                else:
+                    fee_cost = fee_rate * 2.0
+                    long_per_layer_return = price_return - fee_cost
+                    price_return_long = (long_per_layer_return * size_long).rename(f"{base}_return_long")
 
-                short_raw_per_layer = price_return + fee_cost
-                price_return_short = (short_raw_per_layer * size_short).rename(f"{base}_return_short")
+                    short_raw_per_layer = price_return + fee_cost
+                    price_return_short = (short_raw_per_layer * size_short).rename(f"{base}_return_short")
 
-                price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
-                price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
+                    price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
+                    price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
 
                 if dual_horizon:
                     price_return_2bar = (close.shift(-2) / close_safe - 1)
