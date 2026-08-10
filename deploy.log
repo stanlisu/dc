@@ -356,3 +356,5 @@ Pre-flight: shield idle (no run_pipeline / *_research / rolling_predict /
       run_knull / trade_execution; load 0.15). Post-check: import OK on
       shield under PYTHONPATH=agamotto_pkg/src:.
 ========================================================================
+2026-08-09T12:56:46Z  deploy all 9 algos -> hydra shield shield2  (via scripts/sync_all_repos.sh --dc-deploy)
+2026-08-10T14:31:37Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(1 bots)  failed: none
