@@ -1,25 +1,26 @@
-"""MM-realistic target (Phase B of the 2026-08-10 MM design).
+"""Minute-resolved MM target (2026-08-10 revision of the Phase B design).
+
+WHY THIS MODEL EXISTS. The first cut resolved the MarketMaker lifecycle from 15m bars and
+implied **-28.8% of capital per day** against a live book that made money. Two lines caused
+it: the maker window started at offset 2 (discarding bar T+1, where the ladder actually fills
+and where a bounce to +1bp is most likely), and the taker exit was marked at T+2's close, up
+to a full bar after the crossing really fires. `PASSIVE_SEC 600 + CROSSING_SEC 300 = 900 s` is
+exactly one 15m bar, so the whole lifecycle lives inside T+1 and needs sub-bar data.
 
 The guarantees, and why each exists:
 
-  1. DEGENERATE EQUIVALENCE. LADDER=1, patience=0, taker fee 0 must reproduce the
-     close-to-close ladder target EXACTLY. This is the bridge to the behaviour
-     every existing kline result was produced under, and the strongest single
-     test that the new arithmetic did not drift.
-  2. NO LOOKAHEAD. Maker credit never uses an extreme from the entry bar T+1.
-     A bar whose T+1 high clears exit_px AND whose T+1 low fills the whole ladder
-     must still resolve TAKER — otherwise the target assumes low-before-high and
-     manufactures the free lunch the design's "Why 15m only" section warns about.
-  3. SIGN CONVENTION. The target is in PRICE-RETURN space, not PnL space: the PnL
-     engine multiplies a short leg by -1 itself. Getting this backwards inverts
-     the whole short book silently, which is why it is pinned rather than
-     commented.
-  4. CENSUS PARITY. dc ships standalone and cannot import marvel's
-     `gauntlet/mm_fill_census.py`, so the two implementations of the same fill
-     economics are held together by golden values computed by hand here.
-  5. FEE ABSORPTION. The target is already net; a non-zero FEE would double
-     charge at seven downstream sites, so it must raise.
-  6. Branch exclusivity, size bounds, and the short-leg mirror.
+  1. DEGENERATE EQUIVALENCE. LADDER=1, an unreachable aim and a zero taker fee must reproduce
+     the close-to-close target EXACTLY. That is the bridge to every existing kline result.
+  2. NO INTRA-MINUTE LOOKAHEAD. The exit resting during minute j is priced off fills up to
+     j-1. A minute that both fills rungs and prints through the exit must not bank the
+     post-dip size — that would assume low-before-high.
+  3. SIZE AT A MAKER EXIT IS n(j-1), NOT THE FINAL COUNT. Once the reduce-only close fills the
+     position is flat and the remaining entry rungs are cancelled. Using the final size banks
+     the aim on rungs never held, and erases the asymmetry that defines the mode.
+  4. SIGN CONVENTION. Price-return space, not PnL space — the engine applies the position
+     sign itself. Getting it backwards inverts the short book silently.
+  5. FEE ABSORPTION and required knobs.
+  6. INCOMPLETE MINUTE COVERAGE resolves to NaN, never a guess.
 """
 import numpy as np
 import pandas as pd
@@ -28,15 +29,16 @@ import pytest
 from agamotto.mm_target import (
     TARGET_MODE_LADDER,
     TARGET_MODE_MM,
-    bar_seconds,
     compute_mm_target,
-    expiry_offset,
+    minute_matrices,
     mm_params,
+    patience_minutes,
     resolve_leg,
     target_mode,
 )
 
-BAR_SEC = 900  # 15m
+BARS_PER_15M = 15
+START = "2025-01-01 00:00"
 
 
 def _cfg(**over):
@@ -49,158 +51,241 @@ def _cfg(**over):
         "MM_PROFIT_AIM": 1.0,
         "MM_PATIENCE_SEC": 900.0,
         "MM_TAKER_FEE_BPS": 1.75,
+        "TARGET_MODE": "mm",
     }
     cfg.update(over)
     return cfg
 
 
-def _bars(close, low, high):
-    idx = pd.date_range("2025-01-01", periods=len(close), freq="15min")
-    return pd.DataFrame({"close": close, "low": low, "high": high}, index=idx)
+def _one_bar(minutes, close_t=100.0):
+    """One 15m signal bar at `close_t`, with `minutes` = list of (high, low, close) for T+1.
 
-
-# --------------------------------------------------------------------------
-# 4. Census parity — golden values computed by hand from the design's formulas
-# --------------------------------------------------------------------------
-
-def test_maker_branch_golden_value():
-    """Row 0: a 1bp dip fills rung 2, and T+2's high clears the 1bp aim.
-
-    dip   = (100 - 99.99)/100 = 1.0 bp -> n = 1 -> size = 2
-    vwap  = 100 - 100*(1/2)*1bp        = 99.995
-    exit  = 99.995 * (1 + 1bp)         = 100.0049995
-    T+2 high = 100.05 >= exit          -> MAKER
-    pnl   = size * aim                 = 2 * 1e-4
+    The 15m bar opens at START and closes at START+15m; its T+1 minutes are START+15m
+    onwards, which is exactly what `minute_matrices` reaches for.
     """
-    bars = _bars(close=[100.0, 100.0, 100.02, 100.0, 100.0],
-                 low=[100.0, 99.99, 100.0, 100.0, 100.0],
-                 high=[100.0, 100.0, 100.05, 100.0, 100.0])
-    out = compute_mm_target(bars, "close", "low", "high", _cfg())
-    assert out["return_long_raw"].iloc[0] == pytest.approx(2e-4, rel=1e-12)
+    sig_idx = pd.DatetimeIndex([pd.Timestamp(START)])
+    df15 = pd.DataFrame({"close": [close_t], "high": [close_t], "low": [close_t]},
+                        index=sig_idx)
+    # Two signal bars' worth of minutes so bar spacing is inferrable; only T+1 is read.
+    m_idx = pd.date_range(pd.Timestamp(START) + pd.Timedelta(minutes=15),
+                          periods=len(minutes), freq="1min")
+    minute = pd.DataFrame(minutes, columns=["high", "low", "close"], index=m_idx)
+    return df15, minute
 
 
-def test_taker_branch_golden_value():
-    """Row 1: no dip -> size 1; T+2's high misses the aim -> taker at close.
-
-    size = 1, vwap = 100, exit = 100.01, T+2 high = 100 -> TAKER
-    close_exit = close[3] = 100 -> delta = 0
-    pnl = 1 * (0 - 1.75bp) = -1.75e-4
-    """
-    bars = _bars(close=[100.0, 100.0, 100.02, 100.0, 100.0],
-                 low=[100.0, 99.99, 100.0, 100.0, 100.0],
-                 high=[100.0, 100.0, 100.05, 100.0, 100.0])
-    out = compute_mm_target(bars, "close", "low", "high", _cfg())
-    assert out["return_long_raw"].iloc[1] == pytest.approx(-1.75e-4, rel=1e-12)
+def _resolve_one(minutes, *, leg="long", ladder=2, ladder_bps=1.0, aim_bps=1.0,
+                 taker_fee_bps=1.75, close_t=100.0):
+    """Resolve a single constructed bar and return its one-row result."""
+    df15, minute = _one_bar(minutes, close_t=close_t)
+    high_m, low_m, close_m = minute_matrices(df15.index, minute, len(minutes), 900.0)
+    return resolve_leg(df15["close"], high_m, low_m, close_m, leg=leg, ladder=ladder,
+                       ladder_bps=ladder_bps, aim_bps=aim_bps,
+                       taker_fee_bps=taker_fee_bps).iloc[0]
 
 
-def test_expiry_offset_matches_census():
-    """900s patience on a 900s bar -> expiry at T+2, one maker-window bar.
-
-    300s -> expiry at T+1 -> the window is EMPTY and every row is taker, which
-    is what put 40 of the census's 120 cells at p=0.
-    """
-    assert expiry_offset(900, BAR_SEC) == 2
-    assert expiry_offset(300, BAR_SEC) == 1
-    assert expiry_offset(1800, BAR_SEC) == 3
-
-
-def test_patience_shorter_than_a_bar_is_all_taker():
-    bars = _bars(close=[100.0] * 6, low=[100.0] * 6, high=[101.0] * 6)
-    res = resolve_leg(bars["close"], bars["low"].shift(-1),
-                      bars["high"].shift(-1), bars.index, leg="long", ladder=2,
-                      ladder_bps=1.0, aim_bps=1.0, patience_sec=300.0,
-                      taker_fee_bps=1.75)
-    assert not res["is_maker"].dropna().any()
+def _flat(n, px=100.0):
+    return [(px, px, px)] * n
 
 
 # --------------------------------------------------------------------------
-# 1. Degenerate equivalence with the close-to-close ladder target
+# Golden values — hand-computed from the design's formulas
 # --------------------------------------------------------------------------
+
+def test_maker_on_base_rung_only():
+    """No dip: size 1, exit at 100*(1+1bp)=100.01, cleared by minute 1's high.
+
+    pnl = size * aim = 1 * 1e-4
+    """
+    minutes = _flat(15)
+    minutes[1] = (100.02, 100.0, 100.0)          # high clears 100.01
+    r = _resolve_one(minutes)
+    assert bool(r["is_maker"]) is True
+    assert r["size"] == 1
+    assert r["pnl"] == pytest.approx(1e-4, rel=1e-12)
+
+
+def test_maker_after_a_rung_fills():
+    """m0 dips to 99.985 -> rung 1 fills (99.99), VWAP 99.995, exit 100.0049995.
+
+    m1's high of 100.01 clears it. size = n(0) = 2 -> pnl = 2 * 1e-4.
+    """
+    minutes = _flat(15)
+    minutes[0] = (100.0, 99.985, 99.99)
+    minutes[1] = (100.01, 99.99, 100.0)
+    r = _resolve_one(minutes)
+    assert bool(r["is_maker"]) is True
+    assert r["size"] == 2
+    assert r["avg_cost"] == pytest.approx(99.995, rel=1e-12)
+    assert r["pnl"] == pytest.approx(2e-4, rel=1e-12)
+
+
+def test_taker_when_the_aim_is_never_reached():
+    """Flat book: exit 100.01 never printed -> cross at the last minute's close.
+
+    pnl = 1 * ((100 - 100)/100 - 1.75bp) = -1.75e-4
+    """
+    r = _resolve_one(_flat(15))
+    assert bool(r["is_maker"]) is False
+    assert r["pnl"] == pytest.approx(-1.75e-4, rel=1e-12)
+
+
+def test_taker_marks_at_the_last_minute_close_not_a_later_bar():
+    """The crossing fires at the END of T+1. Marking at T+2 was the old defect."""
+    minutes = _flat(15)
+    minutes[14] = (100.0, 100.0, 99.50)          # -50 bp at the expiry minute
+    r = _resolve_one(minutes)
+    assert bool(r["is_maker"]) is False
+    expected = 1 * ((99.50 - 100.0) / 100.0 - 1.75e-4)
+    assert r["pnl"] == pytest.approx(expected, rel=1e-12)
+
+
+# --------------------------------------------------------------------------
+# The two rules that make this model different from the 15m one
+# --------------------------------------------------------------------------
+
+def test_size_at_maker_exit_is_the_count_before_the_fill():
+    """Rung 2 fills at m3, exit clears at m5, a deeper dip arrives at m9.
+
+    The deeper dip must NOT count: the position was already flat. Final count would be 3.
+    """
+    minutes = _flat(15)
+    minutes[3] = (100.0, 99.985, 99.99)          # fills rung 1 (99.99), not rung 2 (99.98)
+    minutes[5] = (100.01, 99.99, 100.0)          # clears exit 100.0049995
+    minutes[9] = (100.0, 99.975, 99.98)          # would fill rung 2 -- too late
+    r = _resolve_one(minutes, ladder=3)
+    assert bool(r["is_maker"]) is True
+    assert r["size"] == 2, "used the final rung count instead of the count at the exit"
+    assert r["pnl"] == pytest.approx(2e-4, rel=1e-12)
+
+
+def test_no_intra_minute_lookahead_on_the_fill_minute():
+    """A minute that both fills the whole ladder and prints far through the exit.
+
+    The exit resting during that minute was priced off the PREVIOUS minute's fills, so the
+    size banked is 1 -- not the 3 the dip would have produced. Crediting 3 would assume
+    low-before-high inside the minute.
+    """
+    minutes = _flat(15)
+    minutes[1] = (105.0, 99.97, 100.0)           # fills rungs 2 and 3 AND clears any exit
+    r = _resolve_one(minutes, ladder=3)
+    assert bool(r["is_maker"]) is True
+    assert r["size"] == 1
+    assert r["pnl"] == pytest.approx(1e-4, rel=1e-12)
+
+
+def test_ladder_fills_in_minute_order():
+    """Rungs are unfilled until the minute their price is reached."""
+    minutes = _flat(15)
+    minutes[7] = (100.0, 99.975, 99.98)          # reaches rung 1 and rung 2
+    minutes[8] = (100.01, 99.98, 100.0)          # clears the 3-rung exit
+    r = _resolve_one(minutes, ladder=3)
+    assert bool(r["is_maker"]) is True
+    assert r["size"] == 3
+    assert r["avg_cost"] == pytest.approx(100.0 * (1 - 1e-4), rel=1e-12)
+
+
+# --------------------------------------------------------------------------
+# Degenerate equivalence with the close-to-close target
+# --------------------------------------------------------------------------
+
+def _synthetic(n_bars, seed):
+    """A minute series plus the 15m bars aggregated FROM it, so they cannot disagree."""
+    n_min = (n_bars + 1) * BARS_PER_15M
+    rng = np.random.default_rng(seed)
+    m_idx = pd.date_range(START, periods=n_min, freq="1min")
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0, 2e-4, n_min)))
+    minute = pd.DataFrame({
+        "high": close * (1 + np.abs(rng.normal(0, 1e-4, n_min))),
+        "low": close * (1 - np.abs(rng.normal(0, 1e-4, n_min))),
+        "close": close,
+    }, index=m_idx)
+    sig_idx = m_idx[::BARS_PER_15M][:n_bars]
+    # A 15m bar closes at the close of its LAST minute.
+    c15 = close[BARS_PER_15M - 1::BARS_PER_15M][:n_bars]
+    df15 = pd.DataFrame({"close": c15, "high": c15, "low": c15}, index=sig_idx)
+    return df15, minute
+
 
 def test_degenerate_reproduces_close_to_close_target():
-    """LADDER=1, patience=0, fee=0 -> exactly `price_return`, both legs.
+    """LADDER=1, unreachable aim, zero taker fee -> exactly the next-bar return.
 
-    With one rung the VWAP is the close and size is 1; with no patience the
-    maker window is empty, so every row prices at the next close. That is
-    precisely `close.pct_change().shift(-1)` — the current target with size 1.
+    With one rung the VWAP is the close and size is 1; with an unreachable aim every bar
+    resolves taker at the close of T+1, which IS `close.pct_change().shift(-1)`.
     """
-    rng = np.random.default_rng(0)
-    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.001, 300)))
-    bars = _bars(close=close, low=close * 0.999, high=close * 1.001)
-    cfg = _cfg(LADDER_LONG=1, LADDER_SHORT=1, MM_PATIENCE_SEC=0.0,
-               MM_TAKER_FEE_BPS=0.0)
+    df15, minute = _synthetic(200, seed=0)
+    cfg = _cfg(LADDER_LONG=1, LADDER_SHORT=1, MM_PROFIT_AIM=1e6, MM_TAKER_FEE_BPS=0.0)
+    out = compute_mm_target(df15, "close", "low", "high", cfg, minute_bars=minute)
 
-    out = compute_mm_target(bars, "close", "low", "high", cfg)
-    expected = bars["close"].pct_change(fill_method=None).shift(-1)
-
-    # The MM row prices at T+1's close when patience is 0, so it is defined one
-    # bar further back than the plain shift; compare where both exist.
+    expected = df15["close"].pct_change(fill_method=None).shift(-1)
     both = out["return_long_raw"].notna() & expected.notna()
-    assert both.sum() > 250
-    # atol at one ULP of the intermediate: `pct_change` computes
-    # `diff()/shift()` while this module computes `(exit - vwap)/vwap`. Those are
-    # algebraically identical and round differently — measured max absolute
-    # difference 1.1e-16 on values of ~1e-5, i.e. one ULP of a ~100-magnitude
-    # price divided by 100. Anything larger is real drift, so the bound is tight,
-    # not permissive.
-    np.testing.assert_allclose(out["return_long_raw"][both],
-                               expected[both], rtol=1e-9, atol=1e-15)
-    # The short column is in price-return space too, so it matches unnegated —
-    # exactly like the existing `return_short_raw = price_return * size_short`.
-    np.testing.assert_allclose(out["return_short_raw"][both],
-                               expected[both], rtol=1e-9, atol=1e-15)
+    assert both.sum() > 190
+    # atol at one ULP of the intermediate: pct_change is diff()/shift() while this module
+    # computes (exit - vwap)/vwap -- algebraically identical, different rounding.
+    np.testing.assert_allclose(out["return_long_raw"][both], expected[both],
+                               rtol=1e-9, atol=1e-15)
+    # Short is in price-return space too, so it matches UNNEGATED, exactly like the existing
+    # return_short_raw = price_return * size_short.
+    np.testing.assert_allclose(out["return_short_raw"][both], expected[both],
+                               rtol=1e-9, atol=1e-15)
 
 
 # --------------------------------------------------------------------------
-# 2. No lookahead
-# --------------------------------------------------------------------------
-
-def test_entry_bar_extreme_never_grants_maker_credit():
-    """T+1 clears the aim and fills the ladder; T+2 does not. Must be TAKER.
-
-    This is the free lunch the design refuses to buy: crediting T+1's high would
-    assume low-before-high within the entry bar.
-    """
-    bars = _bars(
-        close=[100.0, 100.0, 100.0, 100.0],
-        low=[100.0, 99.90, 100.0, 100.0],     # T+1 low fills the whole ladder
-        high=[100.0, 105.0, 100.0, 100.0],    # T+1 high clears any aim
-    )
-    res = resolve_leg(bars["close"], bars["low"].shift(-1),
-                      bars["high"].shift(-1), bars.index, leg="long", ladder=2,
-                      ladder_bps=1.0, aim_bps=1.0, patience_sec=900.0,
-                      taker_fee_bps=1.75)
-    assert res["is_maker"].iloc[0] == False  # noqa: E712 — NaN-safe compare
-
-
-# --------------------------------------------------------------------------
-# 3. Sign convention
+# Sign convention, mirroring, coverage
 # --------------------------------------------------------------------------
 
 def test_short_column_is_negated_true_pnl():
-    """`return_short_raw` must be -(true short PnL).
-
-    The canonical engine does `rets = ret_col * (-1)` for a short leg
-    (evaluate_regimes.py:196-197). Emitting true short PnL here would flip it a
-    second time and invert the short book.
-    """
-    bars = _bars(close=[100.0, 100.0, 99.98, 100.0, 100.0],
-                 low=[100.0, 99.95, 100.0, 100.0, 100.0],
-                 high=[100.0, 100.01, 100.0, 100.0, 100.0])
+    df15, minute = _synthetic(80, seed=3)
     cfg = _cfg()
-    out = compute_mm_target(bars, "close", "low", "high", cfg)
-    short_true = resolve_leg(bars["close"], bars["low"].shift(-1),
-                             bars["high"].shift(-1), bars.index, leg="short",
-                             ladder=2, ladder_bps=1.0, aim_bps=1.0,
-                             patience_sec=900.0, taker_fee_bps=1.75)["pnl"]
+    out = compute_mm_target(df15, "close", "low", "high", cfg, minute_bars=minute)
+    high_m, low_m, close_m = minute_matrices(df15.index, minute, BARS_PER_15M, 900.0)
+    short_true = resolve_leg(df15["close"], high_m, low_m, close_m, leg="short", ladder=2,
+                             ladder_bps=1.0, aim_bps=1.0, taker_fee_bps=1.75)["pnl"]
     both = out["return_short_raw"].notna() & short_true.notna()
     assert both.sum() > 0
-    np.testing.assert_allclose(out["return_short_raw"][both],
-                               -short_true[both], rtol=1e-12)
+    np.testing.assert_allclose(out["return_short_raw"][both], -short_true[both], rtol=1e-12)
+
+
+def test_short_leg_mirrors_the_long_leg():
+    """A book mirrored about the close gives the short leg the long leg's branch and size."""
+    up = _flat(15)
+    up[0] = (100.0, 99.985, 99.99)
+    up[1] = (100.01, 99.99, 100.0)
+    lo = _resolve_one(up, leg="long")
+
+    dn = _flat(15)
+    dn[0] = (100.015, 100.0, 100.01)
+    dn[1] = (100.01, 99.99, 100.0)
+    sh = _resolve_one(dn, leg="short")
+
+    assert lo["size"] == sh["size"]
+    assert bool(lo["is_maker"]) == bool(sh["is_maker"])
+    assert lo["pnl"] == pytest.approx(sh["pnl"], rel=1e-6)
+
+
+def test_incomplete_minute_coverage_is_nan_not_guessed():
+    minutes = _flat(15)
+    minutes[6] = (np.nan, np.nan, np.nan)
+    r = _resolve_one(minutes)
+    assert np.isnan(r["pnl"])
+    assert np.isnan(r["size"])
+
+
+def test_missing_minute_bars_raises_rather_than_falling_back():
+    df15, _ = _synthetic(20, seed=5)
+    with pytest.raises(ValueError, match="requires 1m bars"):
+        compute_mm_target(df15, "close", "low", "high", _cfg(), minute_bars=None)
+
+
+@pytest.mark.parametrize("ladder", [1, 2, 5])
+def test_size_stays_in_bounds(ladder):
+    minutes = _flat(15)
+    minutes[2] = (100.0, 90.0, 95.0)             # a crash deeper than every rung
+    r = _resolve_one(minutes, ladder=ladder)
+    assert 1 <= r["size"] <= ladder
 
 
 # --------------------------------------------------------------------------
-# 5. Fee absorption
+# Config guards
 # --------------------------------------------------------------------------
 
 def test_nonzero_fee_raises_rather_than_double_charging():
@@ -208,15 +293,7 @@ def test_nonzero_fee_raises_rather_than_double_charging():
         mm_params(_cfg(FEE=2.25))
 
 
-def test_missing_fee_raises():
-    cfg = _cfg()
-    del cfg["FEE"]
-    with pytest.raises(KeyError, match="FEE missing"):
-        mm_params(cfg)
-
-
-@pytest.mark.parametrize("key", ["MM_PROFIT_AIM", "MM_PATIENCE_SEC",
-                                 "MM_TAKER_FEE_BPS"])
+@pytest.mark.parametrize("key", ["MM_PROFIT_AIM", "MM_PATIENCE_SEC", "MM_TAKER_FEE_BPS"])
 def test_every_mm_knob_is_required(key):
     cfg = _cfg()
     del cfg[key]
@@ -224,73 +301,17 @@ def test_every_mm_knob_is_required(key):
         mm_params(cfg)
 
 
-# --------------------------------------------------------------------------
-# 6. Branch exclusivity, size bounds, short mirror
-# --------------------------------------------------------------------------
-
-def test_every_resolvable_row_is_priced_exactly_once():
-    rng = np.random.default_rng(3)
-    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.002, 400)))
-    bars = _bars(close=close,
-                 low=close * (1 - abs(rng.normal(0, 0.001, 400))),
-                 high=close * (1 + abs(rng.normal(0, 0.001, 400))))
-    res = resolve_leg(bars["close"], bars["low"].shift(-1),
-                      bars["high"].shift(-1), bars.index, leg="long", ladder=2,
-                      ladder_bps=1.0, aim_bps=1.0, patience_sec=900.0,
-                      taker_fee_bps=1.75)
-    resolvable = res["pnl"].notna()
-    # A priced row always has a branch, and a branch always has a price.
-    assert (res["is_maker"].notna() == resolvable).all()
-    assert resolvable.sum() > 380
+def test_patience_must_be_whole_minutes():
+    with pytest.raises(ValueError, match="whole number of minutes"):
+        mm_params(_cfg(MM_PATIENCE_SEC=890.0))
 
 
-@pytest.mark.parametrize("ladder", [1, 2, 5])
-def test_size_stays_in_bounds_on_degenerate_input(ladder):
-    bars = _bars(close=[100.0, 0.0, np.nan, 100.0, 100.0, 100.0],
-                 low=[100.0, np.nan, 100.0, 200.0, 100.0, 100.0],   # inverted
-                 high=[100.0, 100.0, 100.0, 50.0, 100.0, 100.0])
-    res = resolve_leg(bars["close"], bars["low"].shift(-1),
-                      bars["high"].shift(-1), bars.index, leg="long",
-                      ladder=ladder, ladder_bps=1.0, aim_bps=1.0,
-                      patience_sec=900.0, taker_fee_bps=1.75)
-    assert res["size"].min() >= 1
-    assert res["size"].max() <= ladder
+def test_patience_minutes_matches_the_live_lifecycle():
+    assert patience_minutes(900) == 15          # PASSIVE_SEC 600 + CROSSING_SEC 300
+    assert patience_minutes(1800) == 30
+    with pytest.raises(ValueError):
+        patience_minutes(0)
 
-
-def test_short_leg_mirrors_the_long_leg():
-    """A mirrored book must give the short leg the long leg's branch and size."""
-    close = [100.0] * 8
-    dip, rip = 0.03, 0.04
-    long_bars = _bars(close=close,
-                      low=[100 - dip] * 8, high=[100 + rip] * 8)
-    short_bars = _bars(close=close,
-                       low=[100 - rip] * 8, high=[100 + dip] * 8)
-    kw = dict(ladder=2, ladder_bps=1.0, aim_bps=1.0, patience_sec=900.0,
-              taker_fee_bps=1.75)
-    lo = resolve_leg(long_bars["close"], long_bars["low"].shift(-1),
-                     long_bars["high"].shift(-1), long_bars.index,
-                     leg="long", **kw)
-    sh = resolve_leg(short_bars["close"], short_bars["low"].shift(-1),
-                     short_bars["high"].shift(-1), short_bars.index,
-                     leg="short", **kw)
-    np.testing.assert_array_equal(lo["size"].to_numpy(), sh["size"].to_numpy())
-    # Compare branch labels only where BOTH resolve. `is_maker` is NaN on the
-    # unresolvable tail, and NaN != NaN under object-dtype array comparison, so
-    # an unmasked assert fails on rows that are in fact identical.
-    resolvable = lo["is_maker"].notna() & sh["is_maker"].notna()
-    assert resolvable.sum() > 0
-    np.testing.assert_array_equal(
-        lo["is_maker"][resolvable].to_numpy().astype(bool),
-        sh["is_maker"][resolvable].to_numpy().astype(bool))
-    # The tail must be unresolvable on BOTH legs, not silently dropped on one.
-    np.testing.assert_array_equal(lo["is_maker"].isna().to_numpy(),
-                                  sh["is_maker"].isna().to_numpy())
-    np.testing.assert_allclose(lo["pnl"].dropna(), sh["pnl"].dropna(), rtol=1e-6)
-
-
-# --------------------------------------------------------------------------
-# Mode + timeframe guards
-# --------------------------------------------------------------------------
 
 def test_target_mode_defaults_to_ladder_but_rejects_unknown():
     assert target_mode({}) == TARGET_MODE_LADDER
@@ -300,57 +321,71 @@ def test_target_mode_defaults_to_ladder_but_rejects_unknown():
 
 
 @pytest.mark.parametrize("tf", ["1h", "4h", "1d", None])
-def test_coarser_timeframes_are_refused(tf):
-    bars = _bars(close=[100.0] * 4, low=[100.0] * 4, high=[100.0] * 4)
+def test_coarser_signal_grids_are_refused(tf):
+    df15, minute = _synthetic(20, seed=6)
     with pytest.raises(ValueError, match="15m"):
-        compute_mm_target(bars, "close", "low", "high", _cfg(TIME_UNIT=tf))
+        compute_mm_target(df15, "close", "low", "high", _cfg(TIME_UNIT=tf),
+                          minute_bars=minute)
 
 
-def test_both_call_sites_agree_in_mm_mode():
+def test_minute_matrices_reads_T_plus_1_not_T():
+    """The window must start at the close of T, i.e. the first minute of T+1."""
+    df15, minute = _synthetic(4, seed=7)
+    high_m, low_m, close_m = minute_matrices(df15.index, minute, BARS_PER_15M, 900.0)
+    # Bar 0 opens at START and closes at START+15m; its window is minutes 15..29.
+    np.testing.assert_allclose(close_m[0], minute["close"].to_numpy()[15:30], rtol=1e-12)
+
+
+def test_both_call_sites_agree_in_mm_mode(tmp_path):
     """`engineer_features` and `_compute_ladder_returns` must not drift apart.
 
-    They are two copies of the same target arithmetic — the design's stated
-    reason for putting it in a shared module — and a private copy is exactly how
-    the cross-TF and same-TF ladder engines drifted apart before. If one switches
-    to MM and the other does not, training and scoring silently price different
-    strategies.
+    They are two copies of the same target arithmetic, and a private copy is exactly how the
+    cross-TF and same-TF ladder engines drifted apart before. This also exercises
+    `_load_minute_bars`, since engineer_features reads the 1m tree off disk while the direct
+    call is handed the frame.
     """
     from agamotto.research import AgamottoResearch
 
-    rng = np.random.default_rng(11)
-    n = 200
-    idx = pd.date_range("2025-01-01", periods=n, freq="15min")
-    close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 3e-4, n))),
-                      index=idx)
-    sym = "BINANCE_PERP_BTC_USDT"
-    raw = pd.DataFrame({
-        f"{sym}_open": close,
-        f"{sym}_close": close,
-        f"{sym}_high": close * (1 + np.abs(rng.normal(0, 4e-4, n))),
-        f"{sym}_low": close * (1 - np.abs(rng.normal(0, 4e-4, n))),
-        f"{sym}_volume": pd.Series(np.abs(rng.normal(1e3, 10, n)), index=idx),
-    }, index=idx)
+    sym = "BTCUSDT"
+    df15, minute = _synthetic(120, seed=11)
 
-    cfg = _cfg(TARGET_MODE="mm")
+    # Lay the 1m tree out exactly as sync_klines.sh writes it.
+    sym_dir = tmp_path / "data" / "BINANCEFUTURES" / "1m" / "liquid" / sym
+    sym_dir.mkdir(parents=True)
+    on_disk = minute.copy()
+    # NORMALISE THE UNIT EXPLICITLY (CLAUDE.md): a raw int64 view returns the index's OWN
+    # unit, which is [us] for pd.date_range on pandas 3 — `// 1_000_000` on that yields
+    # SECONDS, not milliseconds, and silently puts every minute off-grid.
+    on_disk["open_time_ms"] = (
+        on_disk.index.to_numpy(dtype="datetime64[ns]").astype("int64") // 1_000_000)
+    on_disk.to_csv(sym_dir / f"{sym}_2025-01_1m.csv", index=False)
+
+    cfg = _cfg()
     ag = AgamottoResearch.__new__(AgamottoResearch)
     ag.config = cfg
-    expected = ag._compute_ladder_returns(
-        raw.rename(columns={f"{sym}_close": "close", f"{sym}_low": "low",
-                            f"{sym}_high": "high"}),
-        "close", "low", "high")
+    ag.home_root = str(tmp_path)
 
+    expected = ag._compute_ladder_returns(df15, "close", "low", "high", minute_bars=minute)
+
+    raw = pd.DataFrame({
+        f"{sym}_open": df15["close"], f"{sym}_close": df15["close"],
+        f"{sym}_high": df15["high"], f"{sym}_low": df15["low"],
+        f"{sym}_volume": pd.Series(1000.0, index=df15.index),
+    }, index=df15.index)
     ag.raw = raw
     ag.engineer_features()
 
-    for col in ["return_long", "return_short", "return_long_raw",
-                "return_short_raw"]:
+    for col in ["return_long", "return_short", "return_long_raw", "return_short_raw"]:
         pd.testing.assert_series_equal(
             ag.features[f"{sym}_{col}"].reset_index(drop=True),
             expected[col].reset_index(drop=True),
             check_names=False, rtol=1e-12, atol=1e-15)
 
 
-def test_bar_seconds_uses_total_seconds_not_asi8():
-    """A [us]-unit index must still read as 900s (CLAUDE.md duration rule)."""
-    idx = pd.date_range("2025-01-01", periods=5, freq="15min").as_unit("us")
-    assert bar_seconds(idx) == 900.0
+def test_minute_matrices_is_gap_safe():
+    """A missing minute becomes NaN rather than shifting every later bar."""
+    df15, minute = _synthetic(4, seed=8)
+    minute = minute.drop(minute.index[20])
+    high_m, low_m, close_m = minute_matrices(df15.index, minute, BARS_PER_15M, 900.0)
+    assert np.isnan(close_m[0, 5])               # minute 20 == window slot 5 of bar 0
+    assert np.isfinite(close_m[0, 6])            # its neighbour is untouched
