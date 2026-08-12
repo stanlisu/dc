@@ -15,7 +15,9 @@ import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(_REPO / "scripts"))
 import verify_deploy  # noqa: E402
 
 ALGO = "orb"  # a real algo name so NO_OBF_MAP / DEEP_IMPORT lookups behave
@@ -29,16 +31,56 @@ def _make_pkg(base: pathlib.Path, name: str, body: str = "VALUE = 1\n") -> pathl
     return pkg
 
 
+def _is_editable_finder(finder) -> bool:
+    """True for the MetaPathFinder a PEP 660 `pip install -e` registers."""
+    return getattr(type(finder), "__module__", "").startswith("__editable__")
+
+
+def _is_repo_pkg_src(entry: str) -> bool:
+    """True for a sys.path entry pointing at this repo's own <algo>_pkg/src."""
+    try:
+        p = pathlib.Path(entry).resolve()
+    except (OSError, ValueError):
+        return False
+    return p.name == "src" and p.parent.name.endswith("_pkg") and _REPO in p.parents
+
+
 @pytest.fixture(autouse=True)
 def _clean_import_state():
     saved_path = list(sys.path)
+    saved_meta = list(sys.meta_path)
     saved_mods = dict(sys.modules)
     # DEEP_IMPORT would pull in the real orb.research; the fixtures here are
     # stubs, so drop the deep import for the duration of these tests.
     saved_deep = dict(verify_deploy.DEEP_IMPORT)
     verify_deploy.DEEP_IMPORT.pop(ALGO, None)
+
+    # These tests aim `import <algo>` at a temp tree via sys.path. THREE things
+    # in a populated environment outrank that, and CI has all three:
+    #
+    #   1. an already-imported copy in sys.modules — the full suite imports the
+    #      repo's own orb long before this file runs, and a cached module wins
+    #      over any path;
+    #   2. the PEP 660 editable MetaPathFinder that `pip install -e` registers
+    #      (tests.yml installs all 9 packages editable). sys.meta_path is
+    #      consulted BEFORE sys.path, so sys.path.insert(0, ...) cannot outrank
+    #      it — this is the one that actually bit;
+    #   3. a legacy .pth-style editable that appends <algo>_pkg/src to sys.path.
+    #
+    # Running this file ALONE on a machine where the packages are not installed
+    # hits none of them, which is why these passed locally and failed in CI
+    # (dc#38: "imported: /home/runner/work/dc/dc/orb_pkg/src/orb").
+    for name in list(sys.modules):
+        if name.split(".")[0] in (ALGO, "vibranium"):
+            del sys.modules[name]
+    sys.meta_path[:] = [f for f in sys.meta_path if not _is_editable_finder(f)]
+    sys.path[:] = [e for e in sys.path if not _is_repo_pkg_src(e)]
+    importlib.invalidate_caches()
+
     yield
+
     sys.path[:] = saved_path
+    sys.meta_path[:] = saved_meta
     sys.modules.clear()
     sys.modules.update(saved_mods)
     verify_deploy.DEEP_IMPORT.clear()
