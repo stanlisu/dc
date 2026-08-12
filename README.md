@@ -8,7 +8,9 @@ and reaches production only as PyArmor-obfuscated bytecode.
 Two things happen in this repo, and only here:
 
 1. **PyArmor build + deploy** — `<algo>_pkg/src/<algo>/` → obfuscated
-   `build_dist/<algo>_pkg/` → rsync to `<host>:/home/stan/sandbox/marvel/<algo>_pkg/`.
+   `build_dist/<algo>_pkg/` → rsync to `<host>:/home/stan/sandbox/marvel/<algo>_pkg/`
+   → **editable install** → **verify**. The last two steps are not optional —
+   see [rsync is not the deploy](#rsync-is-not-the-deploy).
 2. **Name obfuscation** — the reversible regime/feature name↔code map
    (`obfuscation/`), vendored into every package so the obfuscated code can
    decode at runtime on the servers.
@@ -23,6 +25,8 @@ Two things happen in this repo, and only here:
 | `build_dist/` | PyArmor output (gitignored build artifact — never edit by hand) |
 | `obfuscation/` | Codec, inventory extractor, map builder, vendor sync |
 | `build_distribution.sh` | The single front door for build + deploy |
+| `scripts/deploy_host.sh` | One host, end to end: pre-flight → rsync → editable install → verify. Shared by `build_distribution.sh` and CI |
+| `scripts/verify_deploy.py` | The post-deploy gate. Runs on the target; proves the deployed bytes are the imported bytes |
 | `deploy.log` | **Append one entry per deploy** (see Logging below) |
 | `conftest.py` / `pytest.ini` | Regenerate map + vendored codec before every test session |
 
@@ -41,37 +45,79 @@ cd ~/Documents/sandbox/dc
 ./build_distribution.sh                      # build all, then prompt for a deploy target
 ```
 
-The deploy prompt offers `1) hydra  2) shield  3) shield2  4) all  5) skip` —
-note there is **no "hydra + shield2" combo**. To deploy to an arbitrary subset,
-build with `--build-only` and run the same rsync the script uses:
+The deploy prompt offers `1) hydra  2) shield  3) shield2  4) all  5) xmen
+6) all + xmen  7) skip` — note there is **no "hydra + shield2" combo**. To
+deploy to an arbitrary subset, build with `--build-only` and drive one host at
+a time with the same script the front door uses:
 
 ```bash
-rsync -az --delete build_dist/<algo>_pkg/ <host>:/home/stan/sandbox/marvel/<algo>_pkg/
+bash scripts/deploy_host.sh --host shield \
+     --python /opt/miniconda3/envs/py313/bin/python --algos mjolnir,orb
 ```
+
+Do **not** hand-roll the `rsync` line. rsync alone does not deploy anything —
+see below.
 
 `build_distribution.sh` refreshes the obfuscation map and re-vendors the codec
 into every package **before** running PyArmor, so a deploy can never ship a
 stale map.
+
+### rsync is not the deploy
+
+An rsync into `<host>:/home/stan/sandbox/marvel/<algo>_pkg/` only changes
+whether python imports that tree **if the package is installed editable**. A
+non-editable install copied the tree into `site-packages` at install time, and
+that copy is frozen: rsync never reaches it, the deploy prints success, and the
+old code keeps running.
+
+That is not hypothetical. `deploy.yml` used to run
+`pip install -e A/ B/ C/ ...`, and **pip binds `-e` only to the path that
+immediately follows it** — so `agamotto` was editable and the other **eight**
+were frozen copies. Measured on shield 2026-08-09: `mjolnir.core.ladder`
+imported a **2026-08-06** copy from `site-packages` while the deployed tree
+held the **2026-08-08** build; shield2 held a third version again. Every deploy
+to shield from 2026-08-06 was a silent no-op for 8 of 9 packages, and it cost a
+research panel rebuild before anyone noticed.
+
+Two rules follow, and both are now enforced in code:
+
+1. **Every package is installed editable, on every host** — `-e` before *each*
+   path, so the rsynced tree is the single copy and stays authoritative.
+2. **Every deploy is verified on the target** by `scripts/verify_deploy.py`,
+   which fails non-zero unless the module python imports **is** the tree we
+   rsynced, with a matching content digest.
+
+> The old runbook check here used `sys.path.insert(0, ".../mjolnir_pkg/src")`
+> before importing. That could never detect this: forcing the deployed tree
+> onto `sys.path` is precisely what hides which tree a normal run would pick.
+> And "does it import" is worthless as a staleness test — **a stale package
+> imports perfectly**. Check identity, not importability.
+
+Verify by hand any time you doubt what a host is running:
+
+```bash
+ssh shield '/opt/miniconda3/envs/py313/bin/python - /home/stan/sandbox/marvel' \
+    < scripts/verify_deploy.py
+```
 
 ### Rules
 
 - **Build on the Mac, target linux.x86_64.** `pyarmor gen --platform
   linux.x86_64` cross-compiles; the servers never run PyArmor.
 - **Never deploy onto a host with running bots.** rsync uses `--delete`; a bot
-  that imports a package mid-sync gets a torn tree. Check `pgrep -c python`
-  on the target first, per the marvel bot-process protocol.
-- **A copied file is not a working deploy.** Always verify on the target that
-  the obfuscated package *imports* and exposes the API you shipped — PyArmor
-  runtime mismatches and dropped data files both fail only at import time:
-  ```bash
-  ssh <host> '~/miniconda3/envs/py313/bin/python -c "
-  import sys; sys.path.insert(0, \"/home/stan/sandbox/marvel/mjolnir_pkg/src\")
-  from mjolnir.trading import MjolnirTrading; print(MjolnirTrading)"'
-  ```
+  that imports a package mid-sync gets a torn tree, and a `pip install` swaps
+  `pyarmor_runtime.so` out from under an already-loaded one. `deploy_host.sh`
+  now refuses such a host instead of trusting you to check. It had been only a
+  note: CI rsynced and reinstalled all nine packages on hydra at
+  2026-08-09 03:42Z while `run_knull.py` had been live with real money since
+  2026-08-08 07:11Z.
 - **`shield`'s python is `/opt/miniconda3/envs/py313`**, not `~/miniconda3`
   (hydra and shield2 use `~/miniconda3/envs/py313`).
-- **`shield2` is a deploy target not covered by `deploy.yml`** — it only ever
-  receives packages through this script.
+- **`shield` is the host `deploy.yml` cannot reach** — it is a LAN address
+  (192.168.72.135), unreachable from GitHub-hosted runners, so its step is
+  `continue-on-error` and CI has never installed on it. shield therefore drifts
+  furthest and must be deployed manually from the Mac. (hydra and shield2 both
+  have CI steps.)
 
 ### PyArmor licensing
 
@@ -177,7 +223,24 @@ YYYY-MM-DD HH:MM [local] rebuild+redeploy <algos> -> <hosts> (main@<sha>, <what 
 ## Downstream consumers
 
 Deployed packages land at `/home/stan/sandbox/marvel/<algo>_pkg/` and are
-imported from `<pkg>/src` (marvel adds it to `PYTHONPATH`).
+imported from `<pkg>/src` **via the editable install**, not via `PYTHONPATH`.
+
+This distinction matters and used to be stated wrongly here. marvel's entry
+points export only `PYTHONPATH="agamotto_pkg/src:."` (e.g.
+`mjolnir/gauntlet/run_mjolnir_pipeline.sh:26`, `gauntlet/run_pipeline.sh:54`,
+every `stormbreaker/gauntlet/*.sh`) — **one** package. The other eight are
+found purely through `site-packages`, which is why their install mode silently
+decided whether a deploy took effect. Three resolution orders exist today:
+
+| Entry point | mjolnir/stormbreaker resolve from |
+|---|---|
+| `run_mjolnir_pipeline.sh`, all `stormbreaker/gauntlet/*.sh`, `gauntlet/run_pipeline.sh` | the install (`site-packages`) |
+| `mjolnir/gauntlet/explore_tick.sh`, `run_mjolnir_rolling.sh` | `MJOLNIR_PKG_SRC`, default `/home/stan/sandbox/dc/mjolnir_pkg/src` — the **deobfuscated dc clone**, whatever git state it is in |
+| `mjolnir/gauntlet/run_era_variant.sh` | `$REPO/mjolnir_pkg/src` — the deployed pyarmor tree |
+
+Two runs of "the same" algo on one host can therefore execute different code.
+`scripts/verify_deploy.py` tells you which tree the *install* resolves to; for
+the `MJOLNIR_PKG_SRC` entry points also check `git -C ~/sandbox/dc log -1`.
 
 **xmen** (the private knull mirror, live trading stack) keeps its **own
 git-tracked copy** of `mjolnir_pkg` at `~/sandbox/xmen/mjolnir_pkg` — it is
