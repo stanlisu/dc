@@ -357,3 +357,4 @@ Pre-flight: shield idle (no run_pipeline / *_research / rolling_predict /
       shield under PYTHONPATH=agamotto_pkg/src:.
 ========================================================================
 2026-08-10T15:09:06Z  deploy agamotto -> shield2  (manual: build_distribution.sh --build-only agamotto on main @ 78d31ce, delivered via scripts/deploy_host.sh from feat/vertical-features-csv-flag)  verified: EDITABLE, digest ok
+2026-08-13T02:56:15Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(2 bots)  failed: none
