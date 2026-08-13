@@ -36,7 +36,12 @@ except ImportError:
 
 from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
 from .ladder import compute_ladder_multiplier, ladder_params
-from .mm_target import TARGET_MODE_MM, compute_mm_target, target_mode
+from .mm_target import (
+    MINUTE_TIMEFRAME,
+    TARGET_MODE_MM,
+    compute_mm_target,
+    target_mode,
+)
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
 # Import filter definitions and evaluation logic from sub-module
@@ -195,12 +200,58 @@ class AgamottoResearch:
         combined.index = combined.index.tz_convert(None)
         self.raw = combined
 
+    def _load_minute_bars(self, symbol: str) -> pd.DataFrame:
+        """1m OHLC for ONE symbol — the sub-bar grid the MM target resolves on.
+
+        Loaded per symbol rather than as one wide frame: the combined 1m panel for a 28-symbol
+        arm is ~1.85M minutes x 140 columns, and only one symbol is needed at a time.
+
+        Mirrors `load()`'s layout and parsing exactly (same source_dir shape, same
+        `open_time_ms` -> UTC index, same duplicate policy, same `tz_convert(None)` so the
+        index matches `self.raw`). A symbol with no 1m data RAISES — silently dropping it
+        would train that symbol on nothing while the rest of the arm carried MM economics.
+        """
+        exchange = self.config.get("EXCHANGE", "BINANCEFUTURES")
+        if exchange.upper() == "STOCKS":
+            raise ValueError(
+                "TARGET_MODE='mm' is crypto-only: the MM lifecycle is a 24/7 post-only "
+                "ladder, and the STOCKS data layout carries no 1m tree.")
+        data_family = self.config.get("DATA", "liquid")
+        sym_dir = (f"{self.home_root}/data/BINANCEFUTURES/"
+                   f"{MINUTE_TIMEFRAME}/{data_family}/{symbol}")
+        paths = sorted(glob.glob(f"{sym_dir}/*_{MINUTE_TIMEFRAME}.csv"))
+        if not paths:
+            raise FileNotFoundError(
+                f"no {MINUTE_TIMEFRAME} CSVs for {symbol} under {sym_dir}. TARGET_MODE='mm' "
+                f"resolves the ladder and the exit minute-by-minute inside bar T+1 and "
+                f"cannot fall back to 15m extremes. Sync them with "
+                f"gauntlet/sync_klines.sh.")
+
+        frames = []
+        for csv_path in paths:
+            d = pd.read_csv(csv_path, header=0)
+            if "open_time_ms" not in d.columns:
+                raise ValueError(
+                    f"Missing required column 'open_time_ms' in {csv_path}")
+            missing = [c for c in ("high", "low", "close") if c not in d.columns]
+            if missing:
+                raise ValueError(f"{csv_path} is missing columns {missing}")
+            d["timestamp"] = pd.to_datetime(d["open_time_ms"], unit="ms", utc=True)
+            frames.append(
+                d.set_index("timestamp")[["high", "low", "close"]].astype(float))
+
+        out = pd.concat(frames).sort_index()
+        out = out[~out.index.duplicated(keep="last")]
+        out.index = out.index.tz_convert(None)
+        return out
+
     def _compute_ladder_returns(
         self,
         df: pd.DataFrame,
         close_col: str,
         low_col: str,
         high_col: str,
+        minute_bars: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Ladder-adjusted target columns for a single symbol's OHLC frame.
 
@@ -223,7 +274,7 @@ class AgamottoResearch:
         # every pre-existing arm is untouched.
         if target_mode(self.config) == TARGET_MODE_MM:
             return compute_mm_target(df, close_col, low_col, high_col,
-                                     self.config)
+                                     self.config, minute_bars=minute_bars)
 
         ladder_long, ladder_short, step_bps = ladder_params(self.config)
         fee_rate = float(self.config["FEE"]) / 10000.0
@@ -320,7 +371,8 @@ class AgamottoResearch:
                     mm_cols = compute_mm_target(
                         pd.DataFrame({"close": close, "low": low_series,
                                       "high": high_series}),
-                        "close", "low", "high", self.config)
+                        "close", "low", "high", self.config,
+                        minute_bars=self._load_minute_bars(base))
                     price_return_long = mm_cols["return_long"].rename(
                         f"{base}_return_long")
                     price_return_short = mm_cols["return_short"].rename(
