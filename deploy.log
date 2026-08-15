@@ -410,3 +410,47 @@ Bots: none were running on hydra before or after; nothing was stopped and
       nothing was restarted. shield and shield2 NOT touched — both still run
       the price-row build from 06:15Z.
 ========================================================================
+
+========================================================================
+2026-08-15 14:02Z [local] ROLL-FORWARD rebuild+redeploy agamotto orb -> hydra
+                  (main@b2be99a, tree == fa84468)
+------------------------------------------------------------------------
+What: undid the 11:49Z rollback. main fast-forwarded to origin/main b2be99a
+      (PR #41, revert-the-revert 9a31b78), which restores the price-row work:
+      f47d588 / 74ce8a1 (price the signal at the row predict() ran on) and
+      cb454fd (order-independent NaN fallback + duplicate-label rejection).
+      `git diff fa84468 b2be99a` is empty outside deploy.log — the tree is
+      back to the pre-rollback state.
+
+Why:  the iloc[-2] one-bar-stale defect is real and live (PR #41's rationale);
+      the 11:49Z rollback is superseded, not re-litigated here.
+
+Scope: agamotto_pkg and orb_pkg ONLY — still the only packages that differ
+      between 5858c40 and fa84468. The other 7 algos are untouched on hydra.
+
+Tests: PYTHONPATH=$(ls -d *_pkg/src | paste -sd: -) pytest agamotto_pkg/tests
+      orb_pkg/tests tests/test_agamotto_price_row.py tests/test_orb_price_row.py
+      -> 375 passed, 11 skipped (the 19 restored price-row tests included).
+
+BUILD  ./build_distribution.sh --build-only agamotto
+       ./build_distribution.sh --build-only orb
+       pyarmor 9.2.3 trial, --platform linux.x86_64, no 'out of license'.
+       obfuscation/map.json regenerated git-clean — append-only intact.
+
+DEPLOY bash scripts/deploy_host.sh --host hydra \
+         --python '$HOME/miniconda3/envs/py313/bin/python' --algos agamotto,orb
+       pre-flight: no run_knull / trade_execution / mjolnir_bridge on hydra
+       rsync 2/2 OK -> /home/stan/sandbox/marvel/{agamotto,orb}_pkg/
+       pip install -e on both paths (uninstall+reinstall, editable)
+
+VERIFIED on hydra (/home/stan/miniconda3/envs/py313/bin/python 3.13.12):
+       agamotto  EDITABLE -> marvel/agamotto_pkg/src/agamotto  digest 70f67c605515f205 ok
+       orb       EDITABLE -> marvel/orb_pkg/src/orb            digest f17d6e22e02a45a5 ok
+       map.json md5 33f9f0fa1f1985567cef0a131fb4e403 on both == local.
+       Digests differ from the 11:49Z entry (03d12a4343c8571b / 5cf2517186c2be54)
+       because the source differs — not merely per-build pyarmor noise.
+
+Bots: none running on hydra before or after; nothing stopped, nothing
+      restarted. shield and shield2 NOT touched — both have run the
+      price-row build since 06:15Z, so all three hosts now agree again.
+========================================================================
