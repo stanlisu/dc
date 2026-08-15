@@ -107,6 +107,16 @@ def _closes_at_timestamp(raw, symbols, target_ts) -> dict:
     symbols = list(symbols or [])
     if raw is None or raw.empty:
         return {sym: 0.0 for sym in symbols}
+    # Precondition, stated rather than assumed. `_process_combined` dedupes
+    # (`~combined.index.duplicated`) before the only `self.raw =`, so this is
+    # unreachable on the live path — but a duplicated label makes `raw.at[...]`
+    # return a Series, and the `pd.isna(val)` below then dies with "The truth
+    # value of a Series is ambiguous", a crash far from its cause.
+    if not raw.index.is_unique:
+        dupes = raw.index[raw.index.duplicated()].unique().tolist()
+        raise ValueError(
+            f"raw has duplicate index labels {dupes[:5]} — cannot resolve a "
+            f"single close per timestamp. Dedupe before pricing.")
     if target_ts not in raw.index:
         raise KeyError(
             f"predict() targeted {target_ts!r} but it is not present in raw "
@@ -125,8 +135,13 @@ def _closes_at_timestamp(raw, symbols, target_ts) -> dict:
             logger.warning(
                 "NaN close for %s at %s — falling back to the last valid close "
                 "at or before it", sym, target_ts)
-            valid = raw.loc[:target_ts, col].dropna()
-            val = valid.iloc[-1] if len(valid) else 0.0
+            # Boolean mask + idxmax, NOT `raw.loc[:target_ts]`. Label slicing on a
+            # non-monotonic index does NOT raise — pandas falls back to POSITIONAL
+            # slicing and silently includes rows dated AFTER the target, which is
+            # the very lookahead this helper exists to prevent, reintroduced inside
+            # the fallback. A mask is order-independent by construction.
+            prior = raw[col][raw.index <= target_ts].dropna()
+            val = prior.loc[prior.index.max()] if len(prior) else 0.0
         out[sym] = float(val)
     return out
 

@@ -135,3 +135,50 @@ def test_all_nan_prices_zero_rather_than_inventing_a_number():
 def test_empty_raw_prices_nothing():
     out = _closes_at_timestamp(pd.DataFrame(), [BTC], T_SETTLED)
     assert out == {BTC: 0.0}
+
+
+# ── the fallback must not depend on ROW ORDER (reviewer finding, 2026-08-15) ──
+# `raw.loc[:target_ts, col]` does NOT raise on a non-monotonic index — pandas
+# slices POSITIONALLY and silently includes rows dated AFTER the target. The
+# original `test_the_nan_fallback_never_reaches_forward_in_time` passed only
+# because its `pd.concat` happened to leave the index sorted, so it tested the
+# sorted case while reading as if it pinned the invariant. That is the exact
+# failure this whole file exists to kill — a positional read that cannot state
+# which bar it means — reintroduced inside the fix.
+#
+# The live path is safe (both `_process_combined` callers `.sort_index()`), so
+# these guard the helper's stated contract, not a reachable production bug.
+
+def _unsorted_raw():
+    """Same three bars, plus a LATER row, stored out of order — and the target
+    row is NaN so the fallback has to run."""
+    raw = pd.DataFrame(
+        {"BTCUSDT_close": [63073.3, 63088.9, 99999.0, np.nan]},
+        index=pd.DatetimeIndex([
+            pd.Timestamp("2026-08-15 02:15:00"),
+            T_STALE,                                    # 02:30
+            pd.Timestamp("2026-08-15 03:00:00"),        # LATER than the target
+            T_SETTLED,                                  # 02:45, the target, NaN
+        ]),
+    )
+    assert not raw.index.is_monotonic_increasing        # the precondition under test
+    return raw
+
+
+def test_nan_fallback_is_order_independent():
+    """Must return the 02:30 close, never the 03:00 one, regardless of storage
+    order. Before the fix this returned 99999.0."""
+    out = _closes_at_timestamp(_unsorted_raw(), [BTC], T_SETTLED)
+    assert out[BTC] == pytest.approx(63088.9)
+
+
+def test_duplicate_index_labels_raise_rather_than_exploding_downstream():
+    """`raw.at[ts, col]` on a duplicated label returns a Series, and the next
+    line's `pd.isna(val)` then dies with 'The truth value of a Series is
+    ambiguous' — a confusing crash far from the cause. `_process_combined`
+    dedupes upstream so this is unreachable live, but the helper is module-level
+    and must state its own precondition."""
+    raw = _raw()
+    dup = pd.concat([raw, raw.iloc[[-1]]])              # T_SETTLED twice
+    with pytest.raises(ValueError, match="duplicate"):
+        _closes_at_timestamp(dup, [BTC], T_SETTLED)
