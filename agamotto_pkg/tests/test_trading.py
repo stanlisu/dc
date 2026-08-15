@@ -97,7 +97,12 @@ def test_make_decision_long(mock_agamotto):
     })
     mock_agamotto.raw = pd.DataFrame(
         {"BTCUSDT_close": [49000.0, 50000.0]},
-        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
+        # raw's LAST row IS the row predict() targets — `_process_combined`
+        # drops the in-flight candle before assigning `self.raw`, so `raw.index[-1]`
+        # is the settled bar. The old fixture ended a day BEFORE
+        # vertical_features' timestamp, a state the loader cannot produce; it
+        # survived only because iloc[-2] never looked at the index.
+        index=pd.to_datetime(["2024-12-31", "2025-01-01"]),
     )
     mock_agamotto.config["LOT_SIZES"] = {
         "BINANCE_PERP_BTC_USDT": {"step_size": 0.001, "min_notional": 5.0}
@@ -146,7 +151,12 @@ def test_make_decision_short(mock_agamotto):
     })
     mock_agamotto.raw = pd.DataFrame(
         {"BTCUSDT_close": [49000.0, 50000.0]},
-        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
+        # raw's LAST row IS the row predict() targets — `_process_combined`
+        # drops the in-flight candle before assigning `self.raw`, so `raw.index[-1]`
+        # is the settled bar. The old fixture ended a day BEFORE
+        # vertical_features' timestamp, a state the loader cannot produce; it
+        # survived only because iloc[-2] never looked at the index.
+        index=pd.to_datetime(["2024-12-31", "2025-01-01"]),
     )
     mock_agamotto.config["LOT_SIZES"] = {
         "BINANCE_PERP_BTC_USDT": {"step_size": 0.001, "min_notional": 5.0}
