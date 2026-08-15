@@ -358,3 +358,55 @@ Pre-flight: shield idle (no run_pipeline / *_research / rolling_predict /
 ========================================================================
 2026-08-10T15:09:06Z  deploy agamotto -> shield2  (manual: build_distribution.sh --build-only agamotto on main @ 78d31ce, delivered via scripts/deploy_host.sh from feat/vertical-features-csv-flag)  verified: EDITABLE, digest ok
 2026-08-13T02:56:15Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(2 bots)  failed: none
+2026-08-13T11:20:11Z  deploy 9 algos -> hydra shield2  (via scripts/sync_all_repos.sh)  skipped: shield(unreachable)  failed: none
+2026-08-14T14:29:32Z  deploy 9 algos -> shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(2 bots) shield(unreachable)  failed: none
+2026-08-14T15:36:47Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(2 bots)  failed: none
+2026-08-15T06:15:38Z  deploy 9 algos -> hydra shield shield2  (via scripts/sync_all_repos.sh)  skipped: none  failed: none
+
+========================================================================
+2026-08-15 11:49Z [local] ROLLBACK rebuild+redeploy agamotto orb -> hydra
+                  (main@9cbaec1, tree == 5858c40)
+------------------------------------------------------------------------
+What: rolled dc back to 5858c40, undoing the price-row fixes f47d588
+      (agamotto), 74ce8a1 (orb), cb454fd (agamotto NaN fallback) and their
+      merges dacd294 / fa84468. The rollback itself landed upstream as PR #40
+      (c40e84e, merge 9cbaec1) while this session was preparing an identical
+      local revert; the local one was dropped and main fast-forwarded to
+      origin. `git diff 5858c40 9cbaec1` is empty — the tree is byte-identical
+      to 5858c40.
+
+Why:  hydra had been carrying the price-row build since the 06:15:38Z deploy
+      today (build_dist stamped 14:13 +0800, i.e. after the 11:52 +0800
+      merges). Rollback requested; the two fix branches
+      fix/agamotto-price-row and fix/orb-price-row are untouched and still
+      hold the work for a later re-land.
+
+Scope: agamotto_pkg and orb_pkg ONLY — they are the only packages that differ
+      between fa84468 and 5858c40. The other 7 algos on hydra were left on
+      their 06:15Z build, whose source is identical at both commits.
+
+Tests: PYTHONPATH=$(ls -d *_pkg/src | paste -sd: -) pytest agamotto_pkg/tests
+      orb_pkg/tests -q  ->  356 passed, 11 skipped.
+
+BUILD  ./build_distribution.sh --build-only agamotto
+       ./build_distribution.sh --build-only orb
+       pyarmor 9.2.3 trial, --platform linux.x86_64, no 'out of license'.
+       obfuscation/map.json regenerated to 72 regimes / 107 features and is
+       git-clean — append-only invariant intact.
+
+DEPLOY bash scripts/deploy_host.sh --host hydra \
+         --python '$HOME/miniconda3/envs/py313/bin/python' --algos agamotto,orb
+       pre-flight: no run_knull / trade_execution / mjolnir_bridge on hydra
+       rsync 2/2 OK -> /home/stan/sandbox/marvel/{agamotto,orb}_pkg/
+       pip install -e on both paths (uninstall+reinstall, editable)
+
+VERIFIED on hydra (/home/stan/miniconda3/envs/py313/bin/python 3.13.12):
+       agamotto  EDITABLE -> marvel/agamotto_pkg/src/agamotto  digest 03d12a4343c8571b ok
+       orb       EDITABLE -> marvel/orb_pkg/src/orb            digest 5cf2517186c2be54 ok
+       map.json md5 33f9f0fa1f1985567cef0a131fb4e403 on both == local ==
+       the md5 recorded for the 2026-08-09 deploys.
+
+Bots: none were running on hydra before or after; nothing was stopped and
+      nothing was restarted. shield and shield2 NOT touched — both still run
+      the price-row build from 06:15Z.
+========================================================================
