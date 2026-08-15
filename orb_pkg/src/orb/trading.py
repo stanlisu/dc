@@ -32,72 +32,6 @@ from .research import OrbResearch
 logger = logging.getLogger(__name__)
 
 
-def _closes_at_timestamp(raw, symbols, target_ts) -> dict:
-    """``{symbol: close}`` read off ``raw`` at ``target_ts``, selected by LABEL.
-
-    ``target_ts`` is ``vertical_features["timestamp"].max()`` — the row
-    ``predict()`` actually ran on. Pricing anywhere else means the order is sent
-    at a different bar than the one the model saw.
-
-    **Why label and not position.** This replaced ``self.raw[col].iloc[-2]``,
-    inherited from ``AgamottoTrading`` along with the premise "the last row is
-    the incomplete candle". orb falsifies that premise on BOTH data paths, for
-    two different reasons: the REST path fetches ``limit + 1`` bars and drops the
-    in-flight one (:427-431) before assigning ``self.raw`` (:447), while the WS
-    path never holds the in-flight bar at all (:320-322) and assigns ``self.raw``
-    at :333. Those two assignments are the only ones, and both sit downstream of
-    the drop — so ``iloc[-1]`` IS the just-closed bar and ``iloc[-2]`` is a full
-    ``BASE_TF`` older.
-
-    **What ``predict()`` targets, verified for orb rather than assumed.** orb is
-    cross-TF, so the target row needed its own check. ``predict`` selects
-    ``vertical_features["timestamp"].max()``; ``OrbResearch.verticalize`` sets
-    that column to ``self.features.index`` (research.py:392); ``_align_timeframes``
-    builds ``self.features`` on ``base_idx``, the BASE_TF features index
-    (research.py:443, :575); and ``engineer_features`` preserves ``raw.index``
-    row-for-row. Higher TFs are ``merge_asof``'d ONTO that index and never widen
-    it. So the target equals ``self.raw.index.max()`` — the settled bar that
-    ``iloc[-2]`` misses by one, exactly as in agamotto.
-
-    orb is not live, so this cost nothing; the same pairing did cost agamotto a
-    median +23.8 bps per entry on ltp (dc ``f47d588``, hydra 2026-08-15).
-
-    Two independent layers each believed they owned the "drop the incomplete
-    bar" step and neither could see the other, because a positional index has no
-    way to state which bar it means. A label can, so the disagreement now raises
-    instead of silently pricing a stale bar.
-
-    A NaN at ``target_ts`` falls back to the last valid close AT OR BEFORE it —
-    never a later one, which would be lookahead and is reachable whenever ``raw``
-    still holds rows past the target. All-NaN or an absent column gives 0.0,
-    which the caller's ``close > 0`` guard turns into "use the init-time size".
-    """
-    symbols = list(symbols or [])
-    if raw is None or raw.empty:
-        return {sym: 0.0 for sym in symbols}
-    if target_ts not in raw.index:
-        raise KeyError(
-            f"predict() targeted {target_ts!r} but it is not present in raw "
-            f"(raw spans {raw.index.min()}..{raw.index.max()}, {len(raw)} rows). "
-            f"The prediction row and the pricing row have diverged — refusing "
-            f"to price at a different bar than the model saw.")
-    out: dict[str, float] = {}
-    for sym in symbols:
-        col = f"{_symbol_to_native(sym)}_close"
-        if col not in raw.columns:
-            out[sym] = 0.0
-            continue
-        val = raw.at[target_ts, col]
-        if pd.isna(val):
-            logger.warning(
-                f"NaN close for {sym} at {target_ts} — falling back to the "
-                f"last valid close at or before it")
-            valid = raw.loc[:target_ts, col].dropna()
-            val = valid.iloc[-1] if len(valid) else 0.0
-        out[sym] = float(val)
-    return out
-
-
 class OrbTrading(OrbResearch):
     """Live cross-timeframe inference — mirrors AgamottoTrading's interface."""
 
@@ -636,14 +570,21 @@ class OrbTrading(OrbResearch):
         combined_preds = pd.concat(
             all_predictions, axis=0, ignore_index=True)
 
-        # Close prices for sizing AND for the price the executor anchors on.
-        # Taken from the SAME row predict() ran on, selected by LABEL — see
-        # _closes_at_timestamp for why this must never be positional again.
-        latest_closes = _closes_at_timestamp(
-            getattr(self, "raw", None),
-            self.config.get("SYMBOLS", []),
-            target_ts=self.vertical_features["timestamp"].max(),
-        )
+        latest_closes: dict[str, float] = {}
+        if hasattr(self, 'raw') and not self.raw.empty:
+            for sym in self.config.get("SYMBOLS", []):
+                native = _symbol_to_native(sym)
+                col = f"{native}_close"
+                if col in self.raw.columns:
+                    val = (self.raw[col].iloc[-2]
+                           if len(self.raw) >= 2
+                           else self.raw[col].iloc[-1])
+                    if pd.isna(val):
+                        valid = self.raw[col].dropna()
+                        val = valid.iloc[-1] if len(valid) > 0 else 0.0
+                    latest_closes[sym] = val
+                else:
+                    latest_closes[sym] = 0.0
 
         from decimal import Decimal
         capital = self.config.get("CAPITAL", 100)
