@@ -85,13 +85,9 @@ def _make_orb(config_overrides=None, symbols=None):
 
     inst.vertical_features = pd.DataFrame(vf_rows)
     inst.features = inst.vertical_features.copy()
-    # `raw` must END at the row predict() targets — see the same note in
-    # test_trading.py. The old index stopped a day short of `settled_ts`, which
-    # `_fetch_and_prepare_data` cannot produce.
     inst.raw = pd.DataFrame(
         raw_data,
-        index=pd.DatetimeIndex(
-            [settled_ts - pd.Timedelta(minutes=15), settled_ts]),
+        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
     )
     inst._data_fresh = True
     return inst
