@@ -78,9 +78,16 @@ def orb(base_config):
         "position": ["long"],
     })
     inst.features = inst.vertical_features.copy()
+    # `raw` must END at the row predict() targets — `_align_timeframes` builds
+    # `features` on the BASE_TF raw index, so `vertical_features["timestamp"]`
+    # can never run past `raw.index.max()`. The old index ("2024-12-30",
+    # "2024-12-31") ran a day SHORT of `settled_ts`, a state the real
+    # `_fetch_and_prepare_data` cannot produce; it went unnoticed only because
+    # the positional `iloc[-2]` never looked at the index at all.
     inst.raw = pd.DataFrame(
         {"BTCUSDT_close": [49000.0, 50000.0]},
-        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
+        index=pd.DatetimeIndex(
+            [settled_ts - pd.Timedelta(minutes=15), settled_ts]),
     )
     inst._data_fresh = True
     return inst
