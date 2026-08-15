@@ -71,6 +71,66 @@ except ImportError:
         pass
 
 
+def _closes_at_timestamp(raw, symbols, target_ts) -> dict:
+    """``{symbol: close}`` read off ``raw`` at ``target_ts``, selected by LABEL.
+
+    ``target_ts`` is ``vertical_features["timestamp"].max()`` — the row
+    ``predict()`` actually ran on. Pricing anywhere else means the order is sent
+    at a different bar than the one the model saw.
+
+    **Why label and not position.** This replaced ``self.raw[col].iloc[-2]``,
+    whose comment ("not the incomplete current candle whose close is NaN") was
+    written for the frame ``_fetch_and_prepare_data`` BUILDS. That frame does end
+    with the in-flight candle — the REST fetch includes it and
+    ``knull/kline_stream.py`` appends it on the WS path on purpose so the two
+    match. But ``self.raw`` is assigned exactly once, in ``_process_combined``,
+    AFTER ``combined = combined.iloc[:-1]`` has already removed it. So ``iloc[-1]``
+    was the just-closed candle and ``iloc[-2]`` was a full ``TIME_UNIT`` older.
+
+    Measured live on hydra 2026-08-15 03:00:14 (``tesseract/probe_agamotto_bars.py``):
+    ``raw`` held ``[02:15, 02:30, 02:45]`` and 699 rows at ``limit=700`` — one
+    row dropped, the in-progress 03:00 candle absent entirely — while
+    ``vertical_features["timestamp"].max()`` was ``02:45``. Across 550 live
+    signals every emitted price matched the ``02:30``-equivalent bar, costing a
+    median +23.8 bps per entry on ltp and +29.6 on sumo.
+
+    Two independent layers each believed they owned the "drop the incomplete
+    bar" step and neither could see the other, because a positional index has no
+    way to state which bar it means. A label can, so the disagreement now raises
+    instead of silently pricing a stale bar.
+
+    A NaN at ``target_ts`` falls back to the last valid close AT OR BEFORE it —
+    never a later one, which would be lookahead and is reachable whenever ``raw``
+    still holds rows past the target. All-NaN or an absent column gives 0.0, which
+    the caller's ``close > 0`` guard turns into "use the init-time size".
+    """
+    symbols = list(symbols or [])
+    if raw is None or raw.empty:
+        return {sym: 0.0 for sym in symbols}
+    if target_ts not in raw.index:
+        raise KeyError(
+            f"predict() targeted {target_ts!r} but it is not present in raw "
+            f"(raw spans {raw.index.min()}..{raw.index.max()}, {len(raw)} rows). "
+            f"The prediction row and the pricing row have diverged — refusing to "
+            f"price at a different bar than the model saw."
+        )
+    out = {}
+    for sym in symbols:
+        col = f"{_symbol_to_native(sym)}_close"
+        if col not in raw.columns:
+            out[sym] = 0.0
+            continue
+        val = raw.at[target_ts, col]
+        if pd.isna(val):
+            logger.warning(
+                "NaN close for %s at %s — falling back to the last valid close "
+                "at or before it", sym, target_ts)
+            valid = raw.loc[:target_ts, col].dropna()
+            val = valid.iloc[-1] if len(valid) else 0.0
+        out[sym] = float(val)
+    return out
+
+
 class AgamottoTrading(AgamottoResearch):
     def __init__(
         self,
@@ -720,30 +780,14 @@ class AgamottoTrading(AgamottoResearch):
         # 4. Aggregate Decisions
         combined_preds = pd.concat(all_predictions, axis=0, ignore_index=True)
         
-        # Get latest close prices for size calculation
-        # We can use self.raw or self.features closest to now
-        # Ideally fetch fresh closes, but self.load_data was called in init/update
-        # Let's map symbols to their latest close in self.raw
-        
-        latest_closes = {}
-        if hasattr(self, 'raw') and not self.raw.empty:
-             for sym in self.config.get("SYMBOLS", []):
-                 native = _symbol_to_native(sym)
-                 col = f"{native}_close"
-                 if col in self.raw.columns:
-                     # Use the last completed candle (iloc[-2]), not the
-                     # incomplete current candle whose close is NaN at
-                     # candle boundaries.  Predictions and orderbook
-                     # pricing never touch the incomplete candle, so
-                     # position sizing shouldn't either.
-                     val = self.raw[col].iloc[-2] if len(self.raw) >= 2 else self.raw[col].iloc[-1]
-                     if pd.isna(val):
-                         logger.warning(f"NaN close price for {sym}, using previous valid close")
-                         valid = self.raw[col].dropna()
-                         val = valid.iloc[-1] if len(valid) > 0 else 0.0
-                     latest_closes[sym] = val
-                 else:
-                     latest_closes[sym] = 0.0
+        # Close prices for sizing AND for the price the executor anchors on.
+        # Taken from the SAME row predict() ran on, selected by LABEL — see
+        # _closes_at_timestamp for why this must never be positional again.
+        latest_closes = _closes_at_timestamp(
+            getattr(self, "raw", None),
+            self.config.get("SYMBOLS", []),
+            target_ts=self.vertical_features["timestamp"].max(),
+        )
 
         # Recalculate sizes using fresh closes so notional ≈ CAPITAL
         from decimal import Decimal
