@@ -44,6 +44,34 @@ from .mm_target import (
 )
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
+# ── Trailing volatility-quantile ENTRY gates (2026-08-16) ────────────────────
+# `price_range_pct` is the per-bar range; its TRAILING quantiles are the cutoffs
+# the `high_vol_q*` regime atoms compare each bar against (research_filters.
+# _VOL_QUANTILE_ATOMS). Cost is a fixed round trip and edge scales
+# super-proportionally with bar volatility, so gating ENTRY on forecast range is
+# cost avoidance, not new alpha.
+#
+# VOL_Q_WINDOW is an OPERATOR-CHOSEN bar count (integer bars, never a duration —
+# CLAUDE.md), matching the existing price_range_pct_q50 window so the new cutoffs
+# and the incumbent median share one lookback. It doubles as `min_periods` so the
+# gate FAILS CLOSED during warmup: at min_periods=1 the rolling quantile of a
+# 1-length window is the value itself, so a nominal-20% q80 gate fires on ~30% of
+# the first 50 bars; at min_periods=VOL_Q_WINDOW it fires on 0% of them (the
+# cutoff is NaN and `x > NaN` is False).
+VOL_Q_WINDOW = 700
+VOL_Q_LEVELS = (0.80, 0.90, 0.95)
+# MUST stay a LITERAL list with a `_FEATURES` suffix: obfuscation/
+# extract_inventory.py (:33 _FEATURE_LIST_SUFFIXES, :90 _collect_str_members)
+# AST-scans list literals. A comprehension over VOL_Q_LEVELS is invisible to the
+# extractor, so these columns would get no feature code, codec.encode_columns
+# would silently omit them, and the REAL column names would leak into the filter
+# parquet. Order must match VOL_Q_LEVELS (asserted in tests).
+VOL_QUANTILE_FEATURES = [
+    "price_range_pct_q80",
+    "price_range_pct_q90",
+    "price_range_pct_q95",
+]
+
 # Import filter definitions and evaluation logic from sub-module
 from .research_filters import (
     _require_col,
@@ -333,6 +361,19 @@ class AgamottoResearch:
                 price_range = (high_series - low_series).rename(f"{base}_price_range")
                 price_range_pct = ((high_series - low_series) / (open_series + 1e-8)).rename(f"{base}_price_range_pct")
                 price_range_pct_q50 = price_range_pct.rolling(700, min_periods=1).quantile(0.5).rename(f"{base}_price_range_pct_q50")
+                # Trailing vol-quantile cutoffs — built exactly like
+                # price_range_pct_q50 above (per SYMBOL, on the WIDE frame, so a
+                # cutoff can never be computed across a symbol boundary), but
+                # with min_periods=VOL_Q_WINDOW instead of 1: warmup must fail
+                # CLOSED (see the VOL_Q_WINDOW comment). The first
+                # VOL_Q_WINDOW-1 bars per symbol are NaN by construction and the
+                # `>` comparison in research_filters makes that a non-firing bar.
+                vol_quantile_cols = [
+                    price_range_pct.rolling(
+                        VOL_Q_WINDOW, min_periods=VOL_Q_WINDOW
+                    ).quantile(level).rename(f"{base}_{name}")
+                    for level, name in zip(VOL_Q_LEVELS, VOL_QUANTILE_FEATURES)
+                ]
                 open_close_diff = (close - open_series).rename(f"{base}_open_close_diff")
                 open_close_pct = (open_close_diff / (open_series + 1e-8)).rename(f"{base}_open_close_pct")
                 high_open_pct = ((high_series - open_series) / (open_series + 1e-8)).rename(f"{base}_high_open_pct")
@@ -572,7 +613,7 @@ class AgamottoResearch:
                     ma1.rename(f"{base}_mvg1"),
                     ma2.rename(f"{base}_mvg2"),
                     ma3.rename(f"{base}_mvg3"),
-                ] + volume_features + ta_features + rolling_stats)
+                ] + vol_quantile_cols + volume_features + ta_features + rolling_stats)
 
                 # Scale-free forms of the seven raw price/volume levels. Pooling
                 # symbols makes a price-unit column act as a symbol ID; measured
@@ -731,6 +772,15 @@ class AgamottoResearch:
                 f"{prefix}_price_range": "price_range",
                 f"{prefix}_price_range_pct": "price_range_pct",
                 f"{prefix}_price_range_pct_q50": "price_range_pct_q50",
+                # THREE EXPLICIT entries, not a comprehension over
+                # VOL_QUANTILE_FEATURES: the drop tripwire below (:827-837) is
+                # scoped to SCALE_FREE_FEATURES only, so a rename entry missing
+                # here drops the column SILENTLY (valid_cols iterates the map,
+                # not the frame) and every high_vol_q* regime then raises on a
+                # column the panel quietly lacks.
+                f"{prefix}_price_range_pct_q80": "price_range_pct_q80",
+                f"{prefix}_price_range_pct_q90": "price_range_pct_q90",
+                f"{prefix}_price_range_pct_q95": "price_range_pct_q95",
                 f"{prefix}_open_close_diff": "open_close_diff",
                 f"{prefix}_open_close_pct": "open_close_pct",
                 f"{prefix}_high_open_pct": "high_open_pct",

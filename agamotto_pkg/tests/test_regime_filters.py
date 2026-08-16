@@ -27,7 +27,17 @@ raise via AgamottoResearch._volume_ratio. See TestVolumeRatioFailsLoud.
 import pandas as pd
 import pytest
 
-from agamotto.research import AgamottoResearch
+from agamotto.research import (
+    AgamottoResearch,
+    VOL_QUANTILE_FEATURES,
+    VOL_Q_LEVELS,
+    VOL_Q_WINDOW,
+)
+from agamotto.research_filters import (
+    _VOL_QUANTILE_ATOMS,
+    comprehensive_sweep_regimes,
+    generate_regime_stack,
+)
 
 MVG_DEPENDENT = AgamottoResearch.MVG_DEPENDENT_FILTERS
 COMBINED = (
@@ -35,12 +45,19 @@ COMBINED = (
     "combined_union_plus", "combined_union_alt",
 )
 
-# Every own-column atom, with the column it reads. These must resolve without
+# Every own-column atom, with the column(s) it reads. These must resolve without
 # close/mvg1/mvg2 present. Doubles as a drift check: a new atom added to the
 # if-chain without a price-column dependency belongs here.
+#
+# Values are `str | tuple[str, ...]`: the trailing vol-quantile atoms
+# (2026-08-16) read TWO columns — `price_range_pct` and their own cutoff — and
+# must raise when EITHER is absent, so a single-string value cannot express them.
 OWN_COLUMN_ATOMS = {
     "high_vol": "price_range_pct",
     "low_vol": "price_range_pct",
+    "high_vol_q80": ("price_range_pct", "price_range_pct_q80"),
+    "high_vol_q90": ("price_range_pct", "price_range_pct_q90"),
+    "high_vol_q95": ("price_range_pct", "price_range_pct_q95"),
     "strong_candle": "open_close_pct",
     "rsi_oversold": "rsi",
     "rsi_overbought": "rsi",
@@ -62,11 +79,18 @@ OWN_COLUMN_ATOMS = {
     "roc_negative": "roc",
 }
 
+
+def _own_columns(name: str) -> tuple:
+    """Normalise an OWN_COLUMN_ATOMS value to a tuple of column names."""
+    col = OWN_COLUMN_ATOMS[name]
+    return (col,) if isinstance(col, str) else tuple(col)
+
+
 # The atoms that resolve their column through AgamottoResearch._volume_ratio,
 # i.e. accept EITHER quote_vol_ratio (preferred) or vol_ratio. Derived from
 # OWN_COLUMN_ATOMS so the two can't drift apart.
 VOLUME_ATOMS = tuple(
-    sorted(n for n, col in OWN_COLUMN_ATOMS.items() if col == "vol_ratio"))
+    sorted(n for n in OWN_COLUMN_ATOMS if _own_columns(n) == ("vol_ratio",)))
 
 
 @pytest.fixture
@@ -85,6 +109,14 @@ def _bare_frame() -> pd.DataFrame:
         # Rolling-700 (expanding, min_periods=1) median: [.1, .3, .5, .35, .5]
         # — chosen so BOTH high_vol and low_vol come out mixed, not all-True.
         "price_range_pct": [0.1, 0.5, 1.0, 0.2, 5.0],
+        # Trailing vol-quantile cutoffs (2026-08-16). Nested q80 <= q90 <= q95
+        # row-wise, like the real trailing quantiles, and chosen so EVERY gate
+        # comes out MIXED — never all-True (the banned baseline shape) and
+        # never all-False (which would hide a broken comparison):
+        #   q80 -> [T, F, T, T, T]   q90 -> [T, F, T, F, F]   q95 -> [T, F, F, F, F]
+        "price_range_pct_q80": [0.05, 0.60, 0.90, 0.15, 4.0],
+        "price_range_pct_q90": [0.08, 0.70, 0.95, 0.30, 6.0],
+        "price_range_pct_q95": [0.09, 0.80, 1.50, 0.50, 7.0],
         "open_close_pct": [-0.01, -0.001, 0.0, 0.001, 0.01],
         "rsi": [10.0, 25.0, 50.0, 75.0, 90.0],
         "macdhist": [-1.0, -0.5, 0.0, 0.5, 1.0],
@@ -151,6 +183,12 @@ class TestOwnColumnFiltersNotGatedOnPriceColumns:
     @pytest.mark.parametrize("name,position,expected", [
         ("high_vol", "long", [False, True, True, False, True]),
         ("low_vol", "long", [False, False, False, True, False]),
+        ("high_vol_q80", "long", [True, False, True, True, True]),
+        ("high_vol_q80", "short", [True, False, True, True, True]),
+        ("high_vol_q90", "long", [True, False, True, False, False]),
+        ("high_vol_q90", "short", [True, False, True, False, False]),
+        ("high_vol_q95", "long", [True, False, False, False, False]),
+        ("high_vol_q95", "short", [True, False, False, False, False]),
         ("strong_candle", "long", [False, False, False, False, True]),
         ("strong_candle", "short", [True, False, False, False, False]),
         ("rsi_oversold", "long", [True, True, False, False, False]),
@@ -453,30 +491,31 @@ class TestOwnColumnMissingRaises:
     @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
     def test_absent_own_column_raises_rather_than_matching_every_row(
             self, research, name):
-        col = OWN_COLUMN_ATOMS[name]
         # Start from the frame that has EVERY own column, then remove only
-        # this atom's input — so nothing else can explain the raise.
-        df = _bare_frame().drop(columns=[col])
-        if name in VOLUME_ATOMS:
-            # These resolve through _volume_ratio, which accepts either
-            # quote_vol_ratio or vol_ratio — drop both to starve it.
-            df = df.drop(columns=["quote_vol_ratio"], errors="ignore")
-        for position in _positions(name):
-            with pytest.raises(ValueError) as exc:
-                research._apply_filter_mask(df, name, position)
-            msg = str(exc.value)
-            assert name in msg, (name, position, msg)
+        # ONE of this atom's inputs at a time — so nothing else can explain
+        # the raise, and a two-column atom is starved on each column in turn.
+        for col in _own_columns(name):
+            df = _bare_frame().drop(columns=[col])
+            if name in VOLUME_ATOMS:
+                # These resolve through _volume_ratio, which accepts either
+                # quote_vol_ratio or vol_ratio — drop both to starve it.
+                df = df.drop(columns=["quote_vol_ratio"], errors="ignore")
+            for position in _positions(name):
+                with pytest.raises(ValueError) as exc:
+                    research._apply_filter_mask(df, name, position)
+                msg = str(exc.value)
+                assert name in msg, (name, position, col, msg)
 
     @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
     def test_error_names_the_missing_column(self, research, name):
         if name in VOLUME_ATOMS:
             pytest.skip("_volume_ratio names the pair, covered by its own test")
-        col = OWN_COLUMN_ATOMS[name]
-        df = _bare_frame().drop(columns=[col])
-        for position in _positions(name):
-            with pytest.raises(ValueError) as exc:
-                research._apply_filter_mask(df, name, position)
-            assert col in str(exc.value), (name, position, str(exc.value))
+        for col in _own_columns(name):
+            df = _bare_frame().drop(columns=[col])
+            for position in _positions(name):
+                with pytest.raises(ValueError) as exc:
+                    research._apply_filter_mask(df, name, position)
+                assert col in str(exc.value), (name, position, str(exc.value))
 
     @pytest.mark.parametrize("name", sorted(OWN_COLUMN_ATOMS))
     def test_present_column_still_yields_a_mask(self, research, name):
@@ -510,3 +549,140 @@ class TestOwnColumnMissingRaises:
         with pytest.raises(ValueError, match="rsi"):
             research._apply_filter_mask(df, "rsi_oversold_and_adx_trend",
                                         "long")
+
+
+class TestVolQuantileGate:
+    """2026-08-16 — trailing vol-quantile ENTRY gates (Scope B).
+
+    `high_vol` (r028) / `low_vol` (r038) split on the trailing MEDIAN, which is
+    a 50/50 cut and appears in ZERO generated regime. These atoms cut at the
+    trailing 80/90/95th percentile of `price_range_pct` instead, so the book
+    only pays the fixed 4.48 bps round trip on bars whose forecast range can
+    cover it. The predicate is position-INVARIANT (like high_vol): it says
+    nothing about direction, only about whether the bar is worth entering.
+    """
+
+    ATOMS = ("high_vol_q80", "high_vol_q90", "high_vol_q95")
+
+    def test_atom_map_is_exactly_the_three_gates(self):
+        assert _VOL_QUANTILE_ATOMS == {
+            "high_vol_q80": "price_range_pct_q80",
+            "high_vol_q90": "price_range_pct_q90",
+            "high_vol_q95": "price_range_pct_q95",
+        }
+
+    def test_feature_list_matches_levels(self):
+        """The LITERAL feature list and the level tuple must agree.
+
+        VOL_QUANTILE_FEATURES has to stay a literal list with a `_FEATURES`
+        suffix: obfuscation/extract_inventory.py AST-scans list literals, so a
+        comprehension over VOL_Q_LEVELS would be invisible to the extractor,
+        get no feature code, and codec.encode_columns would then silently omit
+        the columns — leaking the real names into the filter parquet.
+        """
+        assert len(VOL_QUANTILE_FEATURES) == len(VOL_Q_LEVELS)
+        for name, level in zip(VOL_QUANTILE_FEATURES, VOL_Q_LEVELS):
+            assert name == f"price_range_pct_q{int(round(level * 100))}"
+        assert list(_VOL_QUANTILE_ATOMS.values()) == list(VOL_QUANTILE_FEATURES)
+
+    def test_window_is_the_q50_window(self):
+        assert VOL_Q_WINDOW == 700
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_mask_is_position_invariant(self, research, name):
+        bare = _bare_frame()
+        long_mask = research._apply_filter_mask(bare, name, "long")
+        short_mask = research._apply_filter_mask(bare, name, "short")
+        assert long_mask.tolist() == short_mask.tolist()
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_mask_is_mixed_never_all_true_or_all_false(self, research, name):
+        mask = research._apply_filter_mask(_bare_frame(), name, "long")
+        assert mask.any(), f"{name} fired on NO bar"
+        assert not mask.all(), f"{name} fired on EVERY bar (baseline shape)"
+
+    def test_gates_nest_by_level(self, research):
+        """q95 ⊆ q90 ⊆ q80 — a higher cutoff can only fire on fewer bars."""
+        bare = _bare_frame()
+        q80, q90, q95 = (
+            research._apply_filter_mask(bare, n, "long") for n in self.ATOMS)
+        assert (q95 <= q90).all()
+        assert (q90 <= q80).all()
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_missing_cutoff_column_raises(self, research, name):
+        """No rolling fallback: the cutoff is computed per SYMBOL on the wide
+        frame, and a fallback here would run on the STACKED panel and cross
+        symbol boundaries. Absent column must raise, never all-True."""
+        col = _VOL_QUANTILE_ATOMS[name]
+        df = _bare_frame().drop(columns=[col])
+        for position in ("long", "short"):
+            with pytest.raises(ValueError, match="requires column") as exc:
+                research._apply_filter_mask(df, name, position)
+            assert col in str(exc.value)
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_missing_price_range_pct_raises(self, research, name):
+        df = _bare_frame().drop(columns=["price_range_pct"])
+        for position in ("long", "short"):
+            with pytest.raises(ValueError, match="price_range_pct"):
+                research._apply_filter_mask(df, name, position)
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_codec_round_trip(self, name):
+        """The extractor tripwire: an atom the AST scan never saw gets no code,
+        so encode_regime raises and the atom can never reach a stack."""
+        from agamotto._obf.codec import default
+        c = default()
+        assert c.decode_regime(c.encode_regime(name)) == name
+
+    def test_atoms_are_in_the_generated_map(self):
+        import json
+        from pathlib import Path
+        import agamotto
+        map_path = Path(agamotto.__file__).parent / "_obf" / "map.json"
+        regimes = json.loads(map_path.read_text())["regimes"]
+        for name in self.ATOMS:
+            assert name in regimes, name
+
+    def test_sweep_carries_the_vol_gates(self):
+        assert AgamottoResearch._SWEEP_VOL_FILTERS == [
+            "low_volume", "high_volume", "vol_breakout",
+            "high_vol", "high_vol_q80", "high_vol_q90", "high_vol_q95",
+        ]
+
+    def test_comprehensive_sweep_count(self):
+        # 7 vol + 14 tech + 7*14 crosses
+        assert len(comprehensive_sweep_regimes()) == 119
+
+    def test_base_regimes_scope_b_counts(self):
+        from agamotto.research_filters import BASE_REGIMES
+        assert len(BASE_REGIMES) == 132        # 33 ungated + 33*3 gated
+        assert len(set(BASE_REGIMES)) == 132   # no duplicates
+        assert len(generate_regime_stack()) == 224   # 56 ungated + 56*3 gated
+
+    def test_every_gated_regime_is_a_parent_plus_one_gate(self):
+        from agamotto.research_filters import BASE_REGIMES
+        ungated = [r for r in BASE_REGIMES
+                   if not any(r.endswith(f"_and_{a}") for a in self.ATOMS)]
+        assert len(ungated) == 33
+        for atom in self.ATOMS:
+            gated = [r for r in BASE_REGIMES if r.endswith(f"_and_{atom}")]
+            assert [r[: -len(f"_and_{atom}")] for r in gated] == ungated
+
+    def test_no_baseline_anywhere(self):
+        from agamotto.research_filters import BASE_REGIMES
+        for r in BASE_REGIMES:
+            assert "baseline" not in r, r
+        for r in comprehensive_sweep_regimes():
+            assert "baseline" not in r, r
+
+    def test_gated_composite_equals_and_of_parent_and_gate(self, research):
+        full = _full_frame()
+        composite = research._apply_filter_mask(
+            full, "vol_breakout_and_strong_trend_and_high_vol_q80", "long")
+        parent = research._apply_filter_mask(
+            full, "vol_breakout_and_strong_trend", "long")
+        gate = research._apply_filter_mask(full, "high_vol_q80", "long")
+        assert composite.tolist() == (parent & gate).tolist()
+        assert composite.sum() <= parent.sum()
