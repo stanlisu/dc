@@ -109,12 +109,32 @@ _VOL_QUANTILE_ATOMS = {
 # the single 1-atom parent, `vol_breakout`). apply_filter_mask splits on `_and_`
 # and ANDs every part, and allowed_positions handles an arbitrary number of
 # parts, so no parser change is needed. 33 + 33*3 = 132 names.
+#
+# Scope C (2026-08-16): the UNDILUTED gate. Every one of the 33 Scope-B parents
+# is itself parented on `high_volume`, `low_volume` or `vol_breakout`; volume and
+# bar range co-move, so in conjunction the nominal-5% q95 gate fired on 14.71% of
+# pooled bars (per-leg median 28.98%) — 3x nominal — and whole-book gross daily
+# Sharpe HALVED (+0.3719 -> +0.1792) instead of staying flat. The surrogate that
+# motivated the gate measured it on the whole book with NO volume parent at all,
+# so Scope B tested the hypothesis in the one configuration guaranteed to weaken
+# it. These 45 names carry the gate with no volume parent: the 3 bare atoms (the
+# direct analogue of the surrogate) and their crosses with the 14 non-volume tech
+# atoms of _SWEEP_TECH_FILTERS. 3 + 3*14 = 45.
+#
+# 132 + 45 = 177 names / 299 (regime, position) rows.
 # `baseline` appears nowhere — every parent and every gate is conditional.
+_VOL_QUANTILE_BARE = list(_VOL_QUANTILE_ATOMS)
+_VOL_QUANTILE_TECH_CROSSES = [
+    f"{tech}_and_{atom}"
+    for atom in _VOL_QUANTILE_ATOMS
+    for tech in _SWEEP_TECH_FILTERS
+]
+
 BASE_REGIMES = _BASE_REGIMES_UNGATED + [
     f"{regime}_and_{atom}"
     for atom in _VOL_QUANTILE_ATOMS
     for regime in _BASE_REGIMES_UNGATED
-]
+] + _VOL_QUANTILE_BARE + _VOL_QUANTILE_TECH_CROSSES
 
 
 def allowed_positions(filter_name: str) -> list:

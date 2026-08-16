@@ -657,18 +657,70 @@ class TestVolQuantileGate:
 
     def test_base_regimes_scope_b_counts(self):
         from agamotto.research_filters import BASE_REGIMES
-        assert len(BASE_REGIMES) == 132        # 33 ungated + 33*3 gated
-        assert len(set(BASE_REGIMES)) == 132   # no duplicates
-        assert len(generate_regime_stack()) == 224   # 56 ungated + 56*3 gated
+        # 33 ungated + 33*3 volume-parented gated (Scope B)
+        #  + 3 bare gates + 3*14 tech-crossed gates (Scope C) = 177
+        assert len(BASE_REGIMES) == 177
+        assert len(set(BASE_REGIMES)) == 177   # no duplicates
+        assert len(generate_regime_stack()) == 299   # 224 (Scope B) + 75
 
     def test_every_gated_regime_is_a_parent_plus_one_gate(self):
-        from agamotto.research_filters import BASE_REGIMES
+        from agamotto.research_filters import (
+            BASE_REGIMES, _BASE_REGIMES_UNGATED, _SWEEP_TECH_FILTERS)
         ungated = [r for r in BASE_REGIMES
-                   if not any(r.endswith(f"_and_{a}") for a in self.ATOMS)]
+                   if not any(r.endswith(f"_and_{a}") for a in self.ATOMS)
+                   and r not in self.ATOMS]
+        assert ungated == _BASE_REGIMES_UNGATED
         assert len(ungated) == 33
+        # Scope B parents (volume-parented) then Scope C parents (tech atoms).
         for atom in self.ATOMS:
             gated = [r for r in BASE_REGIMES if r.endswith(f"_and_{atom}")]
-            assert [r[: -len(f"_and_{atom}")] for r in gated] == ungated
+            parents = [r[: -len(f"_and_{atom}")] for r in gated]
+            assert parents == _BASE_REGIMES_UNGATED + _SWEEP_TECH_FILTERS
+
+    def test_scope_c_bare_atoms_and_tech_crosses_present(self):
+        """Scope C: the gate WITHOUT a volume parent.
+
+        Every one of the 33 Scope-B parents is itself parented on
+        high_volume / low_volume / vol_breakout. Volume and range co-move, so
+        in conjunction the nominal-5% q95 gate fired on 14.71% of pooled bars.
+        These 45 names carry no volume parent at all.
+        """
+        from agamotto.research_filters import BASE_REGIMES, _SWEEP_TECH_FILTERS
+        for atom in self.ATOMS:
+            assert atom in BASE_REGIMES, atom
+            for tech in _SWEEP_TECH_FILTERS:
+                assert f"{tech}_and_{atom}" in BASE_REGIMES
+        # …and no volume atom leaks into a Scope C name.
+        scope_c = list(self.ATOMS) + [
+            f"{t}_and_{a}" for a in self.ATOMS for t in _SWEEP_TECH_FILTERS]
+        assert len(scope_c) == 45
+        for name in scope_c:
+            for vol in ("low_volume", "high_volume", "vol_breakout"):
+                assert vol not in name, name
+
+    def test_bare_gate_is_position_invariant(self):
+        from agamotto.research_filters import allowed_positions
+        for atom in self.ATOMS:
+            assert allowed_positions(atom) == ["long", "short"]
+
+    @pytest.mark.parametrize("name", ATOMS)
+    def test_tech_cross_equals_and_of_tech_and_gate(self, research, name):
+        full = _full_frame()
+        for position in ("long", "short"):
+            composite = research._apply_filter_mask(
+                full, f"adx_trend_and_{name}", position)
+            tech = research._apply_filter_mask(full, "adx_trend", position)
+            gate = research._apply_filter_mask(full, name, position)
+            assert composite.tolist() == (tech & gate).tolist()
+
+    def test_scope_c_codec_round_trip(self):
+        """No map regeneration needed: the atoms already carry codes from
+        _SWEEP_VOL_FILTERS, and the tech atoms from _SWEEP_TECH_FILTERS."""
+        from agamotto._obf.codec import default
+        from agamotto.research_filters import BASE_REGIMES
+        c = default()
+        for name in BASE_REGIMES:
+            assert c.decode_regime(c.encode_regime(name)) == name
 
     def test_no_baseline_anywhere(self):
         from agamotto.research_filters import BASE_REGIMES
