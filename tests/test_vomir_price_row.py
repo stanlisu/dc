@@ -81,11 +81,18 @@ def _import_dc_source():
     before collection begins, which would make this helper redundant. That moves
     ~649 tests off marvel's blobs onto dc source and is deliberately not bundled
     here.
+
+    Records what it mutated into `_RESTORED` so
+    `test_import_of_dc_source_restored_what_it_touched` can pin the restore itself
+    rather than any particular resulting `sys.path` shape — see that test.
     """
+    def _tracked_modules():
+        return {n: m for n, m in sys.modules.items()
+                if n in ("vomir", "agamotto")
+                or n.startswith(("vomir.", "agamotto."))}
+
     saved_path = list(sys.path)
-    saved_modules = {n: m for n, m in sys.modules.items()
-                     if n in ("vomir", "agamotto")
-                     or n.startswith(("vomir.", "agamotto."))}
+    saved_modules = _tracked_modules()
     try:
         for pkg in ("agamotto_pkg", "vomir_pkg"):
             sys.path.insert(0, str(_ROOT / pkg / "src"))
@@ -96,13 +103,18 @@ def _import_dc_source():
         return dc_vomir_trading, dc_vomir_classifier
     finally:
         sys.path[:] = saved_path
-        for name in [n for n in sys.modules
-                     if n in ("vomir", "agamotto")
-                     or n.startswith(("vomir.", "agamotto."))]:
+        for name in list(_tracked_modules()):
             del sys.modules[name]
         sys.modules.update(saved_modules)
+        _RESTORED.update(
+            path_before=saved_path,
+            path_after=list(sys.path),
+            modules_before=saved_modules,
+            modules_after=_tracked_modules(),
+        )
 
 
+_RESTORED: dict = {}
 _VT, _VC = _import_dc_source()
 VomirTrading = _VT.VomirTrading
 CLASS_LONG, CLASS_NEUTRAL, CLASS_SHORT = (
@@ -132,19 +144,51 @@ def test_this_suite_actually_exercises_dc_source():
         f"vomir bound marvel's agamotto, so the eviction missed a module")
 
 
-def test_import_of_dc_source_did_not_leak_into_sys_modules():
-    """`_import_dc_source` must not leak. Attempt 2 evicted without restoring and
-    broke `vomir_pkg/tests`' string patches from three directories away; this pins
-    that it cannot happen again.
+def test_import_of_dc_source_restored_what_it_touched():
+    """`_import_dc_source` must leave the interpreter as it found it. Attempt 2
+    evicted without restoring and broke `vomir_pkg/tests`' string patches from three
+    directories away; this pins that it cannot happen again.
 
-    Asserted as "not ours" rather than "is marvel's": the ambient binding depends
-    on what else the session imported, and asserting on that would reintroduce the
-    order dependence this file exists to remove."""
-    ambient = sys.modules.get("vomir.trading")
-    assert ambient is not _VT, "our private dc module leaked into sys.modules"
-    assert str(_ROOT / "vomir_pkg" / "src") not in sys.path, (
-        "sys.path was not restored — a later test file's bare import would "
-        "silently switch trees")
+    ASSERTS RESTORATION, NOT ABSENCE — and that distinction is the whole point,
+    because the first version of this guard got it wrong and only CI caught it. It
+    asserted `vomir_pkg/src not in sys.path`, which is a property of the ENVIRONMENT,
+    not of this helper:
+
+      * locally, marvel is editable-installed, dc's bare imports resolve to its
+        PyArmor blobs, and nothing ever inserts `*_pkg/src` — so the path stays
+        clean and the assertion passed;
+      * on CI there is no marvel install, so dc's other test files insert their own
+        `*_pkg/src` entries (the failing run showed `orb_pkg/src`,
+        `agamotto_pkg/src` TWICE, `aether_pkg/src` already present). `vomir_pkg/src`
+        was on the path because OTHER files put it there, and this helper's restore
+        must not — and does not — remove their entries.
+
+    So it failed for a reason with nothing to do with leaking, and it would have
+    failed again the moment the root-conftest change landed. The invariant that is
+    actually true in both environments, and the one attempt 2 violated, is
+    difference-based: whatever `sys.path` and the `vomir`/`agamotto` corner of
+    `sys.modules` looked like on entry, they look identical on exit.
+    """
+    assert _RESTORED, "_import_dc_source did not record its snapshots"
+
+    # sys.path: exact list equality, including order and any duplicates other
+    # files left behind. `sys.path[:] = saved_path` makes this exact by construction.
+    assert _RESTORED["path_after"] == _RESTORED["path_before"], (
+        "sys.path not restored; diff = "
+        f"{set(_RESTORED['path_after']) ^ set(_RESTORED['path_before'])}")
+
+    # sys.modules: same names bound to the same OBJECTS. Identity matters — swapping
+    # marvel's `vomir.trading` for dc's while leaving the key in place is precisely
+    # what broke `vomir_pkg/tests`' string-target patches.
+    before, after = _RESTORED["modules_before"], _RESTORED["modules_after"]
+    assert set(after) == set(before), (
+        f"tracked sys.modules key set changed; diff = {set(after) ^ set(before)}")
+    rebound = [n for n in before if after[n] is not before[n]]
+    assert not rebound, f"these modules were rebound to different objects: {rebound}"
+
+    # And our private module must not be what the session sees under that name.
+    assert sys.modules.get("vomir.trading") is not _VT, (
+        "our private dc module leaked into sys.modules")
 
 
 def _artifacts():
