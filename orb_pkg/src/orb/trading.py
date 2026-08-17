@@ -32,70 +32,42 @@ from .research import OrbResearch
 logger = logging.getLogger(__name__)
 
 
-def _closes_at_timestamp(raw, symbols, target_ts) -> dict:
-    """``{symbol: close}`` read off ``raw`` at ``target_ts``, selected by LABEL.
-
-    ``target_ts`` is ``vertical_features["timestamp"].max()`` — the row
-    ``predict()`` actually ran on. Pricing anywhere else means the order is sent
-    at a different bar than the one the model saw.
-
-    **Why label and not position.** This replaced ``self.raw[col].iloc[-2]``,
-    inherited from ``AgamottoTrading`` along with the premise "the last row is
-    the incomplete candle". orb falsifies that premise on BOTH data paths, for
-    two different reasons: the REST path fetches ``limit + 1`` bars and drops the
-    in-flight one (:427-431) before assigning ``self.raw`` (:447), while the WS
-    path never holds the in-flight bar at all (:320-322) and assigns ``self.raw``
-    at :333. Those two assignments are the only ones, and both sit downstream of
-    the drop — so ``iloc[-1]`` IS the just-closed bar and ``iloc[-2]`` is a full
-    ``BASE_TF`` older.
-
-    **What ``predict()`` targets, verified for orb rather than assumed.** orb is
-    cross-TF, so the target row needed its own check. ``predict`` selects
-    ``vertical_features["timestamp"].max()``; ``OrbResearch.verticalize`` sets
-    that column to ``self.features.index`` (research.py:392); ``_align_timeframes``
-    builds ``self.features`` on ``base_idx``, the BASE_TF features index
-    (research.py:443, :575); and ``engineer_features`` preserves ``raw.index``
-    row-for-row. Higher TFs are ``merge_asof``'d ONTO that index and never widen
-    it. So the target equals ``self.raw.index.max()`` — the settled bar that
-    ``iloc[-2]`` misses by one, exactly as in agamotto.
-
-    orb is not live, so this cost nothing; the same pairing did cost agamotto a
-    median +23.8 bps per entry on ltp (dc ``f47d588``, hydra 2026-08-15).
-
-    Two independent layers each believed they owned the "drop the incomplete
-    bar" step and neither could see the other, because a positional index has no
-    way to state which bar it means. A label can, so the disagreement now raises
-    instead of silently pricing a stale bar.
-
-    A NaN at ``target_ts`` falls back to the last valid close AT OR BEFORE it —
-    never a later one, which would be lookahead and is reachable whenever ``raw``
-    still holds rows past the target. All-NaN or an absent column gives 0.0,
-    which the caller's ``close > 0`` guard turns into "use the init-time size".
-    """
-    symbols = list(symbols or [])
-    if raw is None or raw.empty:
-        return {sym: 0.0 for sym in symbols}
-    if target_ts not in raw.index:
-        raise KeyError(
-            f"predict() targeted {target_ts!r} but it is not present in raw "
-            f"(raw spans {raw.index.min()}..{raw.index.max()}, {len(raw)} rows). "
-            f"The prediction row and the pricing row have diverged — refusing "
-            f"to price at a different bar than the model saw.")
-    out: dict[str, float] = {}
-    for sym in symbols:
-        col = f"{_symbol_to_native(sym)}_close"
-        if col not in raw.columns:
-            out[sym] = 0.0
-            continue
-        val = raw.at[target_ts, col]
-        if pd.isna(val):
-            logger.warning(
-                f"NaN close for {sym} at {target_ts} — falling back to the "
-                f"last valid close at or before it")
-            valid = raw.loc[:target_ts, col].dropna()
-            val = valid.iloc[-1] if len(valid) else 0.0
-        out[sym] = float(val)
-    return out
+# ``_closes_at_timestamp`` — re-exported, ONE implementation, in
+# ``agamotto/trading.py``. It reads ``{symbol: close}`` off ``raw`` at
+# ``target_ts`` by LABEL and raises if that label is absent, replacing the
+# ``self.raw[col].iloc[-2]`` orb inherited from ``AgamottoTrading`` along with the
+# premise "the last row is the incomplete candle".
+#
+# WHY THE PREMISE IS FALSE IN ORB, on BOTH data paths and for two different
+# reasons: the REST path fetches ``limit + 1`` bars and drops the in-flight one
+# (``_fetch_and_prepare_data``, :496-497) before assigning ``self.raw`` (:513),
+# while the WS path never holds the in-flight bar at all (:385-386, "WS buffer
+# only contains closed bars — do NOT drop the last bar") and assigns ``self.raw``
+# at :399. Those two assignments are the ONLY ones, and both sit downstream of
+# the drop — so ``iloc[-1]`` IS the just-closed bar and ``iloc[-2]`` is a full
+# ``BASE_TF`` older.
+#
+# WHAT ``predict()`` TARGETS, verified for orb rather than assumed — orb is
+# cross-TF, so the target row needed its own check. ``predict`` selects
+# ``vertical_features["timestamp"].max()`` (:559); ``OrbResearch.verticalize``
+# sets that column to ``self.features.index`` (research.py:392);
+# ``_align_timeframes`` builds ``self.features`` on ``base_idx``, the BASE_TF
+# features index (research.py:441-443, :577); and ``engineer_features`` preserves
+# ``raw.index`` row-for-row. Higher TFs are ``merge_asof``'d ONTO that index and
+# never widen it. So the target equals ``self.raw.index.max()`` — the settled bar
+# that ``iloc[-2]`` misses by one, exactly as in agamotto.
+#
+# orb is not live, so this cost nothing; the same pairing did cost agamotto a
+# median +23.8 bps per entry on ltp (dc ``f47d588``, hydra 2026-08-15).
+#
+# WHY IMPORTED AND NOT COPIED (2026-08-17). ``74ce8a1`` ported the helper into
+# this module by duplication, and it promptly drifted: ``cb454fd`` hardened
+# agamotto's copy the same day — an order-independent NaN fallback (label slicing
+# a non-monotonic index silently falls back to POSITIONAL slicing and reaches
+# FORWARD in time, rebuilding the lookahead inside the repair) plus a
+# duplicate-label guard — and neither reached this copy. Two copies of the same
+# rule is how engines drift apart; there is now one.
+from agamotto.trading import _closes_at_timestamp  # noqa: F401
 
 
 class OrbTrading(OrbResearch):

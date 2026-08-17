@@ -9,13 +9,24 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from agamotto.utils import (
-    _symbol_to_native,
-    _timeframe_to_seconds,
-)
-
 from .research import AetherResearch
 from agamotto.research import _obf
+# ONE implementation, in `agamotto/trading.py` — see the rationale block in
+# `orb/trading.py` for why this is imported and not copied.
+#
+# WHY AETHER NEEDS IT (verified 2026-08-17, not inherited by assumption).
+# `AetherTrading` extends `AetherResearch` -> `OrbResearch`, NOT `AgamottoTrading`
+# and NOT `OrbTrading`, so neither fix reached it: it carried its own
+# `self.raw[col].iloc[-2]` until this commit. `dc f47d588` left it explicitly
+# unverified ("aether has no upstream drop, so its iloc[-2] may be correct").
+# It does have an upstream drop — aether's `load_data` delegates straight to
+# `OrbTrading.load_data(self, ...)` (:144-147), so `self.raw` is orb's, assigned
+# only downstream of orb's in-flight-bar drop. And `AetherResearch` overrides only
+# `__init__`, `create` and `train_pooled_models`, so `engineer_features`,
+# `verticalize` and `_align_timeframes` are OrbResearch's verbatim, putting
+# `vertical_features["timestamp"].max() == self.raw.index.max()`. Hence
+# `iloc[-2]` was a full BASE_TF stale, exactly as in agamotto and orb.
+from agamotto.trading import _closes_at_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -231,23 +242,19 @@ class AetherTrading(AetherResearch):
                     short_votes[sym] += 1
 
         # ---- Step 3: net position per symbol ----
-        from agamotto.utils import _symbol_to_native
         from decimal import Decimal
         capital = self.config.get("CAPITAL", 100)
         lot_sizes = self.config.get("LOT_SIZES", {})
         sizes = self.config.get("SIZES", [])
         symbols = self.config.get("SYMBOLS", [])
 
-        # Latest closes from raw
-        latest_closes: Dict[str, float] = {}
-        if hasattr(self, "raw") and not self.raw.empty:
-            for sym in symbols:
-                native = _symbol_to_native(sym)
-                col = f"{native}_close"
-                if col in self.raw.columns:
-                    val = (self.raw[col].iloc[-2]
-                           if len(self.raw) >= 2 else self.raw[col].iloc[-1])
-                    latest_closes[sym] = float(val) if not pd.isna(val) else 0.0
+        # Close prices for sizing AND for the price the executor anchors on.
+        # Taken from the SAME row the forward passes above ran on — `target_ts`,
+        # `vertical_features["timestamp"].max()` — selected by LABEL. See
+        # `agamotto.trading._closes_at_timestamp` for why this must never be
+        # positional again.
+        latest_closes: Dict[str, float] = _closes_at_timestamp(
+            getattr(self, "raw", None), symbols, target_ts=target_ts)
 
         for sym in symbols:
             net = long_votes.get(sym, 0) - short_votes.get(sym, 0)
