@@ -43,12 +43,70 @@ import pandas as pd
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-# Must precede the marvel install — see the module docstring.
-sys.path.insert(0, str(_ROOT / "agamotto_pkg" / "src"))
-sys.path.insert(0, str(_ROOT / "vomir_pkg" / "src"))
 
-from vomir.classifier import CLASS_LONG, CLASS_NEUTRAL, CLASS_SHORT  # noqa: E402
-from vomir.trading import VomirTrading  # noqa: E402
+
+def _import_dc_source():
+    """Return dc's own `vomir.trading` module, whatever was imported first, and
+    leave `sys.modules` exactly as it was found.
+
+    THREE ATTEMPTS, because the first two were wrong and the reasons are the
+    interesting part.
+
+    1. `sys.path.insert` alone (first draft). Inert: `sys.path` is consulted only
+       on a module's FIRST import, and `vomir_pkg/tests/*` bare-import
+       `vomir.trading`. Collect `vomir_pkg` before `tests` and
+       `sys.modules["vomir.trading"]` is already marvel's PyArmor blob. The suite
+       then passed or failed on COLLECTION ORDER — green under plain `pytest`
+       (where `tests` sorts first) and 4 failures under
+       `pytest vomir_pkg tests/test_vomir_price_row.py`.
+
+    2. Insert + evict `sys.modules`, not restored. Worse: 11 failed / 5 errors in
+       that same order. `vomir_pkg/tests` binds its classes at module import (so it
+       still holds MARVEL's `VomirTrading`) but patches by STRING —
+       `patch("vomir.trading.AgamottoResearch.__init__")` — which re-resolves
+       through `sys.modules` at call time and so hit dc's module instead. Its
+       fixture then instantiated marvel's class with dc's class patched, the real
+       `__init__` ran, and it went looking for weights on disk. Evicting a module
+       another file already imported is not a local act.
+
+    3. This: evict, import off dc, then RESTORE the prior `sys.modules` entries.
+       Order-independent (nothing depends on who imported first) and side-effect
+       free (no other file's string patches move). Safe here only because dc's
+       `vomir/trading.py` has NO function-level imports — verified by grep, every
+       name is bound at module import — so the returned module keeps working after
+       the restore. The corollary is that THIS file must patch by OBJECT, never by
+       string, for exactly the reason attempt 2 failed.
+
+    The proper repo-wide fix is a root `conftest.py` inserting every `*_pkg/src`
+    before collection begins, which would make this helper redundant. That moves
+    ~649 tests off marvel's blobs onto dc source and is deliberately not bundled
+    here.
+    """
+    saved_path = list(sys.path)
+    saved_modules = {n: m for n, m in sys.modules.items()
+                     if n in ("vomir", "agamotto")
+                     or n.startswith(("vomir.", "agamotto."))}
+    try:
+        for pkg in ("agamotto_pkg", "vomir_pkg"):
+            sys.path.insert(0, str(_ROOT / pkg / "src"))
+        for name in saved_modules:
+            del sys.modules[name]
+        import vomir.trading as dc_vomir_trading
+        import vomir.classifier as dc_vomir_classifier
+        return dc_vomir_trading, dc_vomir_classifier
+    finally:
+        sys.path[:] = saved_path
+        for name in [n for n in sys.modules
+                     if n in ("vomir", "agamotto")
+                     or n.startswith(("vomir.", "agamotto."))]:
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+
+
+_VT, _VC = _import_dc_source()
+VomirTrading = _VT.VomirTrading
+CLASS_LONG, CLASS_NEUTRAL, CLASS_SHORT = (
+    _VC.CLASS_LONG, _VC.CLASS_NEUTRAL, _VC.CLASS_SHORT)
 
 T_STALE = pd.Timestamp("2026-08-15 02:30:00")
 T_SETTLED = pd.Timestamp("2026-08-15 02:45:00")   # the row the classifier scores
@@ -56,14 +114,37 @@ BTC = "BINANCE_PERP_BTC_USDT"
 
 
 def test_this_suite_actually_exercises_dc_source():
-    """The whole point of the file. If `vomir.trading` resolves to marvel's
-    PyArmor blob, every assertion below is about a build artifact and none of them
-    is about this repo."""
-    import vomir.trading as vt
-    assert Path(vt.__file__).resolve() == (
+    """The whole point of the file. If `_VT` were marvel's PyArmor blob, every
+    assertion below would be about a build artifact and none of them about this
+    repo. Must hold under ANY collection order — see `_import_dc_source`."""
+    assert Path(_VT.__file__).resolve() == (
         _ROOT / "vomir_pkg" / "src" / "vomir" / "trading.py").resolve(), (
-        f"imported {vt.__file__} — not dc source; a bare `import vomir` picks up "
+        f"imported {_VT.__file__} — not dc source; a bare `import vomir` picks up "
         f"the marvel install, which is exactly what vomir_pkg/tests does")
+    # The helper it prices with must come from dc's agamotto too, not marvel's.
+    # Read off the FUNCTION OBJECT, not `sys.modules` — the restore in
+    # `_import_dc_source` deliberately leaves no `agamotto.trading` entry behind
+    # when the ambient session had none, so a sys.modules lookup KeyErrors.
+    assert _VT._closes_at_timestamp.__module__ == "agamotto.trading"
+    assert Path(_VT._closes_at_timestamp.__code__.co_filename).resolve() == (
+        _ROOT / "agamotto_pkg" / "src" / "agamotto" / "trading.py").resolve(), (
+        f"prices with {_VT._closes_at_timestamp.__code__.co_filename} — dc's "
+        f"vomir bound marvel's agamotto, so the eviction missed a module")
+
+
+def test_import_of_dc_source_did_not_leak_into_sys_modules():
+    """`_import_dc_source` must not leak. Attempt 2 evicted without restoring and
+    broke `vomir_pkg/tests`' string patches from three directories away; this pins
+    that it cannot happen again.
+
+    Asserted as "not ours" rather than "is marvel's": the ambient binding depends
+    on what else the session imported, and asserting on that would reintroduce the
+    order dependence this file exists to remove."""
+    ambient = sys.modules.get("vomir.trading")
+    assert ambient is not _VT, "our private dc module leaked into sys.modules"
+    assert str(_ROOT / "vomir_pkg" / "src") not in sys.path, (
+        "sys.path was not restored — a later test file's bare import would "
+        "silently switch trees")
 
 
 def _artifacts():
@@ -113,9 +194,15 @@ def _vomir(raw):
         "VOMIR_SHORT_THRESHOLD": 0.4,
         "LOT_SIZES": {BTC: {"step_size": 0.001, "min_notional": 5.0}},
     }
-    with patch("vomir.trading.AgamottoResearch.__init__", _fake_research_init), \
-         patch("vomir.trading.VomirClassifier.load_model_artifacts",
-               return_value=_artifacts()), \
+    # Patched by OBJECT, never by string. A string target re-resolves through
+    # `sys.modules` at call time, which this file deliberately leaves bound to
+    # whatever the session already had (marvel's, usually) — so
+    # `patch("vomir.trading.X")` would patch the WRONG tree. That is precisely the
+    # mistake `vomir_pkg/tests` makes and how attempt 2 broke it; see
+    # `_import_dc_source`.
+    with patch.object(_VT.AgamottoResearch, "__init__", _fake_research_init), \
+         patch.object(_VT.VomirClassifier, "load_model_artifacts",
+                      return_value=_artifacts()), \
          patch.object(VomirTrading, "_calculate_sizes"), \
          patch.object(VomirTrading, "load_data"):
         inst = VomirTrading(config=config, home_root="/tmp", skip_load=True)

@@ -16,15 +16,15 @@ WHY NEITHER EARLIER FIX REACHED IT. `AetherTrading` extends `AetherResearch` ->
 `self.raw[col].iloc[-2] if len(self.raw) >= 2 else self.raw[col].iloc[-1]`.
 
 AETHER DOES HAVE AN UPSTREAM DROP, contrary to the note in `f47d588`.
-`AetherTrading.load_data` (aether_pkg/src/aether/trading.py:144-147) is a
+`AetherTrading.load_data` (aether_pkg/src/aether/trading.py:157-160) is a
 three-line delegation to `OrbTrading.load_data(self, limit=limit)`, so `self.raw`
 is built by orb's `_fetch_and_prepare_data` and assigned in exactly orb's two
 places, both downstream of the in-flight-bar drop:
 
-  * REST (orb_pkg/src/orb/trading.py:496-497) drops it — "After this drop we have
-    exactly `limit` closed bars" — and assigns `self.raw` at :513.
-  * WS (:385-386) never has it — "WS buffer only contains closed bars — do NOT
-    drop the last bar" — and assigns at :399.
+  * REST (orb_pkg/src/orb/trading.py:480) drops it — "After this drop we have
+    exactly `limit` closed bars" — and assigns `self.raw` at :496.
+  * WS (:370-371) never has it — "WS buffer only contains closed bars — do NOT
+    drop the last bar" — and assigns at :382.
 
 So `iloc[-1]` IS the just-closed bar and `iloc[-2]` is a full BASE_TF older.
 
@@ -32,14 +32,21 @@ WHAT AETHER'S FORWARD PASSES TARGET. `AetherResearch` overrides only `__init__`,
 `create` and `train_pooled_models` (aether_pkg/src/aether/research.py:22, :25,
 :66), so `engineer_features`, `verticalize` and `_align_timeframes` are
 `OrbResearch`'s verbatim. `make_decision` sets
-`target_ts = self.vertical_features["timestamp"].max()` (:167) and both pooled
-forward passes score only `vertical_features[timestamp == target_ts]`; the regime
-vote at :217 filters on the same label. `verticalize` sets that column to
-`self.features.index` (orb research.py:392) and `_align_timeframes` builds
-`self.features` on the BASE_TF features index (:441-443, :577), which
+`target_ts = self.vertical_features["timestamp"].max()` (aether trading.py:184)
+and both pooled forward passes score only
+`vertical_features[timestamp == target_ts]`; the regime vote at :231 filters on
+the same label. `verticalize` sets that column to `self.features.index` (orb
+research.py:392) and `_align_timeframes` (orb research.py:437) builds
+`self.features` on the BASE_TF features index (:440-441, assigned :575), which
 `engineer_features` carries from `raw.index` row-for-row. Hence
 `vertical_features["timestamp"].max() == self.raw.index.max()` — the settled bar,
 which `iloc[-2]` missed by one.
+
+Every line number above was re-derived by grep against the post-fix tree
+(2026-08-17). An earlier draft of this file carried citations taken from the
+pre-fix orb source, stale by 28 lines because deleting orb's duplicated 63-line
+helper shifted everything below it — which is why the same-file citations inside
+`orb/trading.py` and `aether/trading.py` are now written as SYMBOLS instead.
 
 `create()`'s `self.features = self.features.iloc[:-1]` (aether research.py:37)
 does NOT apply: that is the offline research path, and the live path reaches
@@ -148,13 +155,35 @@ def test_a_symbol_with_no_close_column_prices_zero():
 
 
 def test_a_nan_close_falls_back_to_the_last_valid_one():
-    """Unchanged behaviour: a symbol listed but not trading can carry NaN at its
-    newest bars. Fall back to the last valid close AT OR BEFORE the target —
-    never to a later one, which would be lookahead."""
+    """DELIBERATE BEHAVIOUR CHANGE for aether — NOT a preserved behaviour, and the
+    only one in this fix. Called out because an earlier draft of this docstring
+    labelled it "unchanged", which was simply wrong.
+
+    BEFORE: `float(val) if not pd.isna(val) else 0.0`. A NaN close became **0.0**,
+    and `knull/orb_bridge._decisions_to_signals` (marvel, :156-157) maps
+    `price <= 0` to `("FLAT", price, 0)` — no order at all. So a NaN close meant
+    aether stood down for that symbol on that bar.
+
+    AFTER: the shared helper returns the last valid close AT OR BEFORE the target.
+    So where aether previously placed NOTHING it will now place an order at an
+    OLDER price — a real change in what reaches an executor, not a refactor.
+
+    Kept anyway, for three reasons: it matches agamotto and orb, so all three
+    kline arms fail the same way; it is `logger.warning`-ed on every occurrence,
+    so it is visible rather than silent; and the alternative (0.0 -> FLAT) is the
+    silent-fallback pattern CLAUDE.md bans — it discards the signal without
+    saying so. The blast radius today is zero: aether has no live path (absent
+    from `launch_bots.ALGO_REGISTRY` and `orb_bridge._load_strategy`), so this
+    lands before aether ever trades, which is the point of fixing it now.
+
+    NOT a change for vomir, whose old fallback was already
+    `raw[col].dropna().iloc[-1]` — a close, never 0.0. There the change is only
+    WHICH close (now masked to `index <= target_ts`), and vomir IS live."""
     raw = _raw()
     raw.loc[T_SETTLED, "BTCUSDT_close"] = np.nan
     out = _closes_at_timestamp(raw, [BTC], T_SETTLED)
     assert out[BTC] == pytest.approx(63088.9)
+    assert out[BTC] != 0.0, "0.0 would be the old FLAT-producing behaviour"
 
 
 def test_the_nan_fallback_never_reaches_forward_in_time():

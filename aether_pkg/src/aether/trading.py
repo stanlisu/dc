@@ -19,12 +19,14 @@ from agamotto.research import _obf
 # and NOT `OrbTrading`, so neither fix reached it: it carried its own
 # `self.raw[col].iloc[-2]` until this commit. `dc f47d588` left it explicitly
 # unverified ("aether has no upstream drop, so its iloc[-2] may be correct").
-# It does have an upstream drop — aether's `load_data` delegates straight to
-# `OrbTrading.load_data(self, ...)` (:144-147), so `self.raw` is orb's, assigned
-# only downstream of orb's in-flight-bar drop. And `AetherResearch` overrides only
-# `__init__`, `create` and `train_pooled_models`, so `engineer_features`,
-# `verticalize` and `_align_timeframes` are OrbResearch's verbatim, putting
-# `vertical_features["timestamp"].max() == self.raw.index.max()`. Hence
+# It does have an upstream drop — `AetherTrading.load_data` below is a three-line
+# delegation to `OrbTrading.load_data(self, limit=limit)` (named as a symbol, not a
+# line: editing this comment would shift any number cited here), so `self.raw` is
+# orb's, assigned only downstream of orb's in-flight-bar drop. And `AetherResearch`
+# overrides only `__init__`, `create` and `train_pooled_models` (research.py:22,
+# :25, :66 — a different file, so those numbers are stable), leaving
+# `engineer_features`, `verticalize` and `_align_timeframes` OrbResearch's verbatim
+# and putting `vertical_features["timestamp"].max() == self.raw.index.max()`. Hence
 # `iloc[-2]` was a full BASE_TF stale, exactly as in agamotto and orb.
 from agamotto.trading import _closes_at_timestamp
 

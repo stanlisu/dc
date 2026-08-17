@@ -39,23 +39,34 @@ logger = logging.getLogger(__name__)
 # premise "the last row is the incomplete candle".
 #
 # WHY THE PREMISE IS FALSE IN ORB, on BOTH data paths and for two different
-# reasons: the REST path fetches ``limit + 1`` bars and drops the in-flight one
-# (``_fetch_and_prepare_data``, :496-497) before assigning ``self.raw`` (:513),
-# while the WS path never holds the in-flight bar at all (:385-386, "WS buffer
-# only contains closed bars — do NOT drop the last bar") and assigns ``self.raw``
-# at :399. Those two assignments are the ONLY ones, and both sit downstream of
-# the drop — so ``iloc[-1]`` IS the just-closed bar and ``iloc[-2]`` is a full
-# ``BASE_TF`` older.
+# reasons. Same-file references are given as SYMBOLS, not line numbers: editing
+# this very comment shifts every line below it, and the stale-by-28 citations
+# this block replaced were created exactly that way (by deleting the 63-line
+# duplicated helper that used to stand here).
+#
+#   * REST — ``_fetch_and_prepare_data`` fetches ``limit + 1`` bars, then
+#     ``combined = combined.iloc[:-1]`` under the comment "After this drop we have
+#     exactly `limit` closed bars", and only THEN assigns
+#     ``self.raw = self._tf_instances[self.base_tf].raw`` near the end of the same
+#     method.
+#   * WS — the buffer branch of the same method never holds the in-flight bar
+#     ("WS buffer only contains closed bars — do NOT drop the last bar") and
+#     assigns ``self.raw`` from the same expression.
+#
+# Those two are the ONLY assignments to ``self.raw`` in this module (grep it), and
+# both sit downstream of the drop — so ``iloc[-1]`` IS the just-closed bar and
+# ``iloc[-2]`` is a full ``BASE_TF`` older.
 #
 # WHAT ``predict()`` TARGETS, verified for orb rather than assumed — orb is
-# cross-TF, so the target row needed its own check. ``predict`` selects
-# ``vertical_features["timestamp"].max()`` (:559); ``OrbResearch.verticalize``
-# sets that column to ``self.features.index`` (research.py:392);
-# ``_align_timeframes`` builds ``self.features`` on ``base_idx``, the BASE_TF
-# features index (research.py:441-443, :577); and ``engineer_features`` preserves
-# ``raw.index`` row-for-row. Higher TFs are ``merge_asof``'d ONTO that index and
-# never widen it. So the target equals ``self.raw.index.max()`` — the settled bar
-# that ``iloc[-2]`` misses by one, exactly as in agamotto.
+# cross-TF, so the target row needed its own check. ``OrbTrading.predict`` selects
+# ``target_ts = self.vertical_features["timestamp"].max()``. In the OTHER file,
+# where line numbers are stable: ``OrbResearch.verticalize`` sets that column to
+# ``self.features.index`` (research.py:392); ``_align_timeframes``
+# (research.py:437) builds ``self.features`` on ``base_idx``, the BASE_TF features
+# index (research.py:440-441, assigned research.py:575); and ``engineer_features``
+# preserves ``raw.index`` row-for-row. Higher TFs are ``merge_asof``'d ONTO that
+# index and never widen it. So the target equals ``self.raw.index.max()`` — the
+# settled bar that ``iloc[-2]`` misses by one, exactly as in agamotto.
 #
 # orb is not live, so this cost nothing; the same pairing did cost agamotto a
 # median +23.8 bps per entry on ltp (dc ``f47d588``, hydra 2026-08-15).
