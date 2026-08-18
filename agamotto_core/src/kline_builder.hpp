@@ -66,6 +66,7 @@ class KlineBuilder {
     int64_t duplicatesDropped() const { return mDuplicatesDropped; }
     int64_t lateTradesDropped() const { return mLateTradesDropped; }
     int64_t partialBucketsDropped() const { return mPartialBucketsDropped; }
+    int64_t badTimestampDropped() const { return mBadTimestampDropped; }
 
   private:
     struct Accum {
@@ -102,6 +103,7 @@ class KlineBuilder {
     int64_t mBarsSeen{0};
     int64_t mTradeUpdates{0}, mAggTradeUpdates{0};
     int64_t mDuplicatesDropped{0}, mLateTradesDropped{0}, mPartialBucketsDropped{0};
+    int64_t mBadTimestampDropped{0};
 
     std::deque<KlineBar> mReady;
 };

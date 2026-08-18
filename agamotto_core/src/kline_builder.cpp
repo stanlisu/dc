@@ -12,6 +12,16 @@ namespace {
 constexpr int kTradeUpdate = 6;
 constexpr int kAggTradeUpdate = 7;
 
+// Plausible epoch-millisecond range: 2001-09-09 .. 2286-11-20. This is not
+// defensive boilerplate — it is load-bearing. The SHM Quote's own
+// message.last_trade_ts reads 18359008543379257232 on the live feed (measured
+// 2026-08-18), i.e. uninitialised garbage. Bucketing that value put every
+// trade in one impossible bucket that never closed, and the run produced zero
+// bars with no error anywhere. A range check turns that class of bug into a
+// counted, visible reject instead of silence.
+constexpr int64_t kMinPlausibleMs = 1'000'000'000'000LL;
+constexpr int64_t kMaxPlausibleMs = 10'000'000'000'000LL;
+
 uint64_t nowRealtimeNs()
 {
 	struct timespec ts {};
@@ -203,12 +213,15 @@ void KlineBuilder::onTick(const TickEvent& ev)
 		mHaveLastTradeId = true;
 	}
 
-	// Bucketing uses the TRADE's exchange timestamp — Binance's own assignment
-	// rule. Without it we cannot reproduce their bar membership.
-	if (ev.last_trade_ts_ms == 0) {
+	// Bucketing uses the exchange's event time for the trade — Binance's own
+	// kline assignment rule. Rejected loudly (counted) when implausible: see
+	// kMinPlausibleMs.
+	const int64_t ts_ms_ = static_cast<int64_t>(ev.last_trade_ts_ms);
+	if (ts_ms_ < kMinPlausibleMs || ts_ms_ >= kMaxPlausibleMs) {
+		++mBadTimestampDropped;
 		return;
 	}
-	const int64_t bucket_ = bucketOf(static_cast<int64_t>(ev.last_trade_ts_ms));
+	const int64_t bucket_ = bucketOf(ts_ms_);
 
 	if (!mHaveOpenBucket) {
 		startBucket(bucket_, ev.recv_ts_ns);
