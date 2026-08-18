@@ -99,13 +99,32 @@ quote-rule approximation for an exact figure.
 
 ## Build
 
+**Use `./build_linux.sh`.** It builds in `mjolnir-core-build:latest`
+(rockylinux:8, glibc 2.28 / gcc 8.5 — the oldest deploy target), exactly as
+`../sentinel_core/build_linux.sh` does, and refuses to ship a `.so` that needs a
+newer libstdc++.
+
+```bash
+./build_linux.sh                    # build + self-tests
+./build_linux.sh --deploy dev105    # and copy the .so to a host
+```
+
+**Do NOT build the core in `devbox-v5.1`.** That is the vendor *SDK* image and
+its toolchain is newer: measured 2026-08-18, a core built there requires
+`GLIBCXX_3.4.29`, which hydra happens to have and **dev105 does not**. The
+failure surfaces at `dlopen` on the host that lacks it and reads as a missing
+plugin rather than as a toolchain mismatch. The rockylinux:8 build requires no
+such symbol and resolves on every target.
+
+devbox-v5.1 remains correct for the *plugin* (`libtsAgamotto.so`), which is
+built against the vendor SDK — same split as mjolnir.
+
+A plain cmake invocation still works for local development:
+
 ```bash
 cmake -S . -B build -DSENTINEL_REPO=$HOME/sandbox/sentinel -DAGAMOTTO_CORE_GITSHA=$(git rev-parse --short HEAD)
 cmake --build build -j
 ```
-
-On dev105 build inside `devbox-v5.1` (see `sentinel/README.md`); `docker run -it`
-dies over ssh with no TTY, so invoke docker directly.
 
 Then point the public strategy at it:
 
