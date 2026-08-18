@@ -14,7 +14,7 @@ reasoning, as [`../sentinel_core`](../sentinel_core/README.md).
 |---|---|
 | 15m kline builder from ticks | ✅ 27/27 self-test assertions |
 | Backfill ingestion + validation | ✅ (loader lives in the strategy; CSV is the seam) |
-| Parity vs Binance's own klines | ⏳ harness written, live numbers pending |
+| Parity vs Binance's own klines | ⚠️ **7/9 columns exact; the two taker_buy_\* miss** (below) |
 | Feature engine (~60 cols, 25 TA-Lib) | ❌ Phase 2 |
 | Regime gate (33 base predicates) | ❌ Phase 3 |
 | Ridge runner (top-5 IC per regime) | ❌ Phase 4 |
@@ -50,6 +50,34 @@ The maker-flag gap is the same one `sentinel/README.md` documents for mjolnir's
 `f091`. The field now *exists* in the 20260804 `Quote`; it is simply never set.
 The fix belongs in the Feed Publisher, which has Binance's own flag at parse
 time — no amount of porting recovers it.
+
+## Measured parity, 2026-08-18
+
+Live run on hydra, BTCUSDT, `bar_sec=60` (identical code path to 900, but a
+Binance kline to diff against every minute). 15 minutes: 66,565 quotes, 5,636
+`TRADE_UPDATE`, 0 `AGG_TRADE_UPDATE`, 14 bars, `conv_err=0`. 12 bars compared:
+
+| column | match | worst rel err |
+|---|---|---|
+| open, high, low, close | **12/12** | 0.0 |
+| volume, quote_volume | **12/12** | 0.0 |
+| number_of_trades | **12/12** | 0.0 |
+| `taker_buy_base` | 10/12 | **1.688e-01** |
+| `taker_buy_quote` | 10/12 | **1.689e-01** |
+
+Seven of the nine columns reproduce Binance **exactly**. The two that do not are
+precisely the pair derived from the maker flag. `unclassified` was 0, so these
+are not unsidable trades: the quote rule assigns a side to every trade and is
+simply wrong on about two bars in twelve, by up to ~17%.
+
+That matters downstream because `taker_buy_quote_volume` feeds the
+`buy_pressure` feature, which the model learned on exact values. Closing it
+needs the Feed Publisher to populate `is_buyer_maker` — it has Binance's own
+flag at parse time. No further porting recovers it.
+
+Latency, same run: **recv -> kline built** n=14, min 0.6 / p50 0.8 / p99 1.6 /
+max 1.6 us. **kline -> signal** is not measurable in Phase 1 (`decide()` is a
+no-op); `tests/talib_bench.cpp` bounds it at 268 us p50 for one symbol.
 
 ## The five bar rules
 
