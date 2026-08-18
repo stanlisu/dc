@@ -32,9 +32,32 @@ uint64_t nowRealtimeNs()
 
 } // namespace
 
-KlineBuilder::KlineBuilder(int period_sec)
-  : mPeriodMs(static_cast<int64_t>(period_sec) * 1000)
+KlineBuilder::KlineBuilder(int period_sec, int max_history)
+  : mPeriodMs(static_cast<int64_t>(period_sec) * 1000),
+    mMaxHistory(max_history > 0 ? static_cast<size_t>(max_history) : 1)
 {
+}
+
+void KlineBuilder::pushHistory(const KlineBar& b)
+{
+    // Contiguity is an INVARIANT of mHistory, not an aspiration. A bar that
+    // does not continue the run means everything before it describes a
+    // different, interrupted stretch of time; keeping both halves would let a
+    // 700-bar window straddle the hole and produce numbers that look fine.
+    // So the pre-gap history is discarded and the run restarts here.
+    if (!mHistory.empty()) {
+        const int64_t expected = mHistory.back().bucket_open_ms + mPeriodMs;
+        if (b.bucket_open_ms != expected) {
+            ++mSeamGaps;
+            mLastGapFromMs = expected;
+            mLastGapToMs = b.bucket_open_ms - mPeriodMs;
+            mHistory.clear();
+        }
+    }
+    mHistory.push_back(b);
+    while (mHistory.size() > mMaxHistory) {
+        mHistory.pop_front();
+    }
 }
 
 int64_t KlineBuilder::bucketOf(int64_t ts_ms) const
@@ -50,11 +73,14 @@ int64_t KlineBuilder::bucketOf(int64_t ts_ms) const
 	return ((ts_ms - mPeriodMs + 1) / mPeriodMs) * mPeriodMs;
 }
 
-void KlineBuilder::startBucket(int64_t bucket_open_ms, uint64_t recv_ns)
+void KlineBuilder::startBucket(int64_t bucket_open_ms)
 {
+	// The bar is stamped from the tick that CLOSES it, which arrives later and
+	// is passed to emitCurrent(). Holding a per-bucket recv time here as well
+	// implied the bar was timed from its last contained trade — a different
+	// quantity — so it is gone rather than left to mislead.
 	mCur = Accum{};
 	mCur.bucket_open_ms = bucket_open_ms;
-	mCur.last_recv_ns = recv_ns;
 	mHaveOpenBucket = true;
 }
 
@@ -78,6 +104,7 @@ void KlineBuilder::emitFlat(int64_t bucket_open_ms)
 	b.close_trigger_recv_ns = 0;   // no tick closed it; excluded from latency
 	b.bar_emit_ns = nowRealtimeNs();
 	mReady.push_back(b);
+	pushHistory(b);
 	++mBarsSeen;
 }
 
@@ -135,6 +162,7 @@ void KlineBuilder::emitCurrent(uint64_t close_trigger_recv_ns)
 	mPrevClose = b.close;
 	mHaveClose = true;
 	mReady.push_back(b);
+	pushHistory(b);
 	++mBarsSeen;
 	mHaveOpenBucket = false;
 }
@@ -224,7 +252,7 @@ void KlineBuilder::onTick(const TickEvent& ev)
 	const int64_t bucket_ = bucketOf(ts_ms_);
 
 	if (!mHaveOpenBucket) {
-		startBucket(bucket_, ev.recv_ts_ns);
+		startBucket(bucket_);
 		mCurIsPartial = true;   // Rule 3: attached mid-bucket
 		applyTrade(ev);
 		return;
@@ -238,7 +266,6 @@ void KlineBuilder::onTick(const TickEvent& ev)
 	}
 
 	if (bucket_ == mCur.bucket_open_ms) {
-		mCur.last_recv_ns = ev.recv_ts_ns;
 		applyTrade(ev);
 		return;
 	}
@@ -251,7 +278,7 @@ void KlineBuilder::onTick(const TickEvent& ev)
 			emitFlat(b);
 		}
 	}
-	startBucket(bucket_, ev.recv_ts_ns);
+	startBucket(bucket_);
 	applyTrade(ev);
 }
 
@@ -278,15 +305,45 @@ bool KlineBuilder::ingestBackfill(const KlineBar* bars, int n)
 			return false;   // off-grid: cannot be a Binance bucket
 		}
 		if (i > 0 && bars[i].bucket_open_ms != bars[i - 1].bucket_open_ms + mPeriodMs) {
-			return false;   // gap or out-of-order
+			return false;   // gap or out-of-order within the run
 		}
 	}
-	if (mHaveClose && bars[0].bucket_open_ms <= mCur.bucket_open_ms) {
-		return false;       // would overlap what we already built
+
+	// How the run joins what we already hold. Checked against the RETAINED
+	// history, not against the open live bucket: the previous version compared
+	// with mCur.bucket_open_ms, which is still 0 before the first tick, so a
+	// second overlapping backfill sailed through and double-counted.
+	if (mHistory.empty()) {
+		for (int i = 0; i < n; ++i) {
+			mHistory.push_back(bars[i]);
+		}
+	} else if (bars[n - 1].bucket_open_ms + mPeriodMs == mHistory.front().bucket_open_ms) {
+		// PREPEND — this is the seam fix. The run ends exactly where the
+		// retained history begins, so it closes the hole left by discarding the
+		// partial bucket we attached on.
+		for (int i = n - 1; i >= 0; --i) {
+			mHistory.push_front(bars[i]);
+		}
+	} else if (bars[0].bucket_open_ms == mHistory.back().bucket_open_ms + mPeriodMs) {
+		for (int i = 0; i < n; ++i) {
+			mHistory.push_back(bars[i]);
+		}
+	} else {
+		// Overlaps, or leaves a hole at either end. Refused outright rather
+		// than stitched, since either would silently break contiguity.
+		return false;
 	}
 
-	mPrevClose = bars[n - 1].close;
-	mHaveClose = true;
+	while (mHistory.size() > mMaxHistory) {
+		mHistory.pop_front();
+	}
+
+	// Only advance the live-build seed when the backfill is the NEWEST thing we
+	// hold; a prepend describes older history and must not rewrite prev-close.
+	if (!mHaveClose || bars[n - 1].bucket_open_ms >= mHistory.back().bucket_open_ms) {
+		mPrevClose = mHistory.back().close;
+		mHaveClose = true;
+	}
 	mBarsSeen += n;
 	return true;
 }
