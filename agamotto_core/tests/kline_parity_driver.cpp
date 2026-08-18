@@ -68,7 +68,7 @@ void selftest()
 {
 	std::printf("[1] first bucket is discarded as partial\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 100, 1, 100.0, 1.0, 99.0, 101.0));
 		b.onTick(trade(T0 + P + 10, 2, 200.0, 2.0, 199.0, 201.0));
 		auto bars = drain(b);
@@ -78,7 +78,7 @@ void selftest()
 
 	std::printf("[2] a full bucket produces Binance's nine columns\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 1, 1, 10.0, 1.0, 9.0, 11.0));       // partial, discarded
 		b.onTick(trade(T0 + P + 1, 2, 100.0, 1.0, 99.0, 101.0)); // opens bucket 1
 		b.onTick(trade(T0 + P + 2, 3, 105.0, 2.0, 99.0, 101.0)); // >= ask -> buy
@@ -110,7 +110,7 @@ void selftest()
 
 	std::printf("[3] empty buckets are emitted flat, one per bucket\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 1, 1, 10.0, 1.0, 9.0, 11.0));         // partial
 		b.onTick(trade(T0 + P + 1, 2, 100.0, 1.0, 99.0, 101.0));  // bucket 1
 		b.onTick(trade(T0 + 4 * P + 1, 3, 120.0, 1.0, 119.0, 121.0)); // skips 2 and 3
@@ -127,7 +127,7 @@ void selftest()
 
 	std::printf("[4] aggTrade is counted but never applied (no double count)\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 1, 1, 10.0, 1.0, 9.0, 11.0));
 		b.onTick(trade(T0 + P + 1, 2, 100.0, 1.0, 99.0, 101.0));
 		b.onTick(trade(T0 + P + 2, 0, 100.0, 5.0, 99.0, 101.0, 7)); // aggTrade
@@ -141,7 +141,7 @@ void selftest()
 
 	std::printf("[5] duplicate and late trades are dropped and counted\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 1, 1, 10.0, 1.0, 9.0, 11.0));
 		b.onTick(trade(T0 + P + 1, 5, 100.0, 1.0, 99.0, 101.0));
 		b.onTick(trade(T0 + P + 2, 5, 100.0, 1.0, 99.0, 101.0));  // same id
@@ -154,7 +154,7 @@ void selftest()
 
 	std::printf("[6] a trade exactly on the boundary opens the NEW bucket\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		b.onTick(trade(T0 + 1, 1, 10.0, 1.0, 9.0, 11.0));
 		b.onTick(trade(T0 + P, 2, 100.0, 1.0, 99.0, 101.0));   // exactly at open
 		b.onTick(trade(T0 + 2 * P, 3, 50.0, 1.0, 49.0, 51.0)); // exactly at next open
@@ -167,21 +167,81 @@ void selftest()
 
 	std::printf("[7] backfill validation refuses gaps and off-grid bars\n");
 	{
-		KlineBuilder b(900);
+		KlineBuilder b(900, 1000);
 		KlineBar good[3]{};
 		for (int i = 0; i < 3; ++i) { good[i].bucket_open_ms = T0 + i * P; good[i].close = 10.0 + i; }
 		check(b.ingestBackfill(good, 3), "contiguous on-grid run accepted");
 
-		KlineBuilder b2(900);
+		KlineBuilder b2(900, 1000);
 		KlineBar gap[2]{};
 		gap[0].bucket_open_ms = T0;
 		gap[1].bucket_open_ms = T0 + 2 * P;   // hole
 		check(!b2.ingestBackfill(gap, 2), "gap refused");
 
-		KlineBuilder b3(900);
+		KlineBuilder b3(900, 1000);
 		KlineBar off[1]{};
 		off[0].bucket_open_ms = T0 + 7;       // off grid
 		check(!b3.ingestBackfill(off, 1), "off-grid bucket refused");
+	}
+
+	std::printf("[8] the backfill->live seam leaves no silent hole\n");
+	{
+		// The regression this suite missed: backfill ends at B, the process
+		// attaches mid-way through B+1 (discarded as partial), so the first
+		// built bar is B+2 and bucket B+1 was simply absent from the series
+		// with nothing reporting it.
+		KlineBuilder b(900, 1000);
+		KlineBar bf[4]{};
+		for (int i = 0; i < 4; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 100.0 + i; }
+		check(b.ingestBackfill(bf, 4), "backfill of 4 contiguous bars accepted");
+		check(b.contiguousBars() == 4, "contiguous run is 4, and it is RETAINED");
+
+		b.onTick(trade(T0 + 4 * P + 420000, 1, 200.0, 1.0, 199.0, 201.0)); // mid-bucket
+		b.onTick(trade(T0 + 5 * P + 1000, 2, 210.0, 1.0, 209.0, 211.0));   // closes B+1 (partial)
+		b.onTick(trade(T0 + 6 * P + 1000, 3, 220.0, 1.0, 219.0, 221.0));   // closes B+2
+		auto bars = drain(b);
+		check(bars.size() == 1 && bars[0].bucket_open_ms == T0 + 5 * P,
+		      "first built bar is B+2, one bucket past the backfill");
+		check(b.seamGaps() == 1, "the hole is DETECTED, not silent");
+		check(b.lastGapFromMs() == T0 + 4 * P && b.lastGapToMs() == T0 + 4 * P,
+		      "the missing bucket range is reported exactly");
+		check(b.contiguousBars() == 1,
+		      "warmth falls back to the post-gap run — 5 bars with a hole are not 5 bars");
+
+		// And the hole can be closed without fabricating the partial bucket.
+		KlineBar fill[1]{};
+		fill[0].bucket_open_ms = T0 + 4 * P;
+		fill[0].close = 205.0;
+		check(b.ingestBackfill(fill, 1), "prepending the missing bucket is accepted");
+		check(b.contiguousBars() == 2, "history is contiguous again across the seam");
+	}
+
+	std::printf("[9] backfill that overlaps or leaves a hole is refused\n");
+	{
+		KlineBuilder b(900, 1000);
+		KlineBar a[2]{};
+		a[0].bucket_open_ms = T0; a[1].bucket_open_ms = T0 + P;
+		check(b.ingestBackfill(a, 2), "first run accepted");
+		check(b.ingestBackfill(a, 2) == false,
+		      "re-ingesting the SAME run is refused (previously double-counted)");
+		KlineBar hole[1]{};
+		hole[0].bucket_open_ms = T0 + 3 * P;   // skips T0+2P
+		check(b.ingestBackfill(hole, 1) == false, "run that would leave a hole is refused");
+		KlineBar next[1]{};
+		next[0].bucket_open_ms = T0 + 2 * P;
+		check(b.ingestBackfill(next, 1), "the genuinely adjacent run appends");
+		check(b.contiguousBars() == 3, "and the run is 3");
+	}
+
+	std::printf("[10] history is capped at max_history\n");
+	{
+		KlineBuilder b(900, 3);
+		KlineBar bf[6]{};
+		for (int i = 0; i < 6; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 1.0 + i; }
+		check(b.ingestBackfill(bf, 6), "6 bars ingested into a 3-bar ring");
+		check(b.contiguousBars() == 3, "ring holds the newest 3");
+		check(b.newestBar() != nullptr && b.newestBar()->bucket_open_ms == T0 + 5 * P,
+		      "and the newest is the newest");
 	}
 }
 
@@ -201,7 +261,7 @@ int replay(const char* tick_csv, const char* kline_csv)
 	std::ifstream tf(tick_csv);
 	if (!tf) { std::printf("cannot open %s\n", tick_csv); return 2; }
 
-	KlineBuilder b(900);
+	KlineBuilder b(900, 1000);
 	std::vector<KlineBar> built;
 	std::string line;
 	std::getline(tf, line);   // header

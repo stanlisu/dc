@@ -44,8 +44,10 @@ namespace agamotto {
 class KlineBuilder {
   public:
     // period_sec must divide 86400 — checked by the caller; buckets tile the
-    // UTC day exactly as Binance's do.
-    explicit KlineBuilder(int period_sec);
+    // UTC day exactly as Binance's do. max_history caps the retained bar ring;
+    // pass the warmup requirement, since that is the longest window anything
+    // downstream reads.
+    KlineBuilder(int period_sec, int max_history);
 
     // Feed one adapted tick. Completed bars are appended to the ready queue.
     void onTick(const TickEvent& ev);
@@ -56,9 +58,33 @@ class KlineBuilder {
     // Seed closed bars (REST backfill). Oldest-first, on-grid, contiguous.
     // Returns false and ingests NOTHING on any violation — a silently accepted
     // hole would train the 700-bar rolling windows on a lie.
+    //
+    // Accepts a run that either APPENDS to the retained history (ends before it
+    // begins is the prepend case below) or PREPENDS to it. Prepending is what
+    // closes the backfill->live seam: the process attaches mid-bucket, discards
+    // that partial bucket, and its first built bar is therefore one bucket
+    // later than the newest bar any boot-time backfill could contain. Filling
+    // that hole afterwards is the only way to reach a contiguous window without
+    // fabricating a bar for a bucket we only partly observed.
     bool ingestBackfill(const KlineBar* bars, int n);
 
+    // Total bars ever emitted/ingested. A monotone counter — NOT a warmup
+    // signal; use contiguousBars() for that.
     int64_t barsSeen() const { return mBarsSeen; }
+
+    // Length of the CONTIGUOUS run of retained bars ending at the newest one.
+    // This is what warmth must be judged on: 700 bars with a hole in them are
+    // not 700 bars, and every rolling window spanning the hole is wrong.
+    int  contiguousBars() const { return static_cast<int>(mHistory.size()); }
+
+    // Newest retained bar, or nullptr when empty.
+    const KlineBar* newestBar() const { return mHistory.empty() ? nullptr : &mHistory.back(); }
+
+    // A discontinuity was seen and the pre-gap history discarded. The range is
+    // the buckets that are MISSING, so an operator can fetch exactly them.
+    int64_t seamGaps() const { return mSeamGaps; }
+    int64_t lastGapFromMs() const { return mLastGapFromMs; }
+    int64_t lastGapToMs() const { return mLastGapToMs; }
 
     // Diagnostics for the parity report.
     int64_t tradeUpdates() const { return mTradeUpdates; }
@@ -79,16 +105,17 @@ class KlineBuilder {
         bool    any_exact{false};
         bool    any_quote_rule{false};
         bool    has_any_trade{false};
-        uint64_t last_recv_ns{0};
     };
 
     int64_t bucketOf(int64_t ts_ms) const;
-    void    startBucket(int64_t bucket_open_ms, uint64_t recv_ns);
+    void    pushHistory(const KlineBar& b);
+    void    startBucket(int64_t bucket_open_ms);
     void    emitCurrent(uint64_t close_trigger_recv_ns);
     void    emitFlat(int64_t bucket_open_ms);
     void    applyTrade(const TickEvent& ev);
 
     const int64_t mPeriodMs;
+    const size_t  mMaxHistory;
 
     Accum   mCur{};
     bool    mHaveOpenBucket{false};
@@ -105,7 +132,13 @@ class KlineBuilder {
     int64_t mDuplicatesDropped{0}, mLateTradesDropped{0}, mPartialBucketsDropped{0};
     int64_t mBadTimestampDropped{0};
 
+    int64_t mSeamGaps{0};
+    int64_t mLastGapFromMs{0}, mLastGapToMs{0};
+
     std::deque<KlineBar> mReady;
+    // Retained bars, oldest first, always contiguous by construction — a gap
+    // clears everything before it, because only the contiguous tail is usable.
+    std::deque<KlineBar> mHistory;
 };
 
 } // namespace agamotto

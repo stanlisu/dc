@@ -73,6 +73,12 @@ def main() -> int:
     ap.add_argument("--symbol", required=True)
     ap.add_argument("--interval", required=True, help="must match bar_sec (60 -> 1m, 900 -> 15m)")
     ap.add_argument("--tol", type=float, default=1e-9)
+    ap.add_argument("--min-bars", type=int, default=3,
+                    help="fail if fewer than this many bars could be compared")
+    ap.add_argument("--max-missing-frac", type=float, default=0.10,
+                    help="fail if more than this fraction of built bars have no "
+                         "Binance counterpart (usually an --interval that does not "
+                         "match the log's bar_sec)")
     args = ap.parse_args()
 
     bars = [b for b in parse_log(args.log) if not b["backfill"]]
@@ -117,6 +123,25 @@ def main() -> int:
     aggr = {b["aggr"] for b in bars}
     unclass = sum(b["unclass"] for b in bars)
     lats = [b["lat_us"] for b in bars if b["lat_us"] >= 0]
+    # A gate that reports success on no evidence is worse than no gate. With
+    # compared == 0 the loop above never runs, so match[i] == compared == 0 for
+    # every column, nothing is flagged, and the old version exited 0 — a total
+    # mismatch (e.g. --interval 15m against a bar_sec=60 log, where no open_ms
+    # ever lines up) read as a clean pass.
+    failures = []
+    if compared < args.min_bars:
+        failures.append(f"only {compared} bar(s) could be compared, need >= {args.min_bars}"
+                        f" — {missing} built bar(s) had no Binance counterpart."
+                        f" Does --interval {args.interval} match the log's bar_sec?")
+    total = compared + missing
+    if total and (missing / total) > args.max_missing_frac:
+        failures.append(f"{missing}/{total} built bars had no Binance counterpart"
+                        f" (> {args.max_missing_frac:.0%})")
+    for i, c in enumerate(COLS):
+        if compared and match[i] != compared:
+            failures.append(f"{c}: {match[i]}/{compared} matched, worst rel err {worst[i]:.3e}"
+                            f" at bucket {worst_at[i]}")
+
     print(f"\naggressor_source: {sorted(aggr)}  (quote_rule => taker_buy_* are APPROXIMATIONS)")
     print(f"trades no rule could side: {unclass}")
     if lats:
@@ -124,6 +149,13 @@ def main() -> int:
         p = lambda q: lats[min(int(q * (len(lats) - 1) + 0.5), len(lats) - 1)]
         print(f"recv->bar us: n={len(lats)} min={lats[0]:.1f} p50={p(0.5):.1f} "
               f"p99={p(0.99):.1f} max={lats[-1]:.1f}")
+
+    if failures:
+        print("\nFAIL:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print(f"\nPASS: all 9 columns match on {compared} bars")
     return 0
 
 

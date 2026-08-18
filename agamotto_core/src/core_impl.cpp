@@ -19,7 +19,7 @@ namespace {
 class RealCore final : public ICore {
   public:
     RealCore(int64_t product_id, int bar_sec, int warmup_bars)
-      : mProductId(product_id), mWarmupBars(warmup_bars), mBuilder(bar_sec)
+      : mProductId(product_id), mWarmupBars(warmup_bars), mBuilder(bar_sec, warmup_bars)
     {
     }
 
@@ -45,9 +45,36 @@ class RealCore final : public ICore {
 
     bool barReady(KlineBar* out) override { return mBuilder.pop(out); }
 
+    // Warmth is the length of the CONTIGUOUS retained run, not a count of
+    // bars that have ever gone past. The old form returned barsSeen(), a
+    // monotone counter over bars nothing kept, so the core reported warm on
+    // history it did not hold AND stayed warm across a discontinuity — the two
+    // ways a 700-bar window can be wrong while looking right.
     bool isWarm() const override { return barsBuffered() >= mWarmupBars; }
-    int  barsBuffered() const override { return static_cast<int>(mBuilder.barsSeen()); }
+    int  barsBuffered() const override { return mBuilder.contiguousBars(); }
     int  warmupRequirement() const override { return mWarmupBars; }
+
+    // Everything the run counted. Previously several of these were
+    // incremented and exposed nowhere — a misrouted product_id swallowed every
+    // tick with the only evidence in a counter no caller could read.
+    CoreDiagnostics diagnostics() const override
+    {
+        CoreDiagnostics d{};
+        d.bars_seen = mBuilder.barsSeen();
+        d.contiguous_bars = mBuilder.contiguousBars();
+        d.backfilled_bars = mBackfilled;
+        d.foreign_product_ticks = mForeignProductTicks;
+        d.seam_gaps = mBuilder.seamGaps();
+        d.last_gap_from_ms = mBuilder.lastGapFromMs();
+        d.last_gap_to_ms = mBuilder.lastGapToMs();
+        d.trade_updates = mBuilder.tradeUpdates();
+        d.aggtrade_updates = mBuilder.aggTradeUpdates();
+        d.duplicates_dropped = mBuilder.duplicatesDropped();
+        d.late_trades_dropped = mBuilder.lateTradesDropped();
+        d.partial_buckets_dropped = mBuilder.partialBucketsDropped();
+        d.bad_timestamp_dropped = mBuilder.badTimestampDropped();
+        return d;
+    }
 
     // Phase 1: never fires. Returning a default-constructed Decision (fired =
     // false) is the whole contract here; a caller that mistakes this for "no
