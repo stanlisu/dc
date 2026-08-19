@@ -32,6 +32,14 @@
 //      with no trades: o=h=l=c=previous close, volume 0. Skipping them would
 //      shift every rolling window downstream.
 //   5. A FUTURE-BUCKET EVENT NEVER TOUCHES THE OPEN BAR. That is lookahead.
+//   6. A DISCONTINUITY QUARANTINES THE PRE-GAP RUN, IT DOES NOT DESTROY IT.
+//      Rule 3 GUARANTEES a one-bucket hole at every start: the backfill can
+//      only end at the last closed bucket, and the bucket we attach on is
+//      discarded. Clearing history there threw the whole backfill away on
+//      every start (observed in production: bars_seen=713 contiguous=14/700
+//      backfilled=699 seam_gaps=1). The pre-gap run is held aside instead,
+//      uncounted, until the missing buckets are ingested and it is spliced
+//      back. The hole is never filled by fabricating a bar.
 
 #include <cstdint>
 #include <deque>
@@ -66,6 +74,11 @@ class KlineBuilder {
     // later than the newest bar any boot-time backfill could contain. Filling
     // that hole afterwards is the only way to reach a contiguous window without
     // fabricating a bar for a bucket we only partly observed.
+    //
+    // After any accepted join the quarantined prefix (see quarantine below) is
+    // re-tested: a run that lands exactly on the hole SPLICES the two halves
+    // back into one contiguous deque, which is how the boot seam is repaired
+    // without a restart and without inventing the bucket we only half saw.
     bool ingestBackfill(const KlineBar* bars, int n);
 
     // Total bars ever emitted/ingested. A monotone counter — NOT a warmup
@@ -80,11 +93,64 @@ class KlineBuilder {
     // Newest retained bar, or nullptr when empty.
     const KlineBar* newestBar() const { return mHistory.empty() ? nullptr : &mHistory.back(); }
 
-    // A discontinuity was seen and the pre-gap history discarded. The range is
-    // the buckets that are MISSING, so an operator can fetch exactly them.
+    // Retained bar by position, 0 = oldest. nullptr when out of range — the
+    // caller gets nothing rather than a neighbouring bar. This is the window
+    // the model will read in Phase 2, and it is what lets a test assert that a
+    // repaired bucket holds the INGESTED kline and not a fabricated one.
+    const KlineBar* barAt(int idx) const
+    {
+        if (idx < 0 || static_cast<size_t>(idx) >= mHistory.size()) return nullptr;
+        return &mHistory[static_cast<size_t>(idx)];
+    }
+
+    // A discontinuity was seen and the pre-gap history QUARANTINED (not
+    // destroyed — see mPending). The range is the buckets that are MISSING, so
+    // an operator can fetch exactly them. These two are a record of the LAST
+    // discontinuity and do not shrink as it is repaired; use missingFromMs() /
+    // missingToMs() for the hole that is still outstanding right now.
     int64_t seamGaps() const { return mSeamGaps; }
     int64_t lastGapFromMs() const { return mLastGapFromMs; }
     int64_t lastGapToMs() const { return mLastGapToMs; }
+
+    // --- the quarantine ---------------------------------------------------
+    // Bars that were contiguous until a discontinuity cut them off from the
+    // live run. They are RETAINED but deliberately NOT counted by
+    // contiguousBars(), so warmth stays honest while the hole is open; feeding
+    // the exact missing buckets through ingestBackfill() reunites them.
+    //
+    // WHY this exists: the boot seam is STRUCTURAL, not a fault. The backfill
+    // CSV can only ever end at the last CLOSED bucket, the process then
+    // attaches part-way through the next bucket B and must discard B as a
+    // partial (we missed its early trades), so the first built bar is B+1 and
+    // B is missing by construction. The old code cleared history at that point,
+    // throwing away every backfill bar on every single start and falling back
+    // to a 700-bar live warmup. Bucket B is fetchable the moment it closes, so
+    // the hole is repairable — but only if the other 699 bars still exist.
+    int  pendingBars() const { return static_cast<int>(mPending.size()); }
+
+    // The buckets still missing between the quarantine and the live run,
+    // inclusive. Both 0 when there is nothing outstanding. This is exactly the
+    // range a caller must fetch and ingest to become contiguous again.
+    int64_t missingFromMs() const
+    {
+        return mPending.empty() ? 0 : mPending.back().bucket_open_ms + mPeriodMs;
+    }
+    int64_t missingToMs() const
+    {
+        return (mPending.empty() || mHistory.empty())
+                 ? 0 : mHistory.front().bucket_open_ms - mPeriodMs;
+    }
+
+    // Times a quarantine was successfully reunited with the live run.
+    int64_t seamRepairs() const { return mSeamRepairs; }
+    // Times an OUTSTANDING quarantine was dropped because a second
+    // discontinuity opened; the older segment is then two holes away from live
+    // and repairing it would need both closed, so only the newer is kept.
+    int64_t quarantinesDiscarded() const { return mQuarantinesDiscarded; }
+    // Bars whose bucket was not strictly newer than the retained history —
+    // a rewind, not a gap. Never written into history (that would rewrite the
+    // past); counted so a wrong-clock or stale feed is visible.
+    int64_t rewoundBarsDropped() const { return mRewoundBarsDropped; }
 
     // Diagnostics for the parity report.
     int64_t tradeUpdates() const { return mTradeUpdates; }
@@ -134,11 +200,21 @@ class KlineBuilder {
 
     int64_t mSeamGaps{0};
     int64_t mLastGapFromMs{0}, mLastGapToMs{0};
+    int64_t mSeamRepairs{0};
+    int64_t mQuarantinesDiscarded{0};
+    int64_t mRewoundBarsDropped{0};
+
+    bool trySplice();
 
     std::deque<KlineBar> mReady;
     // Retained bars, oldest first, always contiguous by construction — a gap
-    // clears everything before it, because only the contiguous tail is usable.
+    // moves everything before it into mPending, because only the contiguous
+    // tail is usable as a rolling window.
     std::deque<KlineBar> mHistory;
+    // The quarantined pre-gap run, oldest first, itself contiguous. Separated
+    // from mHistory by exactly [missingFromMs() .. missingToMs()]. Never
+    // counted toward warmth; only trySplice() can move it back.
+    std::deque<KlineBar> mPending;
 };
 
 } // namespace agamotto

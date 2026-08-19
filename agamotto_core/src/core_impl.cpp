@@ -67,6 +67,12 @@ class RealCore final : public ICore {
         d.seam_gaps = mBuilder.seamGaps();
         d.last_gap_from_ms = mBuilder.lastGapFromMs();
         d.last_gap_to_ms = mBuilder.lastGapToMs();
+        d.pending_bars = mBuilder.pendingBars();
+        d.missing_from_ms = mBuilder.missingFromMs();
+        d.missing_to_ms = mBuilder.missingToMs();
+        d.seam_repairs = mBuilder.seamRepairs();
+        d.quarantines_discarded = mBuilder.quarantinesDiscarded();
+        d.rewound_bars_dropped = mBuilder.rewoundBarsDropped();
         d.trade_updates = mBuilder.tradeUpdates();
         d.aggtrade_updates = mBuilder.aggTradeUpdates();
         d.duplicates_dropped = mBuilder.duplicatesDropped();
