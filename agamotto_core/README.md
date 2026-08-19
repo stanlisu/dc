@@ -140,7 +140,7 @@ startup with `Mismatched shared memory segment, sizeof(T) = 954`.
 ## Tests
 
 ```bash
-./build/kline_parity_driver --selftest                       # 27 assertions
+./build/kline_parity_driver --selftest                       # 84 assertions
 ./build/kline_parity_driver --ticks T.csv --klines K.csv      # offline replay diff
 
 python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
@@ -163,3 +163,47 @@ backfill is not optional in practice. Network I/O stays out of the core — as i
 does for mjolnir, whose weights also come from an external tool — so the seam is
 a CSV written by `fetch_binance_klines.py` and loaded by the strategy before it
 subscribes.
+
+### The boot seam — the CSV MUST be refreshed after startup
+
+There is a **one-bucket hole at every single start**, and it is structural, not a
+fault:
+
+1. `fetch_binance_klines.py` writes only CLOSED bars, so the file ends at the
+   last closed bucket — call the next one **B**, which is still open.
+2. The strategy loads that file, subscribes, and the first live trade lands
+   part-way through **B**.
+3. **B** is discarded as a partial (rule 3): we missed the trades before we
+   attached, and a bar with implausibly low volume is worse than no bar.
+4. So the first bar the core builds is **B+1**, and **B** is in neither half.
+
+The core does **not** fabricate B — it never invents a bucket it half observed.
+Instead it **quarantines** the pre-seam backfill (`pending_bars`), keeps warmth
+honest (`contiguous_bars` counts only the live run), and publishes the exact
+outstanding range as `missing_from_ms .. missing_to_ms`. The strategy re-reads
+`backfill_csv` on each built bar while that range is open, slices exactly it,
+and ingests it; the core splices the quarantine back and the window is
+contiguous across the seam.
+
+**That only works if something refreshes the file after B closes.** Run the
+fetcher alongside the strategy:
+
+```bash
+python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
+    --out <bundle>/config/backfill_BTCUSDT_15m.csv --repeat-sec 60 &
+```
+
+Without it the run does not lie — it is cold and says so on every bar
+(`[AGSEAM] ... is outstanding`, `[AGBAR] warm=0 bars=1/700`) — but it also never
+becomes warm, while holding 699 quarantined bars that would fix it.
+
+Before this, a discontinuity **cleared** history, so every start threw the whole
+backfill away and fell back to 700 live bars. Observed in production:
+
+```
+[AGDIAG] bars_seen=713 contiguous=14/700 backfilled=699 seam_gaps=1
+```
+
+Read `seam_gaps`, `pending_bars`, `seam_repairs` and `missing_from_ms` together:
+`pending_bars > 0` with `missing_from_ms != 0` means the fetcher is not
+refreshing.

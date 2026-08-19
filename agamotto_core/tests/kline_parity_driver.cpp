@@ -213,7 +213,12 @@ void selftest()
 		fill[0].bucket_open_ms = T0 + 4 * P;
 		fill[0].close = 205.0;
 		check(b.ingestBackfill(fill, 1), "prepending the missing bucket is accepted");
-		check(b.contiguousBars() == 2, "history is contiguous again across the seam");
+		// WAS 2, and 2 WAS THE BUG (finding B1): the gap had CLEARED the four
+		// backfill bars, so closing the hole could only ever recover the fill
+		// plus the one live bar, and every start fell back to a live warmup.
+		// The four are now quarantined and spliced back, so the run is 6.
+		check(b.contiguousBars() == 6,
+		      "history is contiguous again across the seam AND the backfill survived");
 	}
 
 	std::printf("[9] backfill that overlaps or leaves a hole is refused\n");
@@ -242,6 +247,190 @@ void selftest()
 		check(b.contiguousBars() == 3, "ring holds the newest 3");
 		check(b.newestBar() != nullptr && b.newestBar()->bucket_open_ms == T0 + 5 * P,
 		      "and the newest is the newest");
+	}
+
+	// ---- finding B1: the boot seam, end to end --------------------------
+	//
+	// The production failure this closes:
+	//     [AGDIAG] bars_seen=713 contiguous=14/700 backfilled=699 seam_gaps=1
+	// 699 backfill bars were ingested and then thrown away by the very first
+	// built bar, every start, because the one bucket between them is missing
+	// BY CONSTRUCTION: fetch_binance_klines.py can only write CLOSED buckets,
+	// and the bucket the process attaches to is discarded as a partial. The
+	// bar layer cannot invent that bucket — it saw only part of it — so the
+	// fix is to keep the 699 alive until the bucket is fetched and spliced in.
+
+	std::printf("[11] boot seam: the 699-bar backfill SURVIVES and repairs to warm\n");
+	{
+		constexpr int kWarm = 700;
+		constexpr int kBackfill = 699;
+		const int64_t B = T0 + kBackfill * P;   // the bucket we attach mid-way through
+
+		KlineBuilder b(900, kWarm);
+		std::vector<KlineBar> bf(kBackfill);
+		for (int i = 0; i < kBackfill; ++i) {
+			bf[i].bucket_open_ms = T0 + static_cast<int64_t>(i) * P;   // ends at B - 1
+			bf[i].close = 100.0 + i;
+			bf[i].from_backfill = true;
+		}
+		check(b.ingestBackfill(bf.data(), kBackfill), "699 closed bars accepted at boot");
+		check(b.contiguousBars() == kBackfill, "699 contiguous, one short of warm");
+
+		// Attach mid-bucket B, then let B+1 and B+2 close normally.
+		b.onTick(trade(B + 420000, 1, 200.0, 1.0, 199.0, 201.0));
+		b.onTick(trade(B + P + 1000, 2, 210.0, 1.0, 209.0, 211.0));
+		b.onTick(trade(B + 2 * P + 1000, 3, 220.0, 1.0, 219.0, 221.0));
+		auto bars = drain(b);
+		check(bars.size() == 1 && bars[0].bucket_open_ms == B + P,
+		      "first EMITTED bar is B+1; bucket B is never emitted");
+		check(b.partialBucketsDropped() == 1, "bucket B discarded as partial, not fabricated");
+
+		// The regression: this used to be 1 (everything before the seam gone).
+		check(b.pendingBars() == kBackfill,
+		      "all 699 backfill bars are QUARANTINED, not discarded");
+		check(b.contiguousBars() == 1,
+		      "and warmth stays honest at 1 while the hole is open");
+		check(b.missingFromMs() == B && b.missingToMs() == B,
+		      "the outstanding hole is reported as exactly bucket B");
+
+		// A CSV refreshed after startup contains B, because B has closed.
+		KlineBar fill[1]{};
+		fill[0].bucket_open_ms = B;
+		fill[0].close = 12345.0;          // distinctive: NOT the partial's 200/210
+		fill[0].volume = 77.0;
+		fill[0].from_backfill = true;
+		check(b.ingestBackfill(fill, 1), "the refreshed CSV's bucket B is accepted");
+		check(b.seamRepairs() == 1, "the quarantine was spliced back, and says so");
+		check(b.pendingBars() == 0, "nothing left quarantined");
+		check(b.contiguousBars() == kWarm,
+		      "700 CONTIGUOUS bars — warm on the first bar after the fill, not in 7.3 days");
+		check(b.missingFromMs() == 0 && b.missingToMs() == 0, "no hole outstanding");
+
+		// And bucket B holds the REST kline, never a synthesised bar.
+		const KlineBar* fixed = b.barAt(b.contiguousBars() - 2);
+		check(fixed != nullptr && fixed->bucket_open_ms == B,
+		      "bucket B sits in the window in its right place");
+		check(fixed != nullptr && fixed->from_backfill && fixed->close == 12345.0
+		      && fixed->volume == 77.0,
+		      "bucket B is the INGESTED kline, not the partial we half-observed");
+		const KlineBar* newest = b.newestBar();
+		check(newest != nullptr && newest->bucket_open_ms == B + P && !newest->from_backfill,
+		      "and the bar after it is the live-built one");
+	}
+
+	std::printf("[12] a STALE csv leaves a multi-bucket hole; a partial fill is refused\n");
+	{
+		// Restart with a CSV written five buckets ago (fetched, then the launch
+		// took a while). The hole is [B-4 .. B], not just B.
+		KlineBuilder b(900, 1000);
+		KlineBar bf[6]{};
+		for (int i = 0; i < 6; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 10.0 + i; }
+		check(b.ingestBackfill(bf, 6), "stale backfill ending 5 buckets back accepted");
+
+		const int64_t B = T0 + 10 * P;
+		b.onTick(trade(B + 60000, 1, 50.0, 1.0, 49.0, 51.0));      // attach mid-B
+		b.onTick(trade(B + P + 1000, 2, 51.0, 1.0, 50.0, 52.0));
+		b.onTick(trade(B + 2 * P + 1000, 3, 52.0, 1.0, 51.0, 53.0));
+		(void)drain(b);
+		check(b.missingFromMs() == T0 + 6 * P && b.missingToMs() == B,
+		      "the whole stale stretch is reported, not just the attach bucket");
+		check(b.pendingBars() == 6, "and the stale backfill is still held");
+
+		// Four of the five missing buckets: still a hole, so refused outright.
+		KlineBar shortfill[4]{};
+		for (int i = 0; i < 4; ++i) shortfill[i].bucket_open_ms = T0 + (6 + i) * P;
+		check(!b.ingestBackfill(shortfill, 4), "a fill that does not close the hole is REFUSED");
+		check(b.pendingBars() == 6 && b.contiguousBars() == 1,
+		      "and it changed nothing — a refused ingest ingests nothing");
+
+		KlineBar full[5]{};
+		for (int i = 0; i < 5; ++i) full[i].bucket_open_ms = T0 + (6 + i) * P;
+		check(b.ingestBackfill(full, 5), "the complete 5-bucket fill is accepted");
+		check(b.contiguousBars() == 12, "6 backfill + 5 fill + 1 live = 12 contiguous");
+		check(b.seamGaps() == 1 && b.seamRepairs() == 1, "one hole, one repair");
+	}
+
+	std::printf("[13] an illiquid symbol: B+1 empty too, and no SECOND hole opens\n");
+	{
+		// Nothing trades for two whole buckets after the one we attached on.
+		// Those buckets are genuinely observed as empty (we were connected), so
+		// they are flat bars — that is rule 4, not fabrication. Only bucket B,
+		// which we saw part of, is missing.
+		KlineBuilder b(900, 1000);
+		KlineBar bf[4]{};
+		for (int i = 0; i < 4; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 100.0 + i; }
+		check(b.ingestBackfill(bf, 4), "backfill accepted");
+
+		const int64_t B = T0 + 4 * P;
+		b.onTick(trade(B + 300000, 1, 200.0, 1.0, 199.0, 201.0));   // attach mid-B
+		b.onTick(trade(B + 3 * P + 1000, 2, 205.0, 1.0, 204.0, 206.0)); // B+1,B+2 silent
+		b.onTick(trade(B + 4 * P + 1000, 3, 206.0, 1.0, 205.0, 207.0));
+		auto bars = drain(b);
+		check(bars.size() == 3 && bars[0].bucket_open_ms == B + P
+		      && bars[0].number_of_trades == 0,
+		      "B+1 is an EMPTY bar, emitted flat, not skipped");
+		check(b.seamGaps() == 1 && b.missingFromMs() == B && b.missingToMs() == B,
+		      "silence does not widen the hole: only bucket B is missing");
+		check(b.quarantinesDiscarded() == 0,
+		      "and no second discontinuity opened — empty buckets are filled, not gapped");
+		check(b.pendingBars() == 4, "the backfill is intact through the quiet stretch");
+
+		KlineBar fill[1]{};
+		fill[0].bucket_open_ms = B;
+		fill[0].close = 199.5;
+		check(b.ingestBackfill(fill, 1), "bucket B fill accepted");
+		check(b.contiguousBars() == 8, "4 backfill + B + B+1..B+3 = 8 contiguous");
+	}
+
+	std::printf("[14] a bar NOT newer than history is a rewind: dropped, counted, no hole\n");
+	{
+		// A feed lagging the CSV (or a wrong clock on either side). The old
+		// code called this a discontinuity and reported a BACKWARDS missing
+		// range, which no operator could act on.
+		KlineBuilder b(900, 1000);
+		KlineBar bf[6]{};
+		for (int i = 0; i < 6; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 10.0 + i; }
+		check(b.ingestBackfill(bf, 6), "backfill through T0+5P accepted");
+
+		b.onTick(trade(T0 + 2 * P + 100, 1, 50.0, 1.0, 49.0, 51.0));   // attach WAY behind
+		b.onTick(trade(T0 + 3 * P + 100, 2, 51.0, 1.0, 50.0, 52.0));   // drops the partial
+		b.onTick(trade(T0 + 4 * P + 100, 3, 52.0, 1.0, 51.0, 53.0));   // emits T0+3P
+		auto bars = drain(b);
+		check(bars.size() == 1 && bars[0].bucket_open_ms == T0 + 3 * P,
+		      "the stale bar is still EMITTED, so the log shows it");
+		check(b.rewoundBarsDropped() == 1, "but it is refused entry to the window, and counted");
+		check(b.seamGaps() == 0 && b.missingFromMs() == 0,
+		      "and it is NOT reported as a hole with a backwards range");
+		check(b.contiguousBars() == 6 && b.newestBar()->bucket_open_ms == T0 + 5 * P,
+		      "the retained window is untouched — the past is never rewritten");
+	}
+
+	std::printf("[15] repair works when the ring is already FULL (trim must not eat the fill)\n");
+	{
+		// max_history == the backfill length: prepending the fill overflows the
+		// ring, and trimming before splicing would pop exactly the bar just
+		// added, leaving the hole open with ingestBackfill() reporting success.
+		constexpr int kRing = 8;
+		KlineBuilder b(900, kRing);
+		KlineBar bf[kRing]{};
+		for (int i = 0; i < kRing; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 5.0 + i; }
+		check(b.ingestBackfill(bf, kRing), "ring filled exactly by the backfill");
+
+		const int64_t B = T0 + kRing * P;
+		b.onTick(trade(B + 1000, 1, 90.0, 1.0, 89.0, 91.0));
+		b.onTick(trade(B + P + 1000, 2, 91.0, 1.0, 90.0, 92.0));
+		b.onTick(trade(B + 2 * P + 1000, 3, 92.0, 1.0, 91.0, 93.0));
+		(void)drain(b);
+		check(b.pendingBars() == kRing && b.contiguousBars() == 1, "full ring quarantined");
+
+		KlineBar fill[1]{};
+		fill[0].bucket_open_ms = B;
+		fill[0].close = 90.5;
+		check(b.ingestBackfill(fill, 1), "fill accepted into a full ring");
+		check(b.contiguousBars() == kRing,
+		      "the ring is contiguous and full — the trim did not eat the fill");
+		check(b.newestBar()->bucket_open_ms == B + P && b.missingFromMs() == 0,
+		      "and it holds the NEWEST kRing buckets, hole closed");
 	}
 }
 

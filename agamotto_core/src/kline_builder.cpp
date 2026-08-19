@@ -38,26 +38,70 @@ KlineBuilder::KlineBuilder(int period_sec, int max_history)
 {
 }
 
+bool KlineBuilder::trySplice()
+{
+	// The quarantine is reunited with the live run ONLY when the two are
+	// exactly adjacent. Anything else would be stitching across a hole, which
+	// is the failure this whole mechanism exists to prevent.
+	if (mPending.empty() || mHistory.empty()) {
+		return false;
+	}
+	if (mPending.back().bucket_open_ms + mPeriodMs != mHistory.front().bucket_open_ms) {
+		return false;
+	}
+	for (const KlineBar& h : mHistory) {
+		mPending.push_back(h);
+	}
+	mHistory.swap(mPending);
+	mPending.clear();
+	++mSeamRepairs;
+	return true;
+}
+
 void KlineBuilder::pushHistory(const KlineBar& b)
 {
-    // Contiguity is an INVARIANT of mHistory, not an aspiration. A bar that
-    // does not continue the run means everything before it describes a
-    // different, interrupted stretch of time; keeping both halves would let a
-    // 700-bar window straddle the hole and produce numbers that look fine.
-    // So the pre-gap history is discarded and the run restarts here.
-    if (!mHistory.empty()) {
-        const int64_t expected = mHistory.back().bucket_open_ms + mPeriodMs;
-        if (b.bucket_open_ms != expected) {
-            ++mSeamGaps;
-            mLastGapFromMs = expected;
-            mLastGapToMs = b.bucket_open_ms - mPeriodMs;
-            mHistory.clear();
-        }
-    }
-    mHistory.push_back(b);
-    while (mHistory.size() > mMaxHistory) {
-        mHistory.pop_front();
-    }
+	// Contiguity is an INVARIANT of mHistory, not an aspiration: a 700-bar
+	// window straddling a hole produces numbers that look fine and are not.
+	// But the pre-gap run is not WRONG, only DISCONNECTED — so it is
+	// quarantined, never destroyed, and can be reunited once the missing
+	// buckets are ingested. Rule 6: the boot seam guarantees exactly one such
+	// hole on every start, and clearing here discarded the whole backfill on
+	// every start.
+	if (!mHistory.empty()) {
+		const int64_t expected = mHistory.back().bucket_open_ms + mPeriodMs;
+		if (b.bucket_open_ms < expected) {
+			// A REWIND, not a gap: this bucket is already covered by, or older
+			// than, the retained run. Writing it would rewrite the past, and
+			// calling it a discontinuity would report a BACKWARDS missing
+			// range. Counted so a stale feed or a wrong-clock CSV is visible.
+			++mRewoundBarsDropped;
+			return;
+		}
+		if (b.bucket_open_ms > expected) {
+			++mSeamGaps;
+			mLastGapFromMs = expected;
+			mLastGapToMs = b.bucket_open_ms - mPeriodMs;
+			if (!mPending.empty()) {
+				// A second hole opened while the first was still outstanding.
+				// The older segment is now TWO holes from the live run, so
+				// repairing it would need both closed; only the newer,
+				// adjacent segment is kept. Counted, never silent.
+				++mQuarantinesDiscarded;
+			}
+			mPending.swap(mHistory);
+			mHistory.clear();
+		}
+	}
+	mHistory.push_back(b);
+	while (mHistory.size() > mMaxHistory) {
+		mHistory.pop_front();
+	}
+	// The quarantine is capped too, or a long unrepaired run would grow it
+	// without bound. Trimming from the front keeps the buckets NEAREST the
+	// hole, which are the ones a splice needs.
+	while (mPending.size() > mMaxHistory) {
+		mPending.pop_front();
+	}
 }
 
 int64_t KlineBuilder::bucketOf(int64_t ts_ms) const
@@ -333,6 +377,13 @@ bool KlineBuilder::ingestBackfill(const KlineBar* bars, int n)
 		// than stitched, since either would silently break contiguity.
 		return false;
 	}
+
+	// Reunite the quarantined pre-gap run if this run just closed the hole.
+	// MUST run BEFORE the ring trim: trimming first pops exactly the bars a
+	// prepend just added when the ring is already full, which would leave the
+	// splice permanently one bucket short with ingestBackfill still reporting
+	// success.
+	trySplice();
 
 	while (mHistory.size() > mMaxHistory) {
 		mHistory.pop_front();
