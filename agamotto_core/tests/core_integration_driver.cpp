@@ -978,6 +978,49 @@ int run(int bench_n, const std::string& weights_override,
                     "The RULE is graded in tests/decision_parity.py.\n");
     }
 
+    // ---- [5e] THE WALL-CLOCK FLUSH -------------------------------------
+    // Graded here because live traffic CANNOT grade it: with an active symbol
+    // a tick always rolls the bucket within milliseconds, so the flush is a
+    // safety net that never trips and "it works" would rest on reasoning
+    // alone. Measured on hydra 2026-08-20: 35 of 35 live bars were closed by a
+    // tick and ZERO by the flush. The path that only runs when a symbol goes
+    // quiet is exactly the path no live run exercises.
+    std::printf("\n[5e] the wall-clock flush\n");
+    {
+        ts += kPeriodMs;
+        tick(*core, ts, px, 1.0, ++tid);      // opens a fresh bucket
+        drain(*core);                          // take whatever that rolled
+        const int64_t open_ms_ = (ts / kPeriodMs) * kPeriodMs;
+        const int64_t end_ms_  = open_ms_ + kPeriodMs;
+
+        // NEGATIVE CONTROL, and the one that matters: a bucket whose end has
+        // NOT passed must not be closed. Without this the test would pass just
+        // as well if flushDue closed everything unconditionally.
+        checkEq<int>(core->flushDueBuckets(end_ms_ - 1), 0,
+                     "flush does NOT close a bucket that is still open");
+        KlineBar probe_{};
+        check(!core->barReady(&probe_),
+              "and emits no bar while the bucket is still open");
+
+        // Due now: the end has passed.
+        checkEq<int>(core->flushDueBuckets(end_ms_), 1,
+                     "flush CLOSES the bucket once its end has passed");
+        KlineBar flushed_{};
+        check(core->barReady(&flushed_), "the flushed bar reaches barReady()");
+        checkEq<int64_t>(flushed_.bucket_open_ms, open_ms_,
+                         "and it is the bucket that just ended");
+        // close_trigger_recv_ns is 0 by contract: no tick triggered this, so
+        // there is no recv->bar span and reporting one would invent a number.
+        checkEq<uint64_t>(flushed_.close_trigger_recv_ns, 0ULL,
+                          "a flushed bar reports NO recv->bar span");
+
+        // IDEMPOTENT: polling again closes nothing and cannot double-emit.
+        checkEq<int>(core->flushDueBuckets(end_ms_ + kPeriodMs), 0,
+                     "flushing again closes nothing -- no open bucket remains");
+        KlineBar again_{};
+        check(!core->barReady(&again_), "and produces no second copy of it");
+    }
+
     std::printf("\n[6] final diagnostics\n");
     std::printf("     bars_seen=%" PRId64 " contiguous=%" PRId64 "/%d panels=%" PRId64
                 " skipped_not_warm=%" PRId64 " skipped_stale=%" PRId64 " errors=%" PRId64 "\n",
