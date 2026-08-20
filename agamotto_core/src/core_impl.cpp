@@ -159,6 +159,16 @@ class RealCore final : public ICore {
     // emits into a queue and the caller drains it, so "a bar completed" and "a
     // bar was handed over" are different moments; the panel must be the one the
     // caller is about to look at.
+    // Wall-clock bar close. See KlineBuilder::flushDue and the ICore contract:
+    // the bar was previously produced only when the next tick rolled the
+    // bucket, which made latency a function of how quiet the symbol was
+    // (3.3-11.6 s past the boundary on 2026-08-20). The bars land in the same
+    // queue barReady() already drains, so downstream sees no new path.
+    int flushDueBuckets(int64_t cutoff_ms) override
+    {
+        return mBuilder.flushDue(cutoff_ms);
+    }
+
     bool barReady(KlineBar* out) override
     {
         if (!mBuilder.pop(out)) {
