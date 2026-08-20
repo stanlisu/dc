@@ -69,7 +69,46 @@ def load_distinctive(map_path: Path) -> list[str]:
     return sorted(distinctive, key=len, reverse=True)
 
 
-def scan(repo: Path, names: list[str], extra_skip: list[str]) -> list[tuple[Path, int, str, str]]:
+# Printable-ASCII runs, the same rule `strings(1)` uses (default -n 4). Applied
+# to files the text scanner cannot read, so a COMPILED ARTIFACT can be audited.
+_STRINGS_RE = re.compile(rb"[\x20-\x7e]{4,}")
+
+
+def scan_binary(path: Path, pattern: re.Pattern) -> list[tuple[int, str, str]]:
+    """`strings` a binary and match the same pattern against each run.
+
+    WHY THIS EXISTS. The text scanner below skips anything that is not valid
+    UTF-8, and `_SKIP_SUFFIX` skips `.so`/`.o`/`.a` outright — which is correct
+    for a source-tree audit and is exactly WRONG when the thing being audited is
+    the .so itself. VERIFIED 2026-08-20: `sentinel_core/build_linux.sh:75` points
+    this script at `build-linux/`, and `_SKIP_SUFFIX` (line 58-61) contains
+    `.so`/`.o`/`.a` — so that run reads CMakeCache.txt and the build logs, prints
+    "artifact leak audit: PASS", and never opens the library it just built. The
+    gate has been hollow, not merely narrow.
+
+    No leak has actually been observed in a shipped artifact: both
+    `libmjolnir_core.so` and `libagamotto_core.so` PASS under `--binaries` as of
+    2026-08-20. What is demonstrated is that the old run could not have found one
+    — confirmed by planting a real name from map.json into a synthetic .so, which
+    the scanner exits 1 on with `--binaries` and silently passes without it.
+
+    String literals are where names re-enter a compiled artifact — exception
+    text, log formats, column keys — and none of them look like data in review.
+    """
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return []
+    out = []
+    for m in _STRINGS_RE.finditer(blob):
+        run = m.group().decode("ascii")
+        for found in pattern.finditer(run):
+            out.append((m.start(), found.group(1), run[:110]))
+    return out
+
+
+def scan(repo: Path, names: list[str], extra_skip: list[str],
+         binaries: bool = False) -> list[tuple[Path, int, str, str]]:
     pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b")
     hits: list[tuple[Path, int, str, str]] = []
     for path in sorted(repo.rglob("*")):
@@ -78,14 +117,25 @@ def scan(repo: Path, names: list[str], extra_skip: list[str]) -> list[tuple[Path
         rel = path.relative_to(repo)
         if any(part in _SKIP_DIRS for part in rel.parts):
             continue
-        if path.suffix.lower() in _SKIP_SUFFIX:
-            continue
         if any(str(rel).startswith(s) for s in extra_skip):
+            continue
+        if path.suffix.lower() in _SKIP_SUFFIX:
+            # --binaries turns the artifact itself back into a target. Only the
+            # linkable/compiled kinds: there is nothing to recover from a .png.
+            if binaries and path.suffix.lower() in {".so", ".o", ".a", ".bin", ".out"}:
+                hits.extend((rel, off, name, run)
+                            for off, name, run in scan_binary(path, pattern))
             continue
         try:
             text = path.read_text(errors="strict")
         except (UnicodeDecodeError, OSError):
-            continue  # WHY: binary or unreadable -> nothing greppable; suffix skip covers the rest
+            # WHY: not text. With --binaries an unsuffixed EXECUTABLE still has
+            # to be audited — an artifact that escapes because nobody gave it an
+            # extension is the same leak.
+            if binaries:
+                hits.extend((rel, off, name, run)
+                            for off, name, run in scan_binary(path, pattern))
+            continue
         for lineno, line in enumerate(text.splitlines(), 1):
             # finditer, not search: a single line can carry several names
             # (e.g. a mapping table) and reporting only the first hides the rest.
@@ -101,6 +151,13 @@ def main() -> int:
     ap.add_argument("--map", default=str(HERE / "map.json"), help="obfuscation map.json")
     ap.add_argument("--skip", nargs="*", default=[],
                     help="repo-relative path prefixes to skip (vendored SDK, etc.)")
+    ap.add_argument("--binaries", action="store_true",
+                    help="ALSO scan compiled artifacts (.so/.o/.a/.bin/.out and "
+                         "extensionless non-text files) by extracting printable "
+                         "runs, as strings(1) does. Required when --repo points "
+                         "at a BUILD DIRECTORY: without it the .so is skipped by "
+                         "suffix and the run passes without ever opening the "
+                         "thing it claims to audit.")
     args = ap.parse_args()
 
     repo = Path(args.repo).expanduser().resolve()
@@ -111,13 +168,16 @@ def main() -> int:
         raise SystemExit(f"map.json not found: {map_path}")
 
     names = load_distinctive(map_path)
-    hits = scan(repo, names, args.skip)
+    hits = scan(repo, names, args.skip, binaries=args.binaries)
 
     print(f"[audit_public_surface] repo={repo}")
     print(f"[audit_public_surface] gating on {len(names)} distinctive names "
           f"({len(_NON_DISTINCTIVE)} common tokens allowlisted)")
     if args.skip:
         print(f"[audit_public_surface] skipping prefixes: {args.skip}")
+    if args.binaries:
+        print("[audit_public_surface] compiled artifacts ARE being scanned "
+              "(printable runs, as strings(1))")
 
     if not hits:
         print("=== PASS: no distinctive regime/feature name found ===")
@@ -125,6 +185,7 @@ def main() -> int:
 
     print(f"\n=== FAIL: {len(hits)} leak line(s) ===\n")
     for rel, lineno, name, line in hits:
+        # `lineno` is a line number for text and a BYTE OFFSET for a binary.
         print(f"  {rel}:{lineno}: [{name}]  {line}")
     print(f"\n{len(hits)} leak(s). Replace real names with their codes "
           f"(codec.encode_regime / encode_columns) or exclude the file.")
