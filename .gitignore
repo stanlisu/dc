@@ -18,4 +18,6 @@ pyarmor.bug.log
 
 # sentinel_core cross-build output (artifact, never source-controlled)
 sentinel_core/build-linux/
+agamotto_core/build-linux/
+agamotto_core/build/
 sentinel_core/build/
