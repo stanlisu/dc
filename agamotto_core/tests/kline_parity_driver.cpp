@@ -432,6 +432,97 @@ void selftest()
 		check(b.newestBar()->bucket_open_ms == B + P && b.missingFromMs() == 0,
 		      "and it holds the NEWEST kRing buckets, hole closed");
 	}
+
+	// ---- RULE 7: the DROPPED-TRADE detector -----------------------------
+	//
+	// These pin the ONE failure the rest of this file cannot see. The SHM ring
+	// overwrites a slot in a burst and the consumer is told nothing: on hydra
+	// 2026-08-19 a 15m bar lost 5.04% of its trades and missed the high by 562
+	// points with unclassified=0, aggressor=exact and conv_err=0. Ids are
+	// monotonic, so a jump is the only evidence left.
+	//
+	// The three properties the detector must have, and all three are here
+	// because each of them is a way to be confidently wrong: a CLEAN stream
+	// must report ZERO (or the counter is noise), an INJECTED gap must report
+	// EXACTLY the missing count (or the counter is a vague alarm), and a
+	// DUPLICATE must report nothing (or rule 2's own drops read as feed loss).
+	std::printf("[16] rule 7: a CLEAN id stream reports zero gaps\n");
+	{
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 1, 4'109'000'000ULL, 10.0, 1.0, 9.0, 11.0));  // partial
+		for (int i = 1; i <= 20; ++i) {
+			b.onTick(trade(T0 + P + i, 4'109'000'000ULL + static_cast<uint64_t>(i),
+			               100.0 + i, 1.0, 99.0, 101.0));
+		}
+		b.onTick(trade(T0 + 2 * P + 1, 4'109'000'021ULL, 50.0, 1.0, 49.0, 51.0));
+		auto bars = drain(b);
+		check(b.tradeIdGaps() == 0, "no gap events on a contiguous id run");
+		check(b.tradesMissing() == 0, "no missing ids on a contiguous id run");
+		check(bars.size() == 1 && bars[0].trade_id_gaps == 0
+		      && bars[0].n_trades_missing == 0, "and the bar itself reports clean");
+		// The FIRST id of the run is ~4.1e9 and must not be read as 4.1e9
+		// missing trades. Asserted, not assumed: without the mHaveLastTradeId
+		// guard every session's first bar carries a nonsense number.
+		check(bars.size() == 1 && bars[0].number_of_trades == 20,
+		      "all 20 trades applied (the first-id guard did not eat one)");
+	}
+
+	std::printf("[17] rule 7: an INJECTED gap reports EXACTLY the missing count\n");
+	{
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 1, 1000, 10.0, 1.0, 9.0, 11.0));      // partial bucket
+		b.onTick(trade(T0 + P + 1, 1001, 100.0, 1.0, 99.0, 101.0));
+		b.onTick(trade(T0 + P + 2, 1002, 101.0, 1.0, 99.0, 101.0));
+		// 1003..1009 never arrive: seven ids, one gap event.
+		b.onTick(trade(T0 + P + 3, 1010, 102.0, 1.0, 99.0, 101.0));
+		// and a second, smaller hole in the SAME bucket: 1011 is missing.
+		b.onTick(trade(T0 + P + 4, 1012, 103.0, 1.0, 99.0, 101.0));
+		b.onTick(trade(T0 + 2 * P + 1, 1013, 50.0, 1.0, 49.0, 51.0));
+		auto bars = drain(b);
+		check(b.tradesMissing() == 8, "7 + 1 missing ids counted exactly");
+		check(b.tradeIdGaps() == 2, "two DISCONTINUITIES, not eight");
+		check(bars.size() == 1 && bars[0].n_trades_missing == 8,
+		      "attributed to the bar that was open when the holes opened");
+		check(bars.size() == 1 && bars[0].trade_id_gaps == 2,
+		      "and the gap-EVENT count rides on the bar too");
+		check(bars.size() == 1 && bars[0].number_of_trades == 4,
+		      "the bar still counts only the trades that ARRIVED");
+	}
+
+	std::printf("[18] rule 7: a DUPLICATE is not a gap, and the split across bars is honest\n");
+	{
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 1, 500, 10.0, 1.0, 9.0, 11.0));         // partial
+		b.onTick(trade(T0 + P + 1, 501, 100.0, 1.0, 99.0, 101.0));  // bucket 1
+		b.onTick(trade(T0 + P + 2, 501, 100.0, 1.0, 99.0, 101.0));  // exact replay
+		b.onTick(trade(T0 + P + 3, 499, 100.0, 1.0, 99.0, 101.0));  // older id
+		b.onTick(trade(T0 + P + 4, 502, 100.0, 1.0, 99.0, 101.0));  // resumes cleanly
+		check(b.duplicatesDropped() == 2, "both replays still dropped by rule 2");
+		check(b.tradeIdGaps() == 0, "a duplicate is NOT a gap");
+		check(b.tradesMissing() == 0, "and it contributes no missing ids");
+
+		// A hole that opens in bucket 1 belongs to bucket 1, not to bucket 2 —
+		// the missing ids lie strictly before the trade that rolls the bucket.
+		b.onTick(trade(T0 + 2 * P + 1, 510, 50.0, 1.0, 49.0, 51.0));  // closes b1
+		b.onTick(trade(T0 + 3 * P + 1, 511, 51.0, 1.0, 50.0, 52.0));  // closes b2
+		auto bars = drain(b);
+		check(bars.size() == 2, "two bars closed");
+		check(bars.size() == 2 && bars[0].n_trades_missing == 7,
+		      "502->510 is 7 missing ids, charged to the bar that was OPEN");
+		check(bars.size() == 2 && bars[1].n_trades_missing == 0,
+		      "the following bar is NOT charged for a hole that predates it");
+	}
+
+	std::printf("[19] rule 7: a backfilled bar carries no id sequence, so it claims no loss\n");
+	{
+		KlineBuilder b(900, 1000);
+		KlineBar bf[3]{};
+		for (int i = 0; i < 3; ++i) { bf[i].bucket_open_ms = T0 + i * P; bf[i].close = 7.0; }
+		check(b.ingestBackfill(bf, 3), "backfill accepted");
+		check(b.barAt(0)->n_trades_missing == 0 && b.barAt(0)->trade_id_gaps == 0,
+		      "a REST kline reports 0/0 rather than an invented figure");
+		check(b.tradesMissing() == 0, "and ingesting it moved no run counter");
+	}
 }
 
 // ---- replay mode ---------------------------------------------------------

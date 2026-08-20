@@ -40,6 +40,37 @@
 //      backfilled=699 seam_gaps=1). The pre-gap run is held aside instead,
 //      uncounted, until the missing buckets are ingested and it is spliced
 //      back. The hole is never filled by fabricating a bar.
+//   7. A JUMP IN THE TRADE-ID SEQUENCE IS A DROPPED TRADE, AND IT IS COUNTED.
+//      The SHM ring (container_size: 1024) overflows in a burst and the
+//      consumer sees NOTHING: a lost slot never arrives, so every counter that
+//      tallies what DID arrive stays clean. Measured on hydra 2026-08-19 —
+//      the 15:15 15m bar lost 5.04% of its trades and MISSED THE HIGH BY 562
+//      POINTS (69888 vs Binance 70450) with unclassified=0, aggressor=exact
+//      and conv_err=0. Ids are monotonic per symbol (rule 2 already relies on
+//      that for dedupe), so `id > expected` is the only in-band evidence the
+//      loss leaves behind. Each bar therefore carries how many gap EVENTS fell
+//      in it and how many IDS they skipped, and the run carries the totals.
+//
+//      THREE THINGS ARE DELIBERATELY *NOT* GAPS, because each would
+//      manufacture a loss the ring did not cause:
+//        (a) the FIRST id of a run — there is no predecessor for it to be
+//            missing from, and treating id 4109... as "4109... trades lost"
+//            would put a nonsense number on every first bar;
+//        (b) an id we dropped OURSELVES as a duplicate (rule 2) — it arrived,
+//            we chose not to apply it, and the sequence never advanced past it;
+//        (c) an id equal to the expected one — the ordinary case.
+//
+//      DECLARED LIMITATION, pinned by a self-test rather than left to
+//      surprise someone. An id that arrives OUT OF ORDER (lower than one
+//      already accepted) is first counted missing by the jump that overtook
+//      it, and is then dropped by rule 2 when it turns up. That is the RIGHT
+//      answer for the question this counter asks — "how many trades are not
+//      in this bar" — since rule 2 means the late one never contributes
+//      either; it is the wrong answer for "how many did the ring lose". The
+//      two coincide on Binance's trade stream, which is ordered.
+//
+//      NOTHING IS RECOVERED. A slot the ring overwrote is gone; the fix
+//      belongs in the feed publisher. This makes the loss LOUD, nothing more.
 
 #include <cstdint>
 #include <deque>
@@ -160,6 +191,13 @@ class KlineBuilder {
     int64_t partialBucketsDropped() const { return mPartialBucketsDropped; }
     int64_t badTimestampDropped() const { return mBadTimestampDropped; }
 
+    // --- the DROPPED-TRADE detector (rule 7) ------------------------------
+    // Run totals of the per-bar KlineBar::trade_id_gaps / n_trades_missing.
+    // See the rule-7 banner at the top of this file for what they mean and for
+    // the measurement that motivated them.
+    int64_t tradeIdGaps() const { return mTradeIdGaps; }
+    int64_t tradesMissing() const { return mTradesMissing; }
+
   private:
     struct Accum {
         int64_t bucket_open_ms{0};
@@ -168,6 +206,8 @@ class KlineBuilder {
         int64_t n_trades{0};
         double  taker_buy_base{0.0}, taker_buy_quote{0.0};
         int64_t n_unclassified{0};
+        int64_t trade_id_gaps{0};
+        int64_t n_trades_missing{0};
         bool    any_exact{false};
         bool    any_quote_rule{false};
         bool    has_any_trade{false};
@@ -197,6 +237,7 @@ class KlineBuilder {
     int64_t mTradeUpdates{0}, mAggTradeUpdates{0};
     int64_t mDuplicatesDropped{0}, mLateTradesDropped{0}, mPartialBucketsDropped{0};
     int64_t mBadTimestampDropped{0};
+    int64_t mTradeIdGaps{0}, mTradesMissing{0};
 
     int64_t mSeamGaps{0};
     int64_t mLastGapFromMs{0}, mLastGapToMs{0};

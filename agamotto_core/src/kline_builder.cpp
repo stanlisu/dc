@@ -144,6 +144,11 @@ void KlineBuilder::emitFlat(int64_t bucket_open_ms)
 	b.taker_buy_quote_volume = 0.0;
 	b.aggressor_source = KlineBar::AggressorSource::NONE;
 	b.n_trades_unclassified = 0;
+	// Rule 7: a flat bar contains no trades, so it can have lost none. Stated
+	// rather than left to the {} initialiser, alongside the other fields this
+	// function zeroes explicitly.
+	b.trade_id_gaps = 0;
+	b.n_trades_missing = 0;
 	b.from_backfill = false;
 	b.close_trigger_recv_ns = 0;   // no tick closed it; excluded from latency
 	b.bar_emit_ns = nowRealtimeNs();
@@ -188,6 +193,13 @@ void KlineBuilder::emitCurrent(uint64_t close_trigger_recv_ns)
 	b.taker_buy_base_volume = mCur.taker_buy_base;
 	b.taker_buy_quote_volume = mCur.taker_buy_quote;
 	b.n_trades_unclassified = mCur.n_unclassified;
+	// Rule 7. These ride on the bar and NOT only on the run counters, because
+	// the loss is bursty: a run that lost 26k ids across 700 bars looks
+	// tolerable in aggregate and is catastrophic on the one bar that ate all
+	// of them (measured 2026-08-19: the 15:15 bar, which missed the high by
+	// 562 points, next to two neighbours that were bit-exact).
+	b.trade_id_gaps = mCur.trade_id_gaps;
+	b.n_trades_missing = mCur.n_trades_missing;
 
 	// Provenance is per BAR: if any trade in it needed the quote rule, the
 	// taker_buy_* columns are approximations and must not be reported as exact.
@@ -276,11 +288,50 @@ void KlineBuilder::onTick(const TickEvent& ev)
 
 	// Rule 2: drop replays / repeated slots. Ids are monotonic per symbol
 	// within the trade stream.
+	//
+	// A duplicate returns HERE, before rule 7 below, and that ordering is the
+	// requirement "a duplicate does not count as a gap": an id we chose to drop
+	// arrived, the ring did not eat it, and mLastTradeId does not advance past
+	// it either.
 	if (mHaveLastTradeId && ev.last_trade_id != 0 && ev.last_trade_id <= mLastTradeId) {
 		++mDuplicatesDropped;
 		return;
 	}
 	if (ev.last_trade_id != 0) {
+		// RULE 7: THE DROPPED-TRADE DETECTOR.
+		//
+		// The expected next id is mLastTradeId + 1. Anything above that is a
+		// hole the SHM ring swallowed — see the rule-7 banner in the header for
+		// the measurement and for why no other counter can see it.
+		//
+		// GUARDED ON mHaveLastTradeId, which is the "not the first id" test.
+		// Without it the first trade of every run would report its own id as
+		// the missing count (~4.1e9 on BTCUSDT), which is not a large number
+		// so much as a meaningless one, and it would land on the very first
+		// bar of every session.
+		//
+		// Counted in BOTH shapes on purpose. The number of EVENTS says how
+		// often the ring overflowed; the number of IDS says how much was lost.
+		// One burst that ate 26,302 trades and 26,302 isolated singleton drops
+		// are the same "trades_missing" and completely different failures, and
+		// only the pair distinguishes them.
+		if (mHaveLastTradeId && ev.last_trade_id > mLastTradeId + 1) {
+			const int64_t missing_ =
+			    static_cast<int64_t>(ev.last_trade_id - mLastTradeId - 1);
+			++mTradeIdGaps;
+			mTradesMissing += missing_;
+			// ATTRIBUTED TO THE BAR CURRENTLY OPEN, i.e. before this trade is
+			// allowed to roll the bucket below. The missing ids lie strictly
+			// between the last accepted trade and this one, so they belong to
+			// the bar that was being built when the hole opened, not to the one
+			// this trade may be about to start. A bar with no open bucket (the
+			// very first trade after a partial discard) gets no attribution and
+			// the run counters carry it alone — mCur is reset by startBucket().
+			if (mHaveOpenBucket) {
+				++mCur.trade_id_gaps;
+				mCur.n_trades_missing += missing_;
+			}
+		}
 		mLastTradeId = ev.last_trade_id;
 		mHaveLastTradeId = true;
 	}
