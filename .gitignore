@@ -21,3 +21,13 @@ sentinel_core/build-linux/
 agamotto_core/build-linux/
 agamotto_core/build/
 sentinel_core/build/
+
+# Core dumps from running the linux/amd64 drivers under qemu on an arm64 host.
+# Two land per crash: qemu dumps the emulated guest as qemu_<prog>_<stamp>.core,
+# and the host may drop a plain `core` for qemu-x86_64 itself (~150MB the last
+# time). Never commit either — a driver core is a memory image of the private
+# core, which is the one thing this repo exists to keep out of anything
+# shareable. Scoped to sentinel_core/ so a legitimately-named `core` module
+# elsewhere in the tree is not swallowed.
+sentinel_core/core
+sentinel_core/*.core
