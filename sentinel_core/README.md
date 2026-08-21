@@ -84,7 +84,7 @@ exit 0 = pass). It pins the semantics the port got wrong — the warmup gate cou
 bars **ever fed**, not bar-buffer occupancy, so a gate above `BUFFER_MAXLEN`
 still opens. See DEPLOY_SHADOW.md.
 
-### Two prerequisites, both of which fail loud
+### Three prerequisites, all of which fail loud
 
 **1. `mjolnir/_obf` must be generated.** It is derived and gitignored, so a
 fresh checkout does not have it and the reference's `regime_filters` import
@@ -129,6 +129,25 @@ export LD_LIBRARY_PATH=$HOME/.local/lib:$LD_LIBRARY_PATH
 Verify with `python3.11 -c "import talib; print(talib.__ta_version__)"` — the
 harnesses check `__ta_version__` (the C library) rather than the wrapper
 version, because the library is what computes the indicators.
+
+**3. The reference environment needs the feature module's PACKAGE deps.** The
+three panel harnesses load `features.py` as a package member
+(`mjolnir.core.features`, via `load_reference_pkg` in `tests/bar_parity.py`),
+because since dc 3fe8e57 it does `from .features_scalefree import
+scale_free_levels` and a relative import has nothing to resolve against when
+the file is loaded standalone. Importing it as a package member also runs
+`mjolnir/core/__init__.py`, which imports `research` and therefore **pyarrow**
+— a dependency the old standalone load did not pull in. Missing it is reported
+as `BLOCKED: cannot import mjolnir.core.features`, never as a parity failure.
+
+```bash
+python3.11 -m pip install --user numpy pandas pyarrow
+```
+
+`bar_parity.py` deliberately keeps the standalone load for `knull/live_bar.py`:
+that reference is self-contained, so importing it as a package member would run
+`knull/__init__.py` and drag the bot's import graph into a bar-builder test for
+no gain.
 
 ### Running
 

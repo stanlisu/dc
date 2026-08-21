@@ -26,6 +26,21 @@ TARGET_SEC = 30   # exercise the non-trivial cycle_progress / secs_to_boundary p
 
 
 def load_reference(path: Path):
+    """Load a reference module as a STANDALONE top-level module.
+
+    Only valid for a reference that has no intra-package imports of its own —
+    ``knull/live_bar.py`` is the one such reference (it is deliberately
+    self-contained so the bot can import it in isolation). A module that does
+    ``from .x import y`` cannot be loaded this way: with no parent package the
+    relative import raises ``ImportError: attempted relative import with no
+    known parent package``. Use ``load_reference_pkg`` for those.
+
+    knull/ IS a package (marvel/knull/__init__.py exists), so this could just
+    as well go through load_reference_pkg — it deliberately does not. Executing
+    knull/__init__.py drags the bot's import graph into a bar-builder test that
+    today needs nothing but this one file, and this path is green. Loading it
+    as a package member would be a change of behaviour with no problem to fix.
+    """
     spec = importlib.util.spec_from_file_location("live_bar_ref", path)
     if spec is None or spec.loader is None:
         raise SystemExit(f"cannot load reference module: {path}")
@@ -34,6 +49,78 @@ def load_reference(path: Path):
     # sys.modules[cls.__module__], which fails if the module isn't there yet.
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
+    return mod
+
+
+def _package_qualname(path: Path) -> tuple[Path, str]:
+    """Resolve ``path`` to (importable src root, dotted module name).
+
+    Walks UP the ``__init__.py`` chain: every parent directory that carries an
+    ``__init__.py`` is part of the package, and the first one that does not is
+    the src root that must go on sys.path. For
+    ``.../mjolnir_pkg/src/mjolnir/core/features.py`` that yields
+    ``.../mjolnir_pkg/src`` and ``mjolnir.core.features``.
+    """
+    path = path.resolve()
+    if path.suffix != ".py":
+        raise SystemExit(f"not a python source file: {path}")
+    parts = [path.stem]
+    d = path.parent
+    while (d / "__init__.py").is_file():
+        parts.append(d.name)
+        d = d.parent
+    if len(parts) == 1:
+        raise SystemExit(
+            f"=== BLOCKED: {path} is not inside a package ===\n"
+            f"  {path.parent} has no __init__.py, so there is no package for a\n"
+            "  relative import to resolve against. This loader exists precisely to\n"
+            "  give the reference its package context; refusing to guess one.")
+    return d, ".".join(reversed(parts))
+
+
+def load_reference_pkg(path: Path):
+    """Load a reference module AS A PACKAGE MEMBER, so relative imports resolve.
+
+    Since dc 3fe8e57 (2026-08-06) ``mjolnir/core/features.py`` does
+    ``from .features_scalefree import scale_free_levels``, so the standalone
+    ``load_reference`` path dies on it with "attempted relative import with no
+    known parent package". This is the same idiom regime_parity.py already uses
+    for ``regime_filters`` (which imports the codec relatively), generalised:
+    the src root is DISCOVERED from the file rather than passed in, so the
+    harnesses keep their existing command lines.
+
+    Costs more than the standalone path and says so: importing
+    ``mjolnir.core.features`` first executes ``mjolnir/core/__init__.py``,
+    which imports ``research`` and therefore pyarrow. A missing third-party
+    dependency is reported as exactly that rather than as a parity failure.
+    """
+    src_root, qualname = _package_qualname(path)
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    try:
+        mod = importlib.import_module(qualname)
+    except ImportError as exc:
+        raise SystemExit(
+            f"=== BLOCKED: cannot import {qualname} from {src_root} ===\n"
+            f"  ({type(exc).__name__}: {exc})\n"
+            "  This is an IMPORT failure, not a parity result. Importing the\n"
+            "  reference as a package member runs its package __init__ too, which\n"
+            "  pulls heavier third-party deps than loading the single file did —\n"
+            "  mjolnir.core.__init__ imports research, which requires pyarrow.\n"
+            "  Install the missing dependency into the reference environment; do\n"
+            "  not fall back to a standalone load, which would either ImportError\n"
+            "  on the relative import or grade against a different module.") from exc
+
+    # A same-named package already on sys.path (an installed mjolnir, say) would
+    # shadow the checkout the caller pointed at and be graded in its place —
+    # silently, and against different source. Prove we got the requested file.
+    got = Path(getattr(mod, "__file__", "") or "").resolve()
+    if got != path.resolve():
+        raise SystemExit(
+            f"=== BLOCKED: {qualname} resolved to {got}, not the requested "
+            f"{path.resolve()} ===\n"
+            "  Another copy of the package shadows the one under test, so the "
+            "comparison\n  would grade different source than the caller asked for.")
     return mod
 
 

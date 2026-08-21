@@ -27,7 +27,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bar_parity import BAR_SEC, TARGET_SEC, gen_events, load_reference  # noqa: E402
+from bar_parity import (  # noqa: E402
+    BAR_SEC, TARGET_SEC, gen_events, load_reference, load_reference_pkg)
 
 # ----------------------------------------------------------------------------
 # Reference-environment gate — the TA-Lib asymmetry
@@ -186,7 +187,10 @@ def main() -> int:
     bar_mod = load_reference(Path(args.ref_bar))
     bars = ref_bars_df(bar_mod, events)
 
-    feat_mod = load_reference(Path(args.ref_feat))
+    # Package member, not standalone file: features.py imports
+    # `.features_scalefree` relatively (dc 3fe8e57), which only resolves with a
+    # parent package. The src root is discovered from the file itself.
+    feat_mod = load_reference_pkg(Path(args.ref_feat))
     fe = feat_mod.MjolnirFeatures(feature_windows=[30, 60, 300, 900],
                                   bar_tf="5s", target_tf="5s")
     ref = fe.compute(bars)
