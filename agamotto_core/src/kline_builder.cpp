@@ -1,5 +1,6 @@
 #include "kline_builder.hpp"
 
+#include <unordered_map>
 #include <algorithm>
 #include <ctime>
 
@@ -410,6 +411,64 @@ bool KlineBuilder::pop(KlineBar* out)
 	*out = mReady.front();
 	mReady.pop_front();
 	return true;
+}
+
+int KlineBuilder::reconcileAgainst(const KlineBar* bars, int n)
+{
+	if (bars == nullptr || n <= 0 || mHistory.empty()) {
+		return 0;
+	}
+	// Index the authoritative bars by bucket so this is one pass over history
+	// rather than n*m. The CSV is ~700 rows and history is capped at the warmup,
+	// so both are small -- but this runs on every seam-repair attempt and a
+	// quadratic scan there would be a per-bar cost nobody asked for.
+	std::unordered_map<int64_t, const KlineBar*> truth;
+	truth.reserve(static_cast<size_t>(n) * 2);
+	for (int i = 0; i < n; ++i) {
+		truth[bars[i].bucket_open_ms] = &bars[i];
+	}
+
+	int corrected = 0;
+	for (KlineBar& held : mHistory) {
+		const auto it = truth.find(held.bucket_open_ms);
+		if (it == truth.end()) {
+			continue;                    // nothing authoritative for this bucket
+		}
+		const KlineBar& t = *it->second;
+		// n_trades and volume are the columns that actually move when trades are
+		// lost; OHLC usually survives because extremes are set by few trades.
+		// Compared with ==, not a tolerance: these are summed from the same
+		// decimal quantities on both sides, so any difference is missing data,
+		// not representation.
+		const bool differs =
+		    held.number_of_trades != t.number_of_trades ||
+		    held.volume != t.volume ||
+		    held.quote_volume != t.quote_volume ||
+		    held.taker_buy_base_volume != t.taker_buy_base_volume ||
+		    held.taker_buy_quote_volume != t.taker_buy_quote_volume ||
+		    held.open != t.open || held.high != t.high ||
+		    held.low != t.low || held.close != t.close;
+		if (!differs) {
+			continue;
+		}
+		// ONLY the nine venue columns. The diagnostics this bar carries about
+		// its own tick stream -- aggressor source, trade-id gaps, missing count,
+		// recv timing -- are what tell an operator the feed was damaged, and
+		// overwriting them would erase the evidence while fixing the symptom.
+		held.open                   = t.open;
+		held.high                   = t.high;
+		held.low                    = t.low;
+		held.close                  = t.close;
+		held.volume                 = t.volume;
+		held.quote_volume           = t.quote_volume;
+		held.number_of_trades       = t.number_of_trades;
+		held.taker_buy_base_volume  = t.taker_buy_base_volume;
+		held.taker_buy_quote_volume = t.taker_buy_quote_volume;
+		held.reconciled             = true;
+		++corrected;
+	}
+	mBarsReconciled += corrected;
+	return corrected;
 }
 
 bool KlineBuilder::ingestBackfill(const KlineBar* bars, int n)
