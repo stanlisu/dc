@@ -186,6 +186,22 @@ class KlineBuilder {
     // Diagnostics for the parity report.
     int64_t tradeUpdates() const { return mTradeUpdates; }
     int64_t aggTradeUpdates() const { return mAggTradeUpdates; }
+    // Close the open bucket if its END is at or before `cutoff_ms`, without
+    // waiting for a tick to roll it. Returns 1 if it closed one, else 0.
+    //
+    // WHY. Bucket membership is by EXCHANGE timestamp, but closing was driven
+    // by the arrival of the first tick of the NEXT bucket -- so a bar's latency
+    // tracked how quiet the symbol was. Measured 2026-08-20 across 28 symbols:
+    // 3.3-11.6 s past the boundary, p50 3.7 s, while recv->bar was 0.9 us.
+    //
+    // The caller passes now MINUS a grace. The grace covers trades ALREADY IN
+    // FLIGHT -- a trade received after the boundary can still belong to the
+    // bucket that just ended -- and nothing else. It is not a wait on the venue.
+    //
+    // IDEMPOTENT: once the bucket is closed there is no open bucket to close,
+    // so polling this costs nothing and cannot double-emit.
+    int     flushDue(int64_t cutoff_ms);
+
     int64_t duplicatesDropped() const { return mDuplicatesDropped; }
     int64_t lateTradesDropped() const { return mLateTradesDropped; }
     int64_t partialBucketsDropped() const { return mPartialBucketsDropped; }

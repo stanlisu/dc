@@ -50,12 +50,15 @@
 #include <sys/stat.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef AGAMOTTO_CORE_GITSHA
@@ -67,6 +70,11 @@ namespace {
 
 class RealCore final : public ICore {
   public:
+    // The worker holds a `this` pointer, so it MUST be stopped before any
+    // member it touches is destroyed. Joining in the destructor is the only
+    // place that ordering can be guaranteed.
+    ~RealCore() override { stopWorker(); }
+
     RealCore(int64_t product_id, int bar_sec, int warmup_bars, const char* weights_dir,
              const DecisionGate& gate)
       : mProductId(product_id), mWarmupBars(warmup_bars), mBuilder(bar_sec, warmup_bars),
@@ -159,6 +167,16 @@ class RealCore final : public ICore {
     // emits into a queue and the caller drains it, so "a bar completed" and "a
     // bar was handed over" are different moments; the panel must be the one the
     // caller is about to look at.
+    // Wall-clock bar close. See KlineBuilder::flushDue and the ICore contract:
+    // the bar was previously produced only when the next tick rolled the
+    // bucket, which made latency a function of how quiet the symbol was
+    // (3.3-11.6 s past the boundary on 2026-08-20). The bars land in the same
+    // queue barReady() already drains, so downstream sees no new path.
+    int flushDueBuckets(int64_t cutoff_ms) override
+    {
+        return mBuilder.flushDue(cutoff_ms);
+    }
+
     bool barReady(KlineBar* out) override
     {
         if (!mBuilder.pop(out)) {
@@ -169,8 +187,140 @@ class RealCore final : public ICore {
         // been emitted several ticks before the caller drained it, and timing
         // from the drain would silently understate the span.
         mBarEmitNs = out->bar_emit_ns;
-        computePanelFor(*out);
+
+        // ROUTE A. The panel is ~47 ms per symbol and it used to run RIGHT
+        // HERE, on the thread whose other job is draining the SHM ring. With
+        // 28 symbols in one process that is ~1.3 s per bar close of not
+        // draining, against a 512-slot ring holding 0.47-1.67 s depending on
+        // market rate -- which is why trades were lost, measured 1.2-8.5 pct
+        // across 28 symbols on 2026-08-20.
+        //
+        // Async mode hands the work to a worker and returns. The drain thread's
+        // per-bar cost becomes the SNAPSHOT below and nothing else, so it stops
+        // being a function of how much arithmetic follows it.
+        if (!mAsync) {
+            snapshotHistory();
+            computePanelFor(*out, mSyncHist.data(),
+                            static_cast<int>(mSyncHist.size()));
+            return true;
+        }
+        enqueueScoring(*out);
         return true;
+    }
+
+    // The worker must not read mBuilder: the drain thread appends to it on
+    // every tick. It gets a private COPY of the contiguous run instead, taken
+    // here on the drain thread. ~700 bars is the drain thread's entire new
+    // per-bar cost, and it is constant -- it does not grow with the panel, the
+    // regime count or the model count, which is the whole point.
+    void snapshotInto(std::vector<KlineBar>& dst) const
+    {
+        const int n = mBuilder.contiguousBars();
+        dst.resize(static_cast<size_t>(n < 0 ? 0 : n));
+        for (int i = 0; i < n; ++i) {
+            const KlineBar* b = mBuilder.barAt(i);
+            if (b == nullptr) {          // out of range only; keep it bounded
+                dst.resize(static_cast<size_t>(i));
+                return;
+            }
+            dst[static_cast<size_t>(i)] = *b;
+        }
+    }
+
+    void snapshotHistory() { snapshotInto(mSyncHist); }
+
+    void enqueueScoring(const KlineBar& popped)
+    {
+        std::unique_lock<std::mutex> lk(mMx);
+        // A NEWER BAR REPLACES AN UNSTARTED ONE, and it replaces an unread
+        // RESULT too. Both match the behaviour this core already had: only the
+        // newest bar gets a panel, older ones are skipped and COUNTED
+        // (mPanelsSkippedStaleBar). Queueing them instead would grow without bound
+        // whenever the worker cannot keep up, and would score bars whose
+        // decisions are already too late to act on.
+        if (mJobPending) ++mPanelsSkippedStaleBar;
+        if (mResultPending) {
+            ++mPanelsSkippedStaleBar;
+            mResultPending = false;
+        }
+        snapshotInto(mJobHist);
+        mJobPopped  = popped;
+        mJobPending = true;
+        lk.unlock();
+        mCv.notify_one();
+    }
+
+    // Poll for a scored bar. Returns true exactly once per scored bar, and the
+    // "latest" accessors (panelLatest, regimeFiredLatest, regimePrediction,
+    // decide) describe THAT bar until the next one is enqueued.
+    //
+    // WHY THIS IS SAFE WITHOUT LOCKING THE ACCESSORS. The worker only ever runs
+    // between an enqueue and a publish, and BOTH enqueue (barReady) and read
+    // (after this returns true) happen on the SDK's single core thread -- so
+    // they cannot overlap. The worker goes idle after publishing and cannot
+    // start again until that thread enqueues, which it does not do while
+    // reading. The mutex here supplies the happens-before, so everything the
+    // worker wrote is visible to the reader.
+    bool takeScoredBar(int64_t* bar_ts_ms) override
+    {
+        std::lock_guard<std::mutex> lk(mMx);
+        if (!mResultPending) {
+            return false;
+        }
+        mResultPending = false;
+        if (bar_ts_ms != nullptr) *bar_ts_ms = mResultTsMs;
+        return true;
+    }
+
+    void setAsyncScoring(bool on) override
+    {
+        if (on == mAsync) return;
+        if (on) {
+            mStop = false;
+            mAsync = true;
+            mWorker = std::thread([this] { workerLoop(); });
+        } else {
+            stopWorker();
+            mAsync = false;
+        }
+    }
+
+    bool asyncScoring() const override { return mAsync; }
+
+    void workerLoop()
+    {
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mMx);
+            mCv.wait(lk, [this] { return mStop || mJobPending; });
+            if (mStop) return;
+            // Move the job out under the lock, then compute WITHOUT it: the
+            // panel is ~47 ms and holding the mutex for it would block the
+            // drain thread's enqueue, reintroducing the stall this exists to
+            // remove.
+            mWorkHist.swap(mJobHist);
+            const KlineBar popped = mJobPopped;
+            mJobPending = false;
+            lk.unlock();
+
+            computePanelFor(popped, mWorkHist.data(),
+                            static_cast<int>(mWorkHist.size()));
+
+            lk.lock();
+            mResultTsMs   = popped.bucket_open_ms;
+            mResultPending = true;
+            lk.unlock();
+        }
+    }
+
+    void stopWorker()
+    {
+        if (!mWorker.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(mMx);
+            mStop = true;
+        }
+        mCv.notify_all();
+        mWorker.join();
     }
 
     // Warmth is the length of the CONTIGUOUS retained run, not a count of
@@ -486,14 +636,19 @@ class RealCore final : public ICore {
     // exactly why it did not. Every early return increments a counter that
     // crosses the ABI — "the panel never ran" and "the panel ran and produced
     // nothing" are the same silence otherwise.
-    void computePanelFor(const KlineBar& popped)
+    // Takes an explicit SNAPSHOT rather than reading mBuilder, so this can run
+    // on a worker thread while the drain thread keeps appending to the builder.
+    // `hist` is a private copy owned by the caller; nothing here touches shared
+    // state that the tick path can mutate. `n_hist` is the CONTIGUOUS run, the
+    // same quantity isWarm() is defined on.
+    void computePanelFor(const KlineBar& popped, const KlineBar* hist, int n_hist)
     {
-        if (!isWarm()) {
+        if (n_hist < mWarmupBars) {
             ++mPanelsSkippedNotWarm;
             return;
         }
 
-        const KlineBar* newest = mBuilder.newestBar();
+        const KlineBar* newest = (n_hist > 0) ? &hist[n_hist - 1] : nullptr;
         if (newest == nullptr) {
             // Unreachable while warm (warmth IS a nonzero contiguous run), but
             // dereferencing on the strength of that reasoning is how a null
@@ -521,7 +676,7 @@ class RealCore final : public ICore {
             return;
         }
 
-        const int n = mBuilder.contiguousBars();
+        const int n = n_hist;
         const int first = n - static_cast<int>(PANEL_BARS);
         // Guaranteed by the ctor check (warmup > PANEL_BARS) together with
         // isWarm(), but an underflow here indexes the deque out of bounds, so
@@ -541,7 +696,7 @@ class RealCore final : public ICore {
         rb.taker_buy_quote_volume.reserve(PANEL_BARS);
         rb.number_of_trades.reserve(PANEL_BARS);
         for (int i = first; i < n; ++i) {
-            const KlineBar* b = mBuilder.barAt(i);
+            const KlineBar* b = &hist[i];
             if (b == nullptr) {
                 // barAt returns nullptr only out of range, which the bounds
                 // above exclude. Refusing to fabricate a bar is the same rule
@@ -807,6 +962,27 @@ class RealCore final : public ICore {
     int64_t     mPanelsComputed{0};
     int64_t     mPanelsSkippedNotWarm{0};
     int64_t     mPanelsSkippedStaleBar{0};
+
+    // ---- ROUTE A: scoring on a worker thread ------------------------------
+    // The drain thread must never run the ~47 ms panel: with 28 symbols in one
+    // process that was ~1.3 s per bar of not reading the SHM ring, against a
+    // ring holding 0.47-1.67 s. Default OFF so behaviour is byte-identical to
+    // the synchronous core unless a caller opts in.
+    bool                    mAsync{false};
+    std::thread             mWorker;
+    mutable std::mutex      mMx;
+    std::condition_variable mCv;
+    bool                    mStop{false};
+    // ONE job and ONE result, never a queue: a backlog would score bars whose
+    // decisions are already too late, and would grow without bound whenever
+    // the worker falls behind. Superseded bars are counted, not silently lost.
+    std::vector<KlineBar>   mJobHist;      // guarded by mMx
+    KlineBar                mJobPopped{};  // guarded by mMx
+    bool                    mJobPending{false};
+    std::vector<KlineBar>   mWorkHist;     // worker-only, never touched by the drain thread
+    int64_t                 mResultTsMs{0};
+    bool                    mResultPending{false};
+    std::vector<KlineBar>   mSyncHist;     // drain-thread-only, synchronous path
     int64_t     mPanelErrors{0};
     std::string mLastPanelError;
 

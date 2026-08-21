@@ -65,6 +65,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace agamotto;
@@ -976,6 +977,161 @@ int run(int bench_n, const std::string& weights_override,
         std::printf("     NOTE: this driver's weights are a synthetic FIXTURE; how "
                     "often they clear the deployed gate says nothing about live. "
                     "The RULE is graded in tests/decision_parity.py.\n");
+    }
+
+    // ---- [5e] THE WALL-CLOCK FLUSH -------------------------------------
+    // Graded here because live traffic CANNOT grade it: with an active symbol
+    // a tick always rolls the bucket within milliseconds, so the flush is a
+    // safety net that never trips and "it works" would rest on reasoning
+    // alone. Measured on hydra 2026-08-20: 35 of 35 live bars were closed by a
+    // tick and ZERO by the flush. The path that only runs when a symbol goes
+    // quiet is exactly the path no live run exercises.
+    std::printf("\n[5e] the wall-clock flush\n");
+    {
+        ts += kPeriodMs;
+        tick(*core, ts, px, 1.0, ++tid);      // opens a fresh bucket
+        drain(*core);                          // take whatever that rolled
+        const int64_t open_ms_ = (ts / kPeriodMs) * kPeriodMs;
+        const int64_t end_ms_  = open_ms_ + kPeriodMs;
+
+        // NEGATIVE CONTROL, and the one that matters: a bucket whose end has
+        // NOT passed must not be closed. Without this the test would pass just
+        // as well if flushDue closed everything unconditionally.
+        checkEq<int>(core->flushDueBuckets(end_ms_ - 1), 0,
+                     "flush does NOT close a bucket that is still open");
+        KlineBar probe_{};
+        check(!core->barReady(&probe_),
+              "and emits no bar while the bucket is still open");
+
+        // Due now: the end has passed.
+        checkEq<int>(core->flushDueBuckets(end_ms_), 1,
+                     "flush CLOSES the bucket once its end has passed");
+        KlineBar flushed_{};
+        check(core->barReady(&flushed_), "the flushed bar reaches barReady()");
+        checkEq<int64_t>(flushed_.bucket_open_ms, open_ms_,
+                         "and it is the bucket that just ended");
+        // close_trigger_recv_ns is 0 by contract: no tick triggered this, so
+        // there is no recv->bar span and reporting one would invent a number.
+        checkEq<uint64_t>(flushed_.close_trigger_recv_ns, 0ULL,
+                          "a flushed bar reports NO recv->bar span");
+
+        // IDEMPOTENT: polling again closes nothing and cannot double-emit.
+        checkEq<int>(core->flushDueBuckets(end_ms_ + kPeriodMs), 0,
+                     "flushing again closes nothing -- no open bucket remains");
+        KlineBar again_{};
+        check(!core->barReady(&again_), "and produces no second copy of it");
+    }
+
+    // ---- [5f] ASYNC == SYNCHRONOUS -------------------------------------
+    // Route A moves the ~47 ms panel off the thread that drains the SHM ring.
+    // The ONLY thing that makes that acceptable is that it changes nothing
+    // about the answer: this core reproduces the reference bit-for-bit across
+    // 62 regimes, and a worker thread is the classic way to lose that quietly.
+    //
+    // Two cores, byte-identical input, one sync and one async. Every panel
+    // column, every per-regime prediction and the decision itself must agree
+    // EXACTLY -- not to a tolerance. A tolerance here would hide precisely the
+    // torn-read and wrong-bar-attribution failures the test exists to catch.
+    std::printf("\n[5f] async scoring == synchronous scoring\n");
+    {
+        auto sync_  = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        auto async_ = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        sync_->setRegimeStack(kStack, kNStack);
+        async_->setRegimeStack(kStack, kNStack);
+        async_->setAsyncScoring(true);
+        check(async_->asyncScoring(), "the async core reports async");
+        check(!sync_->asyncScoring(), "and the control core does NOT");
+
+        check(sync_->ingestBackfill(bf.data(), static_cast<int>(bf.size())),
+              "control core takes the same backfill");
+        check(async_->ingestBackfill(bf.data(), static_cast<int>(bf.size())),
+              "async core takes the same backfill");
+
+        // Reaching WARMTH needs the same seam repair section [3] performs: the
+        // first live bucket is discarded as a partial, which breaks contiguity
+        // with the backfill, and a core that never becomes warm computes no
+        // panel at all. The fill bar is built ONCE and handed to both cores --
+        // makeBar advances the walk, so building it twice would feed them
+        // different data and the comparison below would be meaningless.
+        double p2 = px;
+        uint64_t id_s = 900001;
+        uint64_t id_a = 900001;
+        tick(*sync_,  b699 + 10000, p2, 1.0, id_s);
+        tick(*async_, b699 + 10000, p2, 1.0, id_a);
+        drain(*sync_);
+        drain(*async_);
+
+        Walk wfill;
+        const KlineBar fill2 = makeBar(b699, p2, wfill);
+        check(sync_->ingestBackfill(&fill2, 1),  "control core closes the seam");
+        check(async_->ingestBackfill(&fill2, 1), "async core closes the same seam");
+        check(sync_->isWarm() && async_->isWarm(), "both cores are warm");
+
+        tick(*sync_,  b699 + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_s);
+        tick(*async_, b699 + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_a);
+        drain(*sync_);          // scores inline
+        drain(*async_);         // enqueues; the worker scores
+
+        int64_t scored_ts = 0;
+        bool scored = false;
+        for (int i = 0; i < 5000 && !scored; ++i) {
+            scored = async_->takeScoredBar(&scored_ts);
+            if (!scored) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        check(scored, "the async core handed back a scored bar");
+        // takeScoredBar returns true ONCE per bar; a second call must not
+        // re-deliver it, or a caller would score the same bar twice.
+        int64_t again_ = 0;
+        check(!async_->takeScoredBar(&again_),
+              "and does NOT hand the same bar back twice");
+
+        const CoreDiagnostics ds = sync_->diagnostics();
+        const CoreDiagnostics da = async_->diagnostics();
+        checkEq<int64_t>(da.panel_bar_ts_ms, ds.panel_bar_ts_ms,
+                         "both scored the SAME bar");
+        // NON-TRIVIALITY, and it must come BEFORE the comparisons: a panel
+        // that never ran makes every equality below vacuous.
+        check(ds.panel_bar_ts_ms != 0, "the control core actually COMPUTED a panel");
+        check(ds.panel_rows > 0 && ds.panel_cols > 0,
+              "and that panel has rows and columns");
+        checkEq<int64_t>(scored_ts, ds.panel_bar_ts_ms,
+                         "takeScoredBar named the bar that was scored");
+        checkEq<int64_t>(da.panel_rows, ds.panel_rows, "same panel rows");
+        checkEq<int64_t>(da.panel_cols, ds.panel_cols, "same panel cols");
+
+        int col_diffs_ = 0;
+        for (int j = 0; j < static_cast<int>(ds.panel_cols); ++j) {
+            const double a_ = async_->panelLatest(j);
+            const double b_ = sync_->panelLatest(j);
+            const bool same_ = (a_ == b_) || (a_ != a_ && b_ != b_);  // NaN==NaN
+            if (!same_) ++col_diffs_;
+        }
+        checkEq<int>(col_diffs_, 0, "every panel column is BIT-IDENTICAL");
+
+        int pred_diffs_ = 0;
+        int fire_diffs_ = 0;
+        for (int i = 0; i < sync_->regimeStackSize(); ++i) {
+            const double a_ = async_->regimePrediction(i);
+            const double b_ = sync_->regimePrediction(i);
+            if (!((a_ == b_) || (a_ != a_ && b_ != b_))) ++pred_diffs_;
+            if (async_->regimeFiredLatest(i) != sync_->regimeFiredLatest(i)) ++fire_diffs_;
+        }
+        checkEq<int>(pred_diffs_, 0, "every per-regime prediction is BIT-IDENTICAL");
+        checkEq<int>(fire_diffs_, 0, "every regime fired/held flag agrees");
+
+        const Decision dsync = sync_->decide();
+        const Decision dasync = async_->decide();
+        checkEq<int>(static_cast<int>(dasync.fired), static_cast<int>(dsync.fired),
+                     "the DECISION agrees on fired");
+        checkEq<int>(dasync.side, dsync.side, "the decision agrees on side");
+        check(dasync.y_pred == dsync.y_pred || (dasync.y_pred != dasync.y_pred
+                                                && dsync.y_pred != dsync.y_pred),
+              "and on y_pred, bit-for-bit");
+
+        async_->setAsyncScoring(false);   // joins the worker; must not hang
+        check(!async_->asyncScoring(), "async can be switched back off");
     }
 
     std::printf("\n[6] final diagnostics\n");

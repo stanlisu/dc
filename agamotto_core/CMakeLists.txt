@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(agamotto_core LANGUAGES CXX)
 
+
+# ROUTE A runs the panel on a worker thread, so every target that links the
+# core needs pthread. gcc 8 does not pull it in implicitly: without this the
+# link fails on pthread_create, and only for the targets that instantiate
+# std::thread -- so it would surface as one driver failing to link rather than
+# as an obvious missing dependency.
+find_package(Threads REQUIRED)
+
 # Built as a shared lib and linked by the PUBLIC sentinel strategy via
 #   -DAGAMOTTO_CORE_DIR=<this>/build
 # The public repo never sees these sources. Mirrors dc/sentinel_core.
@@ -114,7 +122,7 @@ add_library(agamotto_core SHARED
 target_include_directories(agamotto_core PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
 target_compile_definitions(agamotto_core PRIVATE
     AGAMOTTO_CORE_GITSHA="${AGAMOTTO_CORE_GITSHA}")
-target_link_libraries(agamotto_core PRIVATE ${TALIB_LIB} m)
+target_link_libraries(agamotto_core PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(agamotto_core PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 message(STATUS "agamotto_core: contract=${CONTRACT_DIR} sha=${AGAMOTTO_CORE_GITSHA}")
@@ -136,7 +144,7 @@ target_compile_options(kline_parity_driver PRIVATE -Wall -Wextra)
 add_executable(pdops_parity_driver tests/pdops_parity_driver.cpp
                                    src/feature_engine.cpp src/talib_block.cpp)
 target_include_directories(pdops_parity_driver PRIVATE src ${TALIB_INC})
-target_link_libraries(pdops_parity_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(pdops_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(pdops_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # Stage 2.2 + 2.3 feature-column parity. Reads one symbol's raw OHLCV panel as
@@ -146,7 +154,7 @@ target_compile_options(pdops_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_F
 add_executable(feature_parity_driver tests/feature_parity_driver.cpp
                                      src/feature_engine.cpp src/talib_block.cpp)
 target_include_directories(feature_parity_driver PRIVATE src ${TALIB_INC})
-target_link_libraries(feature_parity_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(feature_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(feature_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # Stage 2.6 INTEGRATION gate: ticks -> KlineBuilder -> RealCore ->
@@ -169,7 +177,7 @@ add_executable(core_integration_driver tests/core_integration_driver.cpp
 target_include_directories(core_integration_driver PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
 target_compile_definitions(core_integration_driver PRIVATE
     AGAMOTTO_CORE_GITSHA="${AGAMOTTO_CORE_GITSHA}")
-target_link_libraries(core_integration_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(core_integration_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(core_integration_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # PHASE 3 regime-gate parity. Reads the raw OHLCV panel on stdin, prints the
@@ -186,7 +194,7 @@ add_executable(regime_parity_driver tests/regime_parity_driver.cpp
                                     src/feature_engine.cpp
                                     src/talib_block.cpp)
 target_include_directories(regime_parity_driver PRIVATE src ${TALIB_INC})
-target_link_libraries(regime_parity_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(regime_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(regime_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # PHASE 4 model parity. Reads the raw OHLCV panel on stdin, prints the
@@ -210,7 +218,7 @@ add_executable(model_parity_driver tests/model_parity_driver.cpp
                                    src/feature_engine.cpp
                                    src/talib_block.cpp)
 target_include_directories(model_parity_driver PRIVATE src ${TALIB_INC})
-target_link_libraries(model_parity_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(model_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(model_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # PHASE 5 decision parity. Reads the raw OHLCV panel on stdin, prints the
@@ -230,7 +238,7 @@ add_executable(decision_parity_driver tests/decision_parity_driver.cpp
                                       src/feature_engine.cpp
                                       src/talib_block.cpp)
 target_include_directories(decision_parity_driver PRIVATE src ${TALIB_INC})
-target_link_libraries(decision_parity_driver PRIVATE ${TALIB_LIB} m)
+target_link_libraries(decision_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(decision_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # The ta-lib LINK PROOF. find_library above only proves the file exists; this
@@ -238,5 +246,5 @@ target_compile_options(decision_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_F
 # ABI-mismatched archive fails the build here rather than at Phase 2.2.
 add_executable(talib_bench tests/talib_bench.cpp)
 target_include_directories(talib_bench PRIVATE ${TALIB_INC})
-target_link_libraries(talib_bench PRIVATE ${TALIB_LIB} m)
+target_link_libraries(talib_bench PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(talib_bench PRIVATE -Wall -Wextra)

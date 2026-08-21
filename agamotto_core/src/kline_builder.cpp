@@ -157,6 +157,31 @@ void KlineBuilder::emitFlat(int64_t bucket_open_ms)
 	++mBarsSeen;
 }
 
+int KlineBuilder::flushDue(int64_t cutoff_ms)
+{
+	if (!mHaveOpenBucket) {
+		return 0;
+	}
+	// The bucket ENDS at open + period. Only close it once that end is at or
+	// before the cutoff the caller computed (their now minus the in-flight
+	// grace); anything later is still legitimately open.
+	const int64_t bucket_end_ms = mCur.bucket_open_ms + mPeriodMs;
+	if (bucket_end_ms > cutoff_ms) {
+		return 0;
+	}
+	// close_trigger_recv_ns is 0: no tick triggered this close, so there is no
+	// recv->bar span to measure and reporting one would invent a number. The
+	// strategy already treats 0 as "not measured" when building [AGLAT].
+	emitCurrent(0);
+	// NOT followed by startBucket(): opening the next bucket here would claim a
+	// bucket no trade has landed in yet, and the tick path already opens one on
+	// the first trade it sees. A dead symbol should produce no bars, not a
+	// stream of synthetic flats -- the flat-walk on the tick path exists to
+	// bridge gaps BETWEEN real trades, and inventing bars for a symbol that has
+	// simply stopped trading would feed the panel data the venue never had.
+	return 1;
+}
+
 void KlineBuilder::emitCurrent(uint64_t close_trigger_recv_ns)
 {
 	if (!mHaveOpenBucket) {
