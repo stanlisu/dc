@@ -43,14 +43,35 @@ REL_TOL = 1e-9
 
 
 def parse_bars(pattern: str) -> list[dict]:
-    out = []
+    """Latest record per (file, bucket), preferring [AGBARR] over [AGBAR].
+
+    [AGBAR] is written when a bar is BUILT, from the tick stream, and still
+    carries whatever the feed failed to deliver. [AGBARR] is written when that
+    bar is CORRECTED against the venue's own kline. Grading the build-time line
+    would leave this gate red no matter how well the correction works -- it
+    would be measuring the wrong record.
+    """
+    latest: dict[tuple[str, int], dict] = {}
     for f in sorted(glob.glob(pattern)):
         for line in open(f, errors="replace"):
-            if "[AGBAR]" in line and "[AGBARQ]" not in line:
-                d = dict(re.findall(r"(\w+)=([-\d.]+)", line.split("[AGBAR]")[1]))
-                if "open_ms" in d:
-                    out.append(d)
-    return out
+            tag = None
+            if "[AGBARR]" in line:
+                tag = "[AGBARR]"
+            elif "[AGBAR]" in line and "[AGBARQ]" not in line:
+                tag = "[AGBAR]"
+            if tag is None:
+                continue
+            d = dict(re.findall(r"(\w+)=([-\d.]+)", line.split(tag)[1]))
+            if "open_ms" not in d:
+                continue
+            d["_corrected"] = (tag == "[AGBARR]")
+            key = (f, int(d["open_ms"]))
+            prev = latest.get(key)
+            # a corrected record always supersedes a built one for the same
+            # bucket in the same process
+            if prev is None or (d["_corrected"] and not prev.get("_corrected")):
+                latest[key] = d
+    return list(latest.values())
 
 
 def kline(symbol: str, open_ms: int) -> list | None:
@@ -112,8 +133,10 @@ def main() -> int:
             else:
                 clean += 1
 
+    corrected = sum(1 for b in bars if b.get("_corrected"))
     print(f"[bar_fidelity] graded {graded} bar(s) over {len(stamps)} stamp(s): "
-          f"{clean} exact, {len(failures)} LOST DATA")
+          f"{clean} exact, {len(failures)} LOST DATA "
+          f"({corrected} record(s) were corrected bars)")
     for f in failures:
         print(f)
     if graded == 0:

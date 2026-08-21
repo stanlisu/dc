@@ -138,7 +138,14 @@ class KlineBuilder {
     /// source, trade-id gaps, recv timing). Those are PRESERVED: only the nine
     /// venue columns are overwritten, so a corrected bar still reports how badly
     /// its tick stream was damaged.
-    int reconcileAgainst(const KlineBar* bars, int n);
+    ///
+    /// `out`/`max_out` receive the CORRECTED bars so a caller can LOG them.
+    /// Without that the correction is invisible: the only record of a bar is
+    /// the line written when it was BUILT, which still carries the short
+    /// values, so a reader could not tell a fixed bar from a broken one and
+    /// no test could prove the fix worked.
+    int reconcileAgainst(const KlineBar* bars, int n,
+                         KlineBar* out = nullptr, int max_out = 0);
 
     // Total bars ever emitted/ingested. A monotone counter — NOT a warmup
     // signal; use contiguousBars() for that.

@@ -176,9 +176,10 @@ class RealCore final : public ICore {
     // trades before this core sees them -- the publisher cannot always write to
     // the ring -- and that publisher is not ours to change, so the bar is fixed
     // from the source rather than defended.
-    int reconcileAgainst(const KlineBar* bars, int n) override
+    int reconcileAgainst(const KlineBar* bars, int n,
+                         KlineBar* out, int max_out) override
     {
-        return mBuilder.reconcileAgainst(bars, n);
+        return mBuilder.reconcileAgainst(bars, n, out, max_out);
     }
 
     int flushDueBuckets(int64_t cutoff_ms) override

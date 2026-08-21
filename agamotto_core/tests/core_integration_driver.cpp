@@ -1134,6 +1134,61 @@ int run(int bench_n, const std::string& weights_override,
         check(!async_->asyncScoring(), "async can be switched back off");
     }
 
+    // ---- [5g] RECONCILE AGAINST THE VENUE'S KLINES ----------------------
+    // The live gate (tests/bar_fidelity_gate.py) is the acceptance test; this
+    // grades the MECHANISM, including the three ways it could quietly do the
+    // wrong thing: correct a bar that was already right, invent a bar it does
+    // not hold, or erase the evidence that the feed was damaged.
+    std::printf("\n[5g] reconcileAgainst corrects only what disagrees\n");
+    {
+        auto rc = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        rc->setRegimeStack(kStack, kNStack);
+        check(rc->ingestBackfill(bf.data(), static_cast<int>(bf.size())),
+              "reconcile fixture takes the backfill");
+
+        // NEGATIVE CONTROL FIRST: handing it the SAME bars must change nothing.
+        // Without this the suite would pass just as well if reconcileAgainst
+        // overwrote every bar unconditionally -- which would look identical on
+        // a happy path and would destroy tick diagnostics on every bar.
+        checkEq<int>(rc->reconcileAgainst(bf.data(), static_cast<int>(bf.size()), nullptr, 0), 0,
+                     "identical klines correct NOTHING");
+        checkEq<int64_t>(rc->diagnostics().bars_reconciled, 0,
+                         "and the counter stays at zero");
+
+        // Now damage one bar the way a lost trade damages it: volume and
+        // n_trades LOW, price untouched -- the signature measured live.
+        std::vector<KlineBar> truth = bf;
+        const size_t victim = truth.size() - 5;
+        const double good_vol = truth[victim].volume;
+        const int64_t good_n  = truth[victim].number_of_trades;
+        std::vector<KlineBar> damaged = truth;
+        damaged[victim].volume           = good_vol * 0.90;
+        damaged[victim].number_of_trades = good_n - 7;
+
+        auto rc2 = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        rc2->setRegimeStack(kStack, kNStack);
+        check(rc2->ingestBackfill(damaged.data(), static_cast<int>(damaged.size())),
+              "a fixture carrying one SHORT bar is ingested");
+        checkEq<int>(rc2->reconcileAgainst(truth.data(), static_cast<int>(truth.size()), nullptr, 0), 1,
+                     "exactly ONE bar is corrected -- not all of them");
+        checkEq<int64_t>(rc2->diagnostics().bars_reconciled, 1,
+                         "and the counter says so");
+        // Idempotent: a second pass finds nothing left to fix.
+        checkEq<int>(rc2->reconcileAgainst(truth.data(), static_cast<int>(truth.size()), nullptr, 0), 0,
+                     "reconciling again corrects nothing");
+
+        // A bucket the builder does NOT hold must not be inserted: filling a
+        // hole is ingestBackfill's job, and letting this insert would let a
+        // stale file rewrite history it should only have patched.
+        std::vector<KlineBar> stranger;
+        stranger.push_back(makeBar(kBase - 50 * kPeriodMs, 1234.5, w));
+        const int64_t held_before = rc2->barsBuffered();
+        checkEq<int>(rc2->reconcileAgainst(stranger.data(), 1, nullptr, 0), 0,
+                     "a bucket we do not hold is NOT inserted");
+        checkEq<int64_t>(rc2->barsBuffered(), held_before,
+                         "and the retained count is unchanged");
+    }
+
     std::printf("\n[6] final diagnostics\n");
     std::printf("     bars_seen=%" PRId64 " contiguous=%" PRId64 "/%d panels=%" PRId64
                 " skipped_not_warm=%" PRId64 " skipped_stale=%" PRId64 " errors=%" PRId64 "\n",

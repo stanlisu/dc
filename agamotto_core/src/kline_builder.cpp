@@ -413,7 +413,8 @@ bool KlineBuilder::pop(KlineBar* out)
 	return true;
 }
 
-int KlineBuilder::reconcileAgainst(const KlineBar* bars, int n)
+int KlineBuilder::reconcileAgainst(const KlineBar* bars, int n,
+                                   KlineBar* out, int max_out)
 {
 	if (bars == nullptr || n <= 0 || mHistory.empty()) {
 		return 0;
@@ -465,6 +466,9 @@ int KlineBuilder::reconcileAgainst(const KlineBar* bars, int n)
 		held.taker_buy_base_volume  = t.taker_buy_base_volume;
 		held.taker_buy_quote_volume = t.taker_buy_quote_volume;
 		held.reconciled             = true;
+		if (out != nullptr && corrected < max_out) {
+			out[corrected] = held;
+		}
 		++corrected;
 	}
 	mBarsReconciled += corrected;
