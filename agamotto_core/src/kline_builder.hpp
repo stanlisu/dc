@@ -112,6 +112,41 @@ class KlineBuilder {
     // without a restart and without inventing the bucket we only half saw.
     bool ingestBackfill(const KlineBar* bars, int n);
 
+    /// Replace retained bars that DISAGREE with the venue's own klines, and
+    /// report how many were corrected.
+    ///
+    /// WHY THIS EXISTS. The tick path loses trades before this builder ever
+    /// sees them: the feed publisher reports `Failed to publish market data`
+    /// when it cannot write to the SHM ring, so the message never reaches a
+    /// consumer at all. That publisher is vendor code and is not ours to fix.
+    /// Measured 2026-08-21 on a QUIET bar (168 msg/s, 3.05 s of ring headroom,
+    /// with scoring already moved off the drain thread): AAVE -12.21 pct,
+    /// 1000PEPE -11.34 pct, LINK -3.91 pct, and even BNB one trade short.
+    ///
+    /// So the bar is CORRECTED from the authoritative source rather than
+    /// defended. `bars` are Binance's own klines, already refreshed every 60 s
+    /// for the seam repair, so this costs one comparison per retained bar and
+    /// no new I/O.
+    ///
+    /// SCOPE, deliberately narrow: it replaces only bars this builder ALREADY
+    /// HOLDS at a matching bucket_open_ms. It never inserts, never extends and
+    /// never reorders -- filling a hole is ingestBackfill's job and conflating
+    /// the two would let a stale CSV silently rewrite history it should only
+    /// have patched.
+    ///
+    /// A bar built from ticks carries diagnostics the kline cannot (aggressor
+    /// source, trade-id gaps, recv timing). Those are PRESERVED: only the nine
+    /// venue columns are overwritten, so a corrected bar still reports how badly
+    /// its tick stream was damaged.
+    ///
+    /// `out`/`max_out` receive the CORRECTED bars so a caller can LOG them.
+    /// Without that the correction is invisible: the only record of a bar is
+    /// the line written when it was BUILT, which still carries the short
+    /// values, so a reader could not tell a fixed bar from a broken one and
+    /// no test could prove the fix worked.
+    int reconcileAgainst(const KlineBar* bars, int n,
+                         KlineBar* out = nullptr, int max_out = 0);
+
     // Total bars ever emitted/ingested. A monotone counter — NOT a warmup
     // signal; use contiguousBars() for that.
     int64_t barsSeen() const { return mBarsSeen; }
@@ -202,6 +237,10 @@ class KlineBuilder {
     // so polling this costs nothing and cannot double-emit.
     int     flushDue(int64_t cutoff_ms);
 
+    // Bars whose venue columns were CORRECTED from the authoritative klines.
+    // Nonzero means the tick stream lost data -- see reconcileAgainst.
+    int64_t barsReconciled() const { return mBarsReconciled; }
+
     int64_t duplicatesDropped() const { return mDuplicatesDropped; }
     int64_t lateTradesDropped() const { return mLateTradesDropped; }
     int64_t partialBucketsDropped() const { return mPartialBucketsDropped; }
@@ -252,6 +291,7 @@ class KlineBuilder {
     int64_t mBarsSeen{0};
     int64_t mTradeUpdates{0}, mAggTradeUpdates{0};
     int64_t mDuplicatesDropped{0}, mLateTradesDropped{0}, mPartialBucketsDropped{0};
+    int64_t mBarsReconciled{0};
     int64_t mBadTimestampDropped{0};
     int64_t mTradeIdGaps{0}, mTradesMissing{0};
 

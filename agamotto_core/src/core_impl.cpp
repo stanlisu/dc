@@ -172,6 +172,16 @@ class RealCore final : public ICore {
     // bucket, which made latency a function of how quiet the symbol was
     // (3.3-11.6 s past the boundary on 2026-08-20). The bars land in the same
     // queue barReady() already drains, so downstream sees no new path.
+    // Correct retained bars against the venue's own klines. The tick path loses
+    // trades before this core sees them -- the publisher cannot always write to
+    // the ring -- and that publisher is not ours to change, so the bar is fixed
+    // from the source rather than defended.
+    int reconcileAgainst(const KlineBar* bars, int n,
+                         KlineBar* out, int max_out) override
+    {
+        return mBuilder.reconcileAgainst(bars, n, out, max_out);
+    }
+
     int flushDueBuckets(int64_t cutoff_ms) override
     {
         return mBuilder.flushDue(cutoff_ms);
@@ -354,6 +364,7 @@ class RealCore final : public ICore {
         d.trade_updates = mBuilder.tradeUpdates();
         d.aggtrade_updates = mBuilder.aggTradeUpdates();
         d.duplicates_dropped = mBuilder.duplicatesDropped();
+        d.bars_reconciled = mBuilder.barsReconciled();
         d.late_trades_dropped = mBuilder.lateTradesDropped();
         d.partial_buckets_dropped = mBuilder.partialBucketsDropped();
         d.bad_timestamp_dropped = mBuilder.badTimestampDropped();
