@@ -39,8 +39,8 @@ OUTDIR="$HERE/build-linux"
 # stale extra object can still produce numbers.
 #
 # Flags: TALIB pulls libta-lib (+ -lm, which it needs and does not pull in
-# itself); LGBM pulls lib_lightgbm (+ gomp/pthread, which its static lib needs);
-# SHA means the translation unit bakes in MJOLNIR_CORE_GITSHA.
+# itself); LGBM pulls lib_lightgbm; SHA means the translation unit bakes in
+# MJOLNIR_CORE_GITSHA.
 driver_sources() {
     case "$1" in
         bar_parity_driver)       echo "src/bar_builder.cpp" ;;
@@ -149,7 +149,14 @@ for d in "${TARGETS[@]}"; do
     libs=""
     defs=""
     case ",$flags," in *,TALIB,*) libs="$libs /usr/local/lib/libta-lib.a -lm" ;; esac
-    case ",$flags," in *,LGBM,*)  libs="$libs /usr/local/lib/lib_lightgbm.a -lgomp -lpthread" ;; esac
+    # SHARED, not static: the pinned image ships only lib_lightgbm.so — there is
+    # no lib_lightgbm.a to link, and asking for one fails with "No such file or
+    # directory" rather than falling back. CMakeLists.txt already resolves the
+    # same .so for libmjolnir_core, so the drivers now match the library.
+    # No -lgomp/-lpthread here: those were the STATIC lib's undefined symbols.
+    # lib_lightgbm.so carries libgomp.so.1 and libpthread.so.0 as DT_NEEDED, so
+    # the loader pulls them in, and no driver source uses OpenMP directly.
+    case ",$flags," in *,LGBM,*)  libs="$libs /usr/local/lib/lib_lightgbm.so" ;; esac
     case ",$flags," in
         *,SHA,*)
             if [ -z "$SHA" ]; then
