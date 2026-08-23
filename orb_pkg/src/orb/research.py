@@ -495,14 +495,35 @@ class OrbResearch(AgamottoResearch):
         position: str,
     ) -> pd.Series:
         """Override: route TF-prefixed filters through column remapping."""
-        # List → delegate to super (recursive calls come back here)
+        # List → delegate to super, which splits and re-enters HERE per item.
         if isinstance(filter_name, list):
             return super()._apply_filter_mask(df, filter_name, position)
 
         if not isinstance(filter_name, str):
             return super()._apply_filter_mask(df, filter_name, position)
 
-        # Compound _and_ / _or_ → delegate to super (splits + recurses here)
+        # Compound _and_ / _or_ → delegate to super, which does the decode and
+        # the split in ONE place and hands each leg back to this method via the
+        # `sub_filter_fn` hook, so the leg gets its own timeframe's columns.
+        #
+        # FIXED 2026-08-23. Until then the recursion did NOT come back here:
+        # research_filters.apply_filter_mask split `_and_`/`_or_` by calling
+        # ITSELF, so control skipped this override and reached the
+        # `re.sub(r'^(?:15m|1h|4h|1d)_', ...)` strip, which discards the prefix
+        # and reads the BARE (TARGET_TF) columns. Every leg of a compound was
+        # therefore evaluated on TARGET_TF whatever TF its name said. Measured
+        # on a 2,000-row 15m+1h panel: `15m_macd_bullish` 985 rows,
+        # `1h_macd_bullish` 956, true conjunction 505 — and
+        # `15m_macd_bullish_and_1h_macd_bullish` selected 985, the 15m leg
+        # alone. 160 of the 332 regimes in the shipped pred_orb.base.15m_1
+        # stack are compound and 136 of those span more than one TF, so every
+        # orb research artefact built before this date measures a different
+        # regime than its name says.
+        #
+        # Splitting FIRST (before the _TF_PREFIXES loop below) is load-bearing:
+        # `15m_a_and_1h_b` starts with `15m_`, so the loop would otherwise
+        # remap 15m for the whole compound and leave the 1h leg to be evaluated
+        # on a frame that has already been overwritten.
         if "_and_" in filter_name or "_or_" in filter_name:
             return super()._apply_filter_mask(df, filter_name, position)
 
@@ -672,23 +693,41 @@ class OrbResearch(AgamottoResearch):
     # folded onto agamotto/ladder.py on 2026-08-07, so both of orb's target
     # paths — same-TF and cross-TF — now honour LADDER_LONG / LADDER_SHORT.
 
-    @staticmethod
-    def _remap_tf_columns(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    def _remap_tf_columns(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         """Remap TF-prefixed columns to unprefixed for parent filter logic.
 
         E.g. if tf='1d', maps '1d_close' -> 'close', '1d_mvg1' -> 'mvg1',
         '1d_rsi' -> 'rsi', etc.
         Returns a copy with remapped columns added (overwriting any existing
         unprefixed columns so the parent filter sees this TF's values).
+
+        A filter column this TF does NOT carry is DROPPED rather than left
+        showing through (2026-08-23). The bare columns hold TARGET_TF values
+        (verticalize step 3/3b), so leaving one in place lets `<tf>_<atom>` read
+        the target timeframe and call it `<tf>` — the same silent wrong answer
+        the compound-dispatch fix above removes, arriving by a second route
+        (an atom naming a TF that is not in TIMEFRAMES, or a column one TF
+        computed and another did not). Dropped, `_require_col` raises and names
+        the column instead. TARGET_TF is exempt because the bare columns ARE
+        its values: after the verticalize de-duplication there is no
+        `{target_tf}_<derived>` copy left to remap from, and an atomic
+        `15m_<atom>` is meant to fall through to the bare column.
         """
         # All columns the parent's _apply_filter_mask can access
         filter_cols = set(_RAW_COLUMNS) | set(_DERIVED_FEATURES)
 
         remapped = df.copy()
         tf_prefix = f"{tf}_"
+        seen: set[str] = set()
         for col in df.columns:
             if col.startswith(tf_prefix):
                 base_name = col[len(tf_prefix):]
                 if base_name in filter_cols:
                     remapped[base_name] = df[col]
+                    seen.add(base_name)
+        if tf != self.target_tf:
+            stale = [c for c in filter_cols if c in remapped.columns
+                     and c not in seen]
+            if stale:
+                remapped = remapped.drop(columns=stale)
         return remapped
