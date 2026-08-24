@@ -906,6 +906,14 @@ class AgamottoResearch:
             position,
             strict_filters=getattr(self, '_strict_filters', True),
             allowed_positions_fn=type(self).allowed_positions,
+            # Composite (`_and_` / `_or_` / list) legs re-enter through SELF, so
+            # a subclass override applies to EVERY LEG and not just to the whole
+            # name. Without this, OrbResearch's per-TF column remap was skipped
+            # for compounds and every leg of a cross-TF regime was evaluated on
+            # TARGET_TF (2026-08-23; mechanism in apply_filter_mask's docstring).
+            # For agamotto itself the hook is this same call with the same
+            # arguments, so single-TF behaviour is byte-identical.
+            sub_filter_fn=self._apply_filter_mask,
         )
 
     def filter_signals(self, regime: dict, limit_timestamp: Optional[pd.Timestamp] = None, save: bool = False, out_dir: str = None) -> pd.DataFrame:

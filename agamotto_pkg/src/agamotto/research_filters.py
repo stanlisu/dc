@@ -188,8 +188,44 @@ def apply_filter_mask(
     position: str,
     strict_filters: bool = True,
     allowed_positions_fn = allowed_positions,
+    sub_filter_fn=None,
 ) -> pd.Series:
-    """Evaluates a named filter or list of filters against DataFrame df."""
+    """Evaluates a named filter or list of filters against DataFrame df.
+
+    ``sub_filter_fn`` is the RECURSION HOOK for composite names (`_and_`,
+    `_or_`, list). Every leg is evaluated through it — signature
+    ``(df, name, position) -> pd.Series`` — instead of through this function.
+
+    WHY IT EXISTS (2026-08-23). The three recursion sites below used to call
+    THIS function unconditionally, so the split never re-entered a subclass
+    override. `OrbResearch._apply_filter_mask` is the one place that knows how
+    to point an atom at its own timeframe (`_remap_tf_columns`), and a compound
+    leg never reached it: control went straight to the `re.sub(r'^(?:15m|1h|4h|
+    1d)_', ...)` strip further down, which discards the prefix and reads the
+    BARE (TARGET_TF) columns. So every leg of a cross-TF compound was evaluated
+    on the target timeframe. Measured on a 2,000-row 15m+1h orb panel:
+    `15m_macd_bullish` 985 rows, `1h_macd_bullish` 956, the conjunction of the
+    two 505 — but `15m_macd_bullish_and_1h_macd_bullish` selected 985, the 15m
+    leg alone. `ScepterResearch` and `StormBreakerResearch` had each already
+    hand-rolled their own split for exactly this reason; orb had not.
+
+    The prefix strip itself is NOT the defect and stays: agamotto is single-TF
+    and has no per-TF columns to point at, and the standalone callers
+    (`sentinel_core/tests/regime_parity.py`, `agamotto_core/tests/*`, marvel's
+    `psylocke/`) hand this function a frame with bare columns only.
+
+    ``None`` is not a fallback for a required value: it means "no override to
+    re-enter", which is the correct and only possible behaviour for a caller
+    that is not a research instance, and reproduces the standalone semantics
+    those callers already depend on byte-for-byte.
+    """
+    def _sub(part) -> pd.Series:
+        """Evaluate one leg of a composite name — through the hook if given."""
+        if sub_filter_fn is None:
+            return apply_filter_mask(df, part, position, strict_filters,
+                                     allowed_positions_fn, None)
+        return sub_filter_fn(df, part, position)
+
     if isinstance(filter_name, list):
         mask = None
         current_op = None
@@ -198,7 +234,7 @@ def apply_filter_mask(
             if item in ["|", "&"]:
                 current_op = item
             else:
-                sub_mask = apply_filter_mask(df, item, position, strict_filters, allowed_positions_fn)
+                sub_mask = _sub(item)
                 if mask is None:
                     mask = sub_mask
                 else:
@@ -222,7 +258,7 @@ def apply_filter_mask(
             parts = filter_name.split("_and_")
             mask = None
             for part in parts:
-                sub_mask = apply_filter_mask(df, part.strip(), position, strict_filters, allowed_positions_fn)
+                sub_mask = _sub(part.strip())
                 mask = sub_mask if mask is None else (mask & sub_mask)
             return mask if mask is not None else pd.Series(True, index=df.index)
 
@@ -230,7 +266,7 @@ def apply_filter_mask(
             parts = filter_name.split("_or_")
             mask = None
             for part in parts:
-                sub_mask = apply_filter_mask(df, part.strip(), position, strict_filters, allowed_positions_fn)
+                sub_mask = _sub(part.strip())
                 mask = sub_mask if mask is None else (mask | sub_mask)
             return mask if mask is not None else pd.Series(True, index=df.index)
 

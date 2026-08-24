@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from agamotto import AgamottoResearch
+from agamotto.features_scalefree import SCALE_FREE_FEATURES
 from agamotto.ladder import compute_ladder_multiplier, ladder_params
 from agamotto.utils import _symbol_to_native
 
@@ -42,6 +43,24 @@ _DERIVED_FEATURES = [
     "vol_ratio", "quote_vol_ratio", "buy_pressure", "trade_intensity",
     "vol_ret_lag1", "vol_ret_lag2", "vol_ret_lag3",
 ]
+
+# The seven scale-free level replacements (agamotto/features_scalefree.py,
+# added 2026-08-06). orb ALREADY COMPUTES THEM: engineer_features() delegates
+# per TF to AgamottoResearch (:260), whose engineer_features writes
+# `{native}_sar_dist` … into that TF's wide frame, and _align_timeframes carries
+# them through as `{tf}_{native}_sar_dist`. They were simply absent from
+# _DERIVED_FEATURES, so verticalize()'s step-1 loop — which iterates the LIST,
+# not the frame — dropped all seven from the vertical panel in silence. That is
+# the same failure SHAPE as agamotto's pre-104d740 rename-map drop, and it is
+# what left orb's 15m block at 40 features, a strict subset of agamotto's 47
+# (gauntlet/orb_vs_agamotto_features_20260822.md §1a); those twins accounted for
+# 1,794 of agamotto's exclusive top-5 picks.
+#
+# APPENDED FROM THE CANONICAL LIST, never re-typed here: a second hardcoded copy
+# drifting from features_scalefree.SCALE_FREE_FEATURES is exactly the defect
+# this replaces. The obfuscation map already carries codes for all seven
+# (f101–f107) — the map is global and append-only, so nothing renumbers.
+_DERIVED_FEATURES += list(SCALE_FREE_FEATURES)
 
 # Raw / MA / return columns that filters need but ML should NOT use.
 _RAW_COLUMNS = [
@@ -280,8 +299,45 @@ class OrbResearch(AgamottoResearch):
 
             sym_cols: dict[str, pd.Series] = {}
 
-            # 1. TF-prefixed DERIVED features (ML features)
+            # 1. TF-prefixed DERIVED features (ML features).
+            #    TARGET_TF IS SKIPPED — step 3b emits those same source columns
+            #    unprefixed, and emitting both put every base-TF feature in
+            #    front of the model TWICE (fixed 2026-08-22).
+            #
+            #    `15m_rsi` and bare `rsi` were the SAME series: this loop reads
+            #    `{tf}_{native}_{feat}` for every tf in self.timeframes — which
+            #    includes TARGET_TF — and step 3b reads
+            #    `{target_tf}_{native}_{feat}`. Verified on the built panel,
+            #    `15m_rsi.equals(rsi)` is True. select_feature_columns excludes
+            #    step 3's bare raw/MA copies BY NAME (close, mvg1, ...) but has
+            #    no rule for bare DERIVED names — agamotto's own model features
+            #    are exactly those names — so only the derived pair reached the
+            #    model. That asymmetry was the defect. The |IC| ranker puts each
+            #    pair adjacently, so the shipped TOPN_ICS = 16 arm spent its 16
+            #    slots on 9 DISTINCT features, one of them cross-TF (measured on
+            #    15m_r069_long / window_2026_07_31; census in marvel
+            #    gauntlet/orb_vs_agamotto_features_20260822.md §1b).
+            #
+            #    WHY THE UNPREFIXED COPY IS THE ONE KEPT, not the prefixed one:
+            #    it is the only choice that leaves every FILTER bit-identical.
+            #    _remap_tf_columns overwrites a bare name only when it finds the
+            #    prefixed column, so with the TARGET_TF block gone an atomic
+            #    `15m_<filter>` falls through to the bare column — which holds
+            #    exactly the TARGET_TF values it would have remapped. Other TFs
+            #    still have their prefixed blocks and remap as before. It also
+            #    matches how stormbreaker names its panel (base TF bare, context
+            #    TFs prefixed — core/research.py _get_tf_view).
+            #
+            #    Dropping the BARE copy instead would have required routing
+            #    unprefixed atoms through a TARGET_TF remap, and that breaks:
+            #    research_filters.apply_filter_mask splits `_and_` by calling
+            #    ITSELF (:225), never OrbResearch._apply_filter_mask, then
+            #    strips the TF prefix with a regex (:240) and reads BARE
+            #    columns. 160 of the 332 regimes in the shipped stack are
+            #    compound. See the note on _apply_filter_mask below.
             for tf in self.timeframes:
+                if tf == self.target_tf:
+                    continue
                 for feat in _DERIVED_FEATURES:
                     src_col = f"{tf}_{native}_{feat}"
                     dst_col = f"{tf}_{feat}"
@@ -303,13 +359,45 @@ class OrbResearch(AgamottoResearch):
                 if src_col in self.features.columns:
                     sym_cols[raw] = self.features[src_col]
 
-            # 3b. Unprefixed derived features from TARGET_TF (for filter logic)
-            #     Needed so atomic filters like strong_candle (open_close_pct),
-            #     low_vol (price_range_pct) work without a TF prefix.
+            # 3b. Unprefixed derived features from TARGET_TF. THE ONLY COPY of
+            #     the TARGET_TF derived block since 2026-08-22 (step 1 skips
+            #     that TF) — it serves both the filter logic and the model.
+            #     Needed unprefixed so atomic filters like strong_candle
+            #     (open_close_pct), low_vol (price_range_pct) resolve without a
+            #     TF prefix, and so the `_and_` path in research_filters, which
+            #     strips TF prefixes and reads bare columns, keeps working.
             for feat in _DERIVED_FEATURES:
                 src_col = f"{self.target_tf}_{native}_{feat}"
                 if src_col in self.features.columns:
                     sym_cols[feat] = self.features[src_col]
+
+            # Tripwire for the defect steps 1 and 3b hid (mirrors the agamotto
+            # one added in 104d740). Both loops iterate _DERIVED_FEATURES, NOT
+            # the frame, so a feature the per-TF AgamottoResearch computed but
+            # this list omits is dropped from the panel with nothing in the
+            # logs — which is how orb lost all seven scale-free twins between
+            # 2026-08-06 and 2026-08-22. Scoped to SCALE_FREE_FEATURES because
+            # plenty of other `{tf}_{native}_*` columns are dropped here
+            # legitimately (raw OHLCV, TA intermediates, the
+            # price_range_pct_q80/q90/q95 filter-only cutoffs). No silent
+            # fallback: a twin present in the frame but missing from the panel
+            # raises. A TA-Lib failure upstream leaves the source column
+            # ABSENT, so a degraded run does not trip this.
+            for tf in self.timeframes:
+                # TARGET_TF lands unprefixed (step 3b), every other TF prefixed
+                # (step 1) — one name each, never both.
+                _dropped_sf = [
+                    f"{tf}_{native}_{n}" for n in SCALE_FREE_FEATURES
+                    if f"{tf}_{native}_{n}" in self.features.columns
+                    and (n if tf == self.target_tf else f"{tf}_{n}") not in sym_cols
+                ]
+                if _dropped_sf:
+                    raise KeyError(
+                        f"verticalize: {sym} {tf} — engineer_features produced "
+                        f"{_dropped_sf} but _DERIVED_FEATURES does not carry "
+                        f"them, so they would be dropped from the vertical "
+                        f"panel without warning. Add them to _DERIVED_FEATURES."
+                    )
 
             # 4. Returns
             if self.target_tf == self.base_tf:
@@ -407,14 +495,35 @@ class OrbResearch(AgamottoResearch):
         position: str,
     ) -> pd.Series:
         """Override: route TF-prefixed filters through column remapping."""
-        # List → delegate to super (recursive calls come back here)
+        # List → delegate to super, which splits and re-enters HERE per item.
         if isinstance(filter_name, list):
             return super()._apply_filter_mask(df, filter_name, position)
 
         if not isinstance(filter_name, str):
             return super()._apply_filter_mask(df, filter_name, position)
 
-        # Compound _and_ / _or_ → delegate to super (splits + recurses here)
+        # Compound _and_ / _or_ → delegate to super, which does the decode and
+        # the split in ONE place and hands each leg back to this method via the
+        # `sub_filter_fn` hook, so the leg gets its own timeframe's columns.
+        #
+        # FIXED 2026-08-23. Until then the recursion did NOT come back here:
+        # research_filters.apply_filter_mask split `_and_`/`_or_` by calling
+        # ITSELF, so control skipped this override and reached the
+        # `re.sub(r'^(?:15m|1h|4h|1d)_', ...)` strip, which discards the prefix
+        # and reads the BARE (TARGET_TF) columns. Every leg of a compound was
+        # therefore evaluated on TARGET_TF whatever TF its name said. Measured
+        # on a 2,000-row 15m+1h panel: `15m_macd_bullish` 985 rows,
+        # `1h_macd_bullish` 956, true conjunction 505 — and
+        # `15m_macd_bullish_and_1h_macd_bullish` selected 985, the 15m leg
+        # alone. 160 of the 332 regimes in the shipped pred_orb.base.15m_1
+        # stack are compound and 136 of those span more than one TF, so every
+        # orb research artefact built before this date measures a different
+        # regime than its name says.
+        #
+        # Splitting FIRST (before the _TF_PREFIXES loop below) is load-bearing:
+        # `15m_a_and_1h_b` starts with `15m_`, so the loop would otherwise
+        # remap 15m for the whole compound and leave the 1h leg to be evaluated
+        # on a frame that has already been overwritten.
         if "_and_" in filter_name or "_or_" in filter_name:
             return super()._apply_filter_mask(df, filter_name, position)
 
@@ -584,23 +693,41 @@ class OrbResearch(AgamottoResearch):
     # folded onto agamotto/ladder.py on 2026-08-07, so both of orb's target
     # paths — same-TF and cross-TF — now honour LADDER_LONG / LADDER_SHORT.
 
-    @staticmethod
-    def _remap_tf_columns(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    def _remap_tf_columns(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         """Remap TF-prefixed columns to unprefixed for parent filter logic.
 
         E.g. if tf='1d', maps '1d_close' -> 'close', '1d_mvg1' -> 'mvg1',
         '1d_rsi' -> 'rsi', etc.
         Returns a copy with remapped columns added (overwriting any existing
         unprefixed columns so the parent filter sees this TF's values).
+
+        A filter column this TF does NOT carry is DROPPED rather than left
+        showing through (2026-08-23). The bare columns hold TARGET_TF values
+        (verticalize step 3/3b), so leaving one in place lets `<tf>_<atom>` read
+        the target timeframe and call it `<tf>` — the same silent wrong answer
+        the compound-dispatch fix above removes, arriving by a second route
+        (an atom naming a TF that is not in TIMEFRAMES, or a column one TF
+        computed and another did not). Dropped, `_require_col` raises and names
+        the column instead. TARGET_TF is exempt because the bare columns ARE
+        its values: after the verticalize de-duplication there is no
+        `{target_tf}_<derived>` copy left to remap from, and an atomic
+        `15m_<atom>` is meant to fall through to the bare column.
         """
         # All columns the parent's _apply_filter_mask can access
         filter_cols = set(_RAW_COLUMNS) | set(_DERIVED_FEATURES)
 
         remapped = df.copy()
         tf_prefix = f"{tf}_"
+        seen: set[str] = set()
         for col in df.columns:
             if col.startswith(tf_prefix):
                 base_name = col[len(tf_prefix):]
                 if base_name in filter_cols:
                     remapped[base_name] = df[col]
+                    seen.add(base_name)
+        if tf != self.target_tf:
+            stale = [c for c in filter_cols if c in remapped.columns
+                     and c not in seen]
+            if stale:
+                remapped = remapped.drop(columns=stale)
         return remapped
