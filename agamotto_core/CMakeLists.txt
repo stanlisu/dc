@@ -180,6 +180,16 @@ target_compile_definitions(core_integration_driver PRIVATE
 target_link_libraries(core_integration_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(core_integration_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
+# ORDER-PATH ARITHMETIC (sentinel side). Links NOTHING from src/ and no
+# ta-lib: the unit under test is order_path_math.hpp, which includes only
+# <cmath>/<cstdint> precisely so it can be tested without the vendor SDK.
+# AgamottoStrategy itself is unlinkable in a driver (AlgoBase has out-of-line
+# ctor/send_order and ltp_strat_sdk/lib/ is gitignored), so arithmetic left as
+# a member function of the strategy would have NO test at all.
+add_executable(order_path_driver tests/order_path_driver.cpp)
+target_include_directories(order_path_driver PRIVATE ${CONTRACT_DIR})
+target_compile_options(order_path_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
 # PHASE 3 regime-gate parity. Reads the raw OHLCV panel on stdin, prints the
 # ENGINEERED PANEL *and* the per-regime masks it computed from it;
 # tests/regime_parity.py hands that same panel to the REAL research_filters and
