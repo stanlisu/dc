@@ -135,6 +135,53 @@ mutate "a reject leaves the rung live (phantom resting order)" \
         ++s_.rejects;" \
     "        ++s_.rejects;"
 
+# --- the state machine -----------------------------------------------------
+mutate "entry timeout ABANDONS a partially filled position (-> FLAT)" \
+    "    if (s_.filled_qty > 1e-12) {
+        s_.phase = Phase::OPEN;
+        return s_;
+    }" \
+    "    if (false) {
+        s_.phase = Phase::OPEN;
+        return s_;
+    }"
+
+mutate "entry timeout never fires (stuck ENTERING forever)" \
+    "    if (aNowSec - s_.entered_at < aCfg.entry_timeout_sec) return s_;" \
+    "    if (true) return s_;"
+
+mutate "a fill during ENTERING does not open the position" \
+    "        if (s_.phase == Phase::ENTERING) s_.phase = Phase::OPEN;" \
+    "        if (false) s_.phase = Phase::OPEN;"
+
+mutate "FLAT patches fields instead of wiping (stale cost basis survives)" \
+    "    LadderState s_{};                 // everything default-constructed" \
+    "    LadderState s_ = aState;"
+
+mutate "net-zero reducing fill does not go FLAT" \
+    "        if (aResp.reduce_only && s_.filled_qty <= 1e-12) return goFlat(s_);" \
+    "        if (false) return goFlat(s_);"
+
+mutate "a reducing fill ADDS to the position instead of reducing it" \
+    "        s_.filled_qty += aResp.reduce_only ? -aResp.qty : aResp.qty;" \
+    "        s_.filled_qty += aResp.qty;"
+
+mutate "exit price folded into the cost basis (aim chases its own fills)" \
+    "        if (!aResp.reduce_only && aResp.price > 0.0 && s_.filled_qty > 0.0) {" \
+    "        if (aResp.price > 0.0 && s_.filled_qty > 0.0) {"
+
+mutate "tier capacity keeps growing past the first ladder" \
+    "    if (s_.phase == Phase::ENTERING && s_.level <= 1) {" \
+    "    if (true) {"
+
+mutate "crossing phase starts immediately (no passive window)" \
+    "    return (aNowSec - aState.exit_started_at) >= aCfg.passive_sec;" \
+    "    return true;"
+
+mutate "phase B elapsed includes the passive window (depth walks too fast)" \
+    "    const double e_ = aNowSec - aState.exit_started_at - aCfg.passive_sec;" \
+    "    const double e_ = aNowSec - aState.exit_started_at;"
+
 echo
 echo "=== killed: $killed   survived: $survived ==="
 [ "$survived" -eq 0 ]

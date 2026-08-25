@@ -368,6 +368,144 @@ int main()
         check(s.rejects == 1, "rejects are counted");
     }
 
+    // ---- [11] THE STATE MACHINE ------------------------------------------
+    // FLAT -> ENTERING -> OPEN -> EXITING -> FLAT. Every transition below is
+    // one knull has a named event for; getting the entry timeout fork wrong
+    // strands a partially-filled position in ENTERING forever.
+    std::printf("[11] state machine\n");
+    {
+        LadderState st{};
+        check(st.phase == Phase::FLAT, "starts FLAT");
+        // Placing the first entry rung is what moves us, not the signal.
+        LadderState s1 = onPlaced(st, /*uid*/1, 100.0, 0.001, +1, 1000.0);
+        check(s1.phase == Phase::ENTERING, "first placed rung -> ENTERING");
+        check(s1.side == +1, "side is latched on the first placement");
+        checkClose(s1.entered_at, 1000.0, 1e-9, "entry clock starts");
+        checkClose(s1.tier_capacity, 0.001, 1e-12,
+                   "tier capacity latches to the first ladder's size");
+
+        // A fill during ENTERING opens the position.
+        Response r{};
+        r.uid = 1; r.kind = Response::TRADE; r.qty = 0.001; r.price = 100.0;
+        LadderState s2 = applyResponse(s1, r);
+        check(s2.phase == Phase::OPEN, "first fill -> OPEN");
+    }
+    {
+        // ENTRY TIMEOUT with nothing filled -> back to FLAT.
+        LadderState st{};
+        st.phase = Phase::ENTERING;
+        st.entered_at = 1000.0;
+        st.filled_qty = 0.0;
+        LadderState s = applyClock(st, 1000.0 + 900.0, cfg());
+        check(s.phase == Phase::FLAT, "entry timeout, nothing filled -> FLAT");
+    }
+    {
+        // ENTRY TIMEOUT with a partial fill -> OPEN, not FLAT. Going FLAT here
+        // abandons a real position the venue is holding.
+        LadderState st{};
+        st.phase = Phase::ENTERING;
+        st.entered_at = 1000.0;
+        st.filled_qty = 0.0005;
+        st.side = +1;
+        LadderState s = applyClock(st, 1000.0 + 900.0, cfg());
+        check(s.phase == Phase::OPEN, "entry timeout WITH a fill -> OPEN");
+    }
+    {
+        LadderState st{};
+        st.phase = Phase::ENTERING;
+        st.entered_at = 1000.0;
+        LadderState s = applyClock(st, 1000.0 + 899.0, cfg());
+        check(s.phase == Phase::ENTERING, "not yet timed out at 899s");
+    }
+    {
+        // OPEN -> EXITING happens on the exit ladder being placed.
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        LadderState s = onExitStarted(st, 2000.0);
+        check(s.phase == Phase::EXITING, "exit placed -> EXITING");
+        checkClose(s.exit_started_at, 2000.0, 1e-9, "exit clock starts");
+    }
+    {
+        // Reduce to net zero -> FLAT, and the state must be WIPED, not
+        // patched. knull replaces the position object at three sites for this
+        // reason; leaving stale fields caused the 2026-06-18 phantom stoploss.
+        LadderState st{};
+        st.phase = Phase::EXITING;
+        st.side = +1;
+        st.filled_qty = 0.001;
+        st.avg_cost = 100.0;
+        st.level = 2;
+        st.tier_triggered[1] = true;
+        st.n_live = 1;
+        st.live[0].uid = 9; st.live[0].qty = 0.001; st.live[0].active = true;
+        Response r{};
+        r.uid = 9; r.kind = Response::TRADE; r.qty = 0.001; r.price = 101.0;
+        r.reduce_only = true;
+        LadderState s = applyResponse(st, r);
+        check(s.phase == Phase::FLAT, "net zero -> FLAT");
+        checkClose(s.filled_qty, 0.0, 1e-12, "position wiped");
+        checkClose(s.avg_cost, 0.0, 1e-12, "avg cost wiped");
+        check(s.level == 1, "tier level reset");
+        check(!s.tier_triggered[1], "sticky tier triggers cleared on FLAT");
+        check(s.side == 0, "side cleared");
+    }
+
+    // ---- [11b] COST BASIS AND TIER CAPACITY ------------------------------
+    // Two rules with no assertion until a mutant survived. Both silently
+    // corrupt sizing rather than failing loudly.
+    std::printf("[11b] cost basis + tier capacity\n");
+    {
+        // An EXIT fill must not move the cost basis. The aim ladder is priced
+        // off avg_cost, so folding exit prices in makes the ladder chase its
+        // own fills -- it would walk away as it filled.
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        st.avg_cost = 100.0;
+        st.n_live = 1;
+        st.live[0].uid = 11; st.live[0].qty = 0.001; st.live[0].active = true;
+        Response r{};
+        r.uid = 11; r.kind = Response::TRADE; r.qty = 0.001; r.price = 105.0;
+        r.reduce_only = true;
+        LadderState s = applyResponse(st, r);
+        checkClose(s.avg_cost, 100.0, 1e-9,
+                   "a reduce_only fill leaves the cost basis alone");
+        checkClose(s.filled_qty, 0.001, 1e-12, "and reduces the position");
+    }
+    {
+        // tier_capacity latches to the FIRST ladder only. If it kept growing,
+        // every size-up would raise the cap it is measured against and the
+        // position cap would never bind.
+        LadderState st{};
+        LadderState s1 = onPlaced(st, 1, 100.0, 0.001, +1, 1000.0);
+        LadderState s2 = onPlaced(s1, 2, 99.9, 0.001, +1, 1000.0);
+        checkClose(s2.tier_capacity, 0.002, 1e-12,
+                   "capacity accrues across the FIRST ladder's rungs");
+        s2.level = 2;                     // a size-up tier has fired
+        LadderState s3 = onPlaced(s2, 3, 99.0, 0.005, +1, 1100.0);
+        checkClose(s3.tier_capacity, 0.002, 1e-12,
+                   "capacity does NOT grow once past level 1");
+    }
+
+    // ---- [12] EXIT PHASE FORK --------------------------------------------
+    // Phase A rests passively for PASSIVE_SEC; Phase B walks depth. The fork
+    // is on elapsed-since-exit, not on a stored flag.
+    std::printf("[12] exit phase fork\n");
+    {
+        LadderState st{};
+        st.phase = Phase::EXITING;
+        st.exit_started_at = 1000.0;
+        check(!inCrossingPhase(st, 1000.0 + 59.0, cfg()),
+              "still passive at 59s");
+        check(inCrossingPhase(st, 1000.0 + 60.0, cfg()),
+              "crossing from PASSIVE_SEC");
+        checkClose(phaseBElapsed(st, 1000.0 + 340.0, cfg()), 280.0, 1e-9,
+                   "phase B elapsed excludes the passive window");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "MM LADDER PASS" : "MM LADDER FAIL",
                 g_checks, g_failures);
