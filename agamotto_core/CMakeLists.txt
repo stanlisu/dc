@@ -186,6 +186,15 @@ target_compile_options(core_integration_driver PRIVATE -Wall -Wextra ${AGAMOTTO_
 # AgamottoStrategy itself is unlinkable in a driver (AlgoBase has out-of-line
 # ctor/send_order and ltp_strat_sdk/lib/ is gitignored), so arithmetic left as
 # a member function of the strategy would have NO test at all.
+# MARKETMAKER LADDER reducer. Same shape and same reason as order_path_driver:
+# links NOTHING, no ta-lib, no GITSHA. The unit under test is mm_ladder.hpp,
+# which is <cmath>/<cstdint> only so that the MM lifecycle can be proven
+# offline -- the whole point, since MM is being built with no incremental live
+# validation before the shadow run.
+add_executable(mm_ladder_driver tests/mm_ladder_driver.cpp)
+target_include_directories(mm_ladder_driver PRIVATE ${CONTRACT_DIR})
+target_compile_options(mm_ladder_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
 add_executable(order_path_driver tests/order_path_driver.cpp)
 target_include_directories(order_path_driver PRIVATE ${CONTRACT_DIR})
 target_compile_options(order_path_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
