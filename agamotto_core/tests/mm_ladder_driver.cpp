@@ -78,6 +78,7 @@ Config cfg()
 }
 
 const uint64_t NOW = 100ull * 1000000000ull;
+const double NOW_S = 1000.0;   // seconds; the ladder API takes a seconds clock
 
 }  // namespace
 
@@ -644,6 +645,147 @@ int main()
               "trailArmable refuses an unknown ATR on its own");
         LadderState s = applyTrailing(st, book(110.0, 110.1), -1.0, c);
         checkClose(s.trail_peak, 103.0, 1e-9, "and does not move the peak");
+    }
+
+    // ---- [15] desiredLadder DISPATCH -------------------------------------
+    // "Given this state and this book, what should be resting right now."
+    // Every handler is a thin caller of this: desiredLadder -> diffLadder ->
+    // executeIntents. Putting the dispatch here rather than in the strategy is
+    // what makes the four handlers testable at all.
+    std::printf("[15] desiredLadder dispatch\n");
+    const double ask_depth[4] = {100.1, 100.2, 100.3, 100.4};   // consuming side for a SELL->no, for a BUY
+    const double bid_depth[4] = {100.0, 99.9, 99.8, 99.7};
+
+    {   // FLAT, no signal -> nothing
+        LadderState st{};
+        Target t{};
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4, cfg(), NOW_S);
+        check(d.kind == LadderKind::NONE, "FLAT with no signal rests nothing");
+        check(d.n == 0, "and no rungs");
+    }
+    {   // FLAT + long signal -> ENTRY, buying, NOT reduce_only
+        LadderState st{};
+        Target t{};
+        t.fired = true; t.side = +1; t.qty = 3.3; t.signal_close = 100.5;
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4, cfg(), NOW_S);
+        check(d.kind == LadderKind::ENTRY, "a fired signal from FLAT builds an ENTRY ladder");
+        check(d.side == +1, "long signal buys");
+        check(!d.reduce_only, "an entry is never reduce_only");
+        check(d.n > 0, "and has rungs");
+        // anchor = min(bid 100.0, close 100.5) = 100.0, walking DOWN
+        checkClose(d.px[0], 100.0, 1e-9, "rung 0 at the clamped anchor");
+        check(d.px[1] < d.px[0], "rungs walk away from the market");
+    }
+    {   // ENTERING with part of the target already filled -> the ladder sizes
+        // the REMAINDER. Re-laddering the full target on every reprice would
+        // walk the position past what the signal asked for, one reprice at a
+        // time, and the position cap would be the only thing to notice.
+        LadderState st{};
+        st.phase = Phase::ENTERING;
+        st.side = +1;
+        st.filled_qty = 1.1;               // one rung's worth already done
+        Target t{};
+        t.fired = true; t.side = +1; t.qty = 3.3; t.signal_close = 100.5;
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        check(d.kind == LadderKind::ENTRY, "ENTERING keeps repricing the entry");
+        // slice = capital/anchor = 110/100 = 1.1; remaining 2.2 -> 2 rungs, not 3
+        check(d.n == 2, "sizes the REMAINDER (2 rungs), not the whole target (3)");
+    }
+    {   // The rung count is capped at MAX_RUNGS_PER_LADDER, whatever the size.
+        LadderState st{};
+        Target t{};
+        t.fired = true; t.side = +1; t.qty = 11.0; t.signal_close = 100.5;
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        // 11.0 / 1.1 = 10 rungs uncapped; MAX_RUNGS_PER_LADDER is 5
+        check(d.n == 5, "10 rungs of intent is capped to MAX_RUNGS_PER_LADDER");
+    }
+    {   // OPEN -> the AIM ladder: opposite side, reduce_only, priced off cost
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 2.2;
+        st.avg_cost = 100.0;
+        Desired d = desiredLadder(st, Target{}, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        check(d.kind == LadderKind::AIM, "OPEN rests the aim ladder");
+        check(d.side == -1, "a long position aims by SELLING");
+        check(d.reduce_only, "the aim ladder is ALWAYS reduce_only");
+        checkClose(d.px[0], 100.5, 1e-9, "aim 50bps above cost");
+    }
+    {   // OPEN but flat -> nothing to aim at
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.0;
+        st.avg_cost = 100.0;
+        Desired d = desiredLadder(st, Target{}, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        check(d.kind == LadderKind::NONE, "no position, no aim ladder");
+    }
+    {   // EXITING inside PASSIVE_SEC -> passive exit at the CONSERVATIVE anchor
+        LadderState st{};
+        st.phase = Phase::EXITING;
+        st.side = +1;
+        st.filled_qty = 2.2;
+        st.avg_cost = 100.0;
+        st.exit_started_at = NOW_S;
+        // `last` must sit ON the tick grid or this measures rounding rather
+        // than the min(). 100.05 against a 0.1 tick snapped to 100.0 and the
+        // test failed for the wrong reason -- knull round_steps the exit
+        // anchor too, so the behaviour was correct and the fixture was not.
+        Desired d = desiredLadder(st, Target{}, book(100.0, 100.3, 100.1),
+                                  bid_depth, 4, cfg(), NOW_S + 30.0);
+        check(d.kind == LadderKind::EXIT_PASSIVE, "inside PASSIVE_SEC exits passively");
+        check(d.reduce_only, "an exit is always reduce_only");
+        checkClose(d.px[0], 100.1, 1e-9,
+                   "long exit SELLs at min(ask, last) -- the conservative side, "
+                   "not the ask");
+        Desired d_nolast = desiredLadder(st, Target{}, book(100.0, 100.3, 0.0),
+                                         bid_depth, 4, cfg(), NOW_S + 30.0);
+        checkClose(d_nolast.px[0], 100.3, 1e-9,
+                   "with no last print it degrades to the touch");
+    }
+    {   // EXITING past PASSIVE_SEC -> crossing, priced off the CONSUMING side
+        LadderState st{};
+        st.phase = Phase::EXITING;
+        st.side = +1;
+        st.filled_qty = 2.2;
+        st.avg_cost = 100.0;
+        st.exit_started_at = NOW_S;
+        // 60s passive elapsed, 0s into phase B -> depth 1 -> bid_depth[0]
+        Desired d = desiredLadder(st, Target{}, book(100.0, 100.2, 100.05),
+                                  bid_depth, 4, cfg(), NOW_S + 60.0);
+        check(d.kind == LadderKind::EXIT_CROSSING, "past PASSIVE_SEC it crosses");
+        check(d.reduce_only, "still reduce_only");
+        checkClose(d.px[0], 100.0, 1e-9,
+                   "a SELL exit crosses into the BIDS (the consuming side)");
+        // 280s into phase B -> depth 2 -> bid_depth[1]
+        Desired d2 = desiredLadder(st, Target{}, book(100.0, 100.2, 100.05),
+                                   bid_depth, 4, cfg(), NOW_S + 60.0 + 280.0);
+        checkClose(d2.px[0], 99.9, 1e-9, "and walks deeper as phase B elapses");
+    }
+    {   // HALTED -> nothing, ever
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 2.2;
+        st.avg_cost = 100.0;
+        st.halted = true;
+        Desired d = desiredLadder(st, Target{}, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        check(d.kind == LadderKind::NONE, "a HALTED ladder rests nothing at all");
+    }
+    {   // A stale book must not produce a ladder at any price.
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 2.2;
+        st.avg_cost = 100.0;
+        Book b = book(0.0, 100.1);        // one-sided
+        Desired d = desiredLadder(st, Target{}, b, bid_depth, 4, cfg(), NOW_S);
+        check(d.kind == LadderKind::NONE, "a one-sided book rests nothing");
     }
 
     std::printf("\n=== %s: %d checks, %d failures ===\n",

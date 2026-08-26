@@ -239,6 +239,39 @@ mutate "trailing peak ratchets the WRONG way on a long" \
     "        if (touch_ > s_.trail_peak) s_.trail_peak = touch_;" \
     "        if (touch_ < s_.trail_peak) s_.trail_peak = touch_;"
 
+# --- the dispatch ----------------------------------------------------------
+mutate "a HALTED ladder still rests orders" \
+    "    if (aState.halted) return d_;" \
+    "    if (false) return d_;"
+
+mutate "the aim ladder is not reduce_only (it could OPEN exposure)" \
+    "        d_.reduce_only = true;       // NEVER opens exposure; no taker fallback" \
+    "        d_.reduce_only = false;      // NEVER opens exposure; no taker fallback"
+
+mutate "the aim ladder rests on the SAME side as the position" \
+    "        d_.side = -aState.side;      // a long position aims by SELLING" \
+    "        d_.side = aState.side;      // a long position aims by SELLING"
+
+mutate "an ENTRY ladder is marked reduce_only (would never open)" \
+    "        d_.reduce_only = false;      // an entry OPENS exposure" \
+    "        d_.reduce_only = true;      // an entry OPENS exposure"
+
+mutate "phase B prices off the MAKER side instead of the consuming side" \
+    "            const double anchor_ = aDepthConsume[idx_];" \
+    "            const double anchor_ = aBook.ask;"
+
+mutate "the exit never leaves the passive phase" \
+    "        if (!inCrossingPhase(aState, aNowSec, aCfg)) {" \
+    "        if (true) {"
+
+mutate "entry ignores what is already filled (re-buys the whole target)" \
+    "        const double remaining_ = aTarget.qty - aState.filled_qty;" \
+    "        const double remaining_ = aTarget.qty;"
+
+mutate "rung count ignores MAX_RUNGS_PER_LADDER" \
+    "        if (n_ > aCfg.max_rungs_per_ladder) n_ = aCfg.max_rungs_per_ladder;" \
+    "        if (false) n_ = aCfg.max_rungs_per_ladder;"
+
 echo
 echo "=== killed: $killed   survived: $survived ==="
 [ "$survived" -eq 0 ]
