@@ -41,6 +41,21 @@ PYEOF
     fi
 }
 
+# BASELINE FIRST. A mutation suite is MEANINGLESS if the unmutated driver
+# fails: every mutant then "kills" trivially and the run reports a clean sweep
+# it did not earn. That happened on 2026-08-26 -- 38/38 killed while the
+# baseline was red from a bad test constant. Check it, and refuse.
+echo "=== baseline (must pass before any mutant means anything) ==="
+if ! g++ -std=c++17 -ffp-contract=off -I "$SDK" "$DRV" -o /tmp/mmbase 2>/dev/null; then
+    echo "  BASELINE DID NOT COMPILE -- mutants would be meaningless"; exit 2
+fi
+if ! /tmp/mmbase >/dev/null 2>&1; then
+    echo "  BASELINE FAILS -- fix the driver before trusting any mutant result"
+    /tmp/mmbase 2>&1 | grep FAIL | head -5
+    exit 2
+fi
+echo "  baseline passes"
+echo
 echo "=== mm ladder negative controls ==="
 
 # --- entry -----------------------------------------------------------------
@@ -181,6 +196,48 @@ mutate "crossing phase starts immediately (no passive window)" \
 mutate "phase B elapsed includes the passive window (depth walks too fast)" \
     "    const double e_ = aNowSec - aState.exit_started_at - aCfg.passive_sec;" \
     "    const double e_ = aNowSec - aState.exit_started_at;"
+
+# --- stoploss --------------------------------------------------------------
+mutate "stop marked at MID instead of the exit-side touch" \
+    "    const double touch_ = (aState.side > 0) ? aBook.bid : aBook.ask;
+    if (!(touch_ > 0.0)) return false;
+
+    // A COST BASIS" \
+    "    const double touch_ = 0.5 * (aBook.bid + aBook.ask);
+    if (!(touch_ > 0.0)) return false;
+
+    // A COST BASIS"
+
+mutate "stop fires on an implausible cost basis (phantom stoploss)" \
+    "        if (ratio_ < 0.66 || ratio_ > 1.5) return false;" \
+    "        if (false) return false;"
+
+mutate "stop sign inverted (fires on profit)" \
+    "    return pnl_ <= -aCfg.stoploss_frac;" \
+    "    return pnl_ >= aCfg.stoploss_frac;"
+
+# --- trailing --------------------------------------------------------------
+mutate "unknown ATR treated as usable (stop at the touch)" \
+    "    if (!(aAtr > 0.0) || !(aCfg.trail_trigger_atr > 0.0)) return false;" \
+    "    if (!(aCfg.trail_trigger_atr > 0.0)) return false;"
+
+mutate "trailing peak LATCHES instead of clearing below the trigger" \
+    "        s_.trail_armed = false;
+        s_.trail_peak = 0.0;
+        return s_;" \
+    "        return s_;"
+
+mutate "trailing arms below the trigger" \
+    "    return move_ >= aCfg.trail_trigger_atr * aAtr;" \
+    "    return true;"
+
+mutate "trailing exits on any pullback, ignoring the distance" \
+    "    return draw_ >= aCfg.trail_distance_atr * aAtr;" \
+    "    return draw_ > 0.0;"
+
+mutate "trailing peak ratchets the WRONG way on a long" \
+    "        if (touch_ > s_.trail_peak) s_.trail_peak = touch_;" \
+    "        if (touch_ < s_.trail_peak) s_.trail_peak = touch_;"
 
 echo
 echo "=== killed: $killed   survived: $survived ==="

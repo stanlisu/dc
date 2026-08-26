@@ -506,6 +506,146 @@ int main()
                    "phase B elapsed excludes the passive window");
     }
 
+    // ---- [13] STOPLOSS ----------------------------------------------------
+    // PnL is marked at the EXIT-SIDE TOUCH -- bid for a long, ask for a short --
+    // not at mid. Marking at mid flatters every position by half a spread and
+    // makes the stop fire late, in the direction that costs money.
+    std::printf("[13] stoploss\n");
+    {
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        st.avg_cost = 100.0;
+        // -50bps at the bid: 100 * (1 - 0.005) = 99.5
+        check(!stopTriggered(st, book(99.51, 99.61), cfg()),
+              "long above the stop does not fire");
+        check(stopTriggered(st, book(99.50, 99.60), cfg()),
+              "long at -50bps ON THE BID fires");
+        check(!stopTriggered(st, book(99.60, 100.60), cfg()),
+              "marked at the BID, not the mid -- a wide spread does not save it");
+    }
+    {
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = -1;
+        st.filled_qty = 0.002;
+        st.avg_cost = 100.0;
+        check(stopTriggered(st, book(100.40, 100.50), cfg()),
+              "short at +50bps ON THE ASK fires");
+        check(!stopTriggered(st, book(100.30, 100.40), cfg()),
+              "short inside the stop does not fire");
+    }
+    {
+        // A corrupted cost basis must not fire a stop. knull rejects an
+        // entry_price outside [0.66, 1.5] x mid -- the 2026-06-18 XRP phantom
+        // stoploss, where a stale number read as a real position.
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        // The cost basis must be implausible in the direction that would
+        // FIRE. A basis that is too LOW shows a huge profit and would not
+        // trigger anyway, so it proves nothing -- the first version of this
+        // test used 1.0 and a mutant removing the guard survived it.
+        st.avg_cost = 1000.0;              // 10x the book: cannot be true
+        check(!stopTriggered(st, book(100.0, 100.1), cfg()),
+              "an implausible cost basis refuses to fire a stop, even though "
+              "the arithmetic would show -90pct");
+        // 100.5 does NOT fire and should not: (100.0-100.5)/100.5 = -0.4975pct,
+        // fractionally INSIDE the 0.5pct stop. Picking it was my arithmetic
+        // error, not a code bug -- kept here as the boundary case.
+        st.avg_cost = 100.5;
+        check(!stopTriggered(st, book(100.0, 100.1), cfg()),
+              "-49.75bps is inside a 50bps stop and must NOT fire");
+        st.avg_cost = 101.0;               // -0.99pct: plausible and past the stop
+        check(stopTriggered(st, book(100.0, 100.1), cfg()),
+              "a plausible basis genuinely past the stop DOES fire");
+    }
+    {
+        LadderState st{};
+        st.phase = Phase::FLAT;
+        st.avg_cost = 100.0;
+        check(!stopTriggered(st, book(1.0, 1.1), cfg()),
+              "no position, no stop");
+    }
+
+    // ---- [14] ATR TRAILING ------------------------------------------------
+    // Trigger 1.5x ATR of favourable move, then exit on a 0.5x ATR pullback
+    // from the peak. The PEAK IS NOT LATCHED: it resets whenever the trigger
+    // is not currently met, so a position that gives everything back and
+    // recovers starts measuring again.
+    std::printf("[14] atr trailing\n");
+    {
+        Config c = cfg();
+        c.trail_trigger_atr = 1.5;
+        c.trail_distance_atr = 0.5;
+        const double atr = 1.0;
+
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        st.avg_cost = 100.0;
+        st.trail_peak = 0.0;
+
+        // Not yet 1.5 ATR up -> no arming, peak stays cleared.
+        LadderState s1 = applyTrailing(st, book(101.0, 101.1), atr, c);
+        check(!s1.trail_armed, "below the trigger, trailing is not armed");
+        checkClose(s1.trail_peak, 0.0, 1e-12, "and the peak stays cleared");
+
+        // 1.5 ATR up -> armed, peak seeded at the bid.
+        LadderState s2 = applyTrailing(st, book(101.5, 101.6), atr, c);
+        check(s2.trail_armed, "at 1.5x ATR the trail arms");
+        checkClose(s2.trail_peak, 101.5, 1e-9, "peak seeded at the exit-side touch");
+
+        // Higher -> peak rises.
+        LadderState s3 = applyTrailing(s2, book(103.0, 103.1), atr, c);
+        checkClose(s3.trail_peak, 103.0, 1e-9, "peak ratchets up");
+
+        // Pull back less than 0.5 ATR -> hold.
+        check(!trailTriggered(s3, book(102.6, 102.7), atr, c),
+              "a pullback under 0.5x ATR does not exit");
+        // Pull back 0.5 ATR -> exit.
+        check(trailTriggered(s3, book(102.5, 102.6), atr, c),
+              "a 0.5x ATR pullback from the peak exits");
+
+        // THE PEAK CLEARS when the trigger stops being met. Not latched for
+        // the life of the position: a move that gives everything back and
+        // recovers must measure from the NEW move, not from an old high the
+        // price never revisited. Asserting this needs a peak that is already
+        // SET -- clearing a zero peak is unobservable, which is how a mutant
+        // survived the first version.
+        LadderState s4 = applyTrailing(s3, book(100.5, 100.6), atr, c);
+        check(!s4.trail_armed, "falling back under the trigger disarms");
+        checkClose(s4.trail_peak, 0.0, 1e-12, "and CLEARS the peak (103.0 -> 0)");
+    }
+    {
+        // ATR unknown (-1) must DISABLE trailing, not treat it as zero.
+        // A zero ATR makes the trigger 0 and the distance 0 -- arming
+        // instantly and exiting instantly, i.e. a stop at the touch.
+        Config c = cfg();
+        c.trail_trigger_atr = 1.5;
+        c.trail_distance_atr = 0.5;
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.002;
+        st.avg_cost = 100.0;
+        st.trail_armed = true;
+        st.trail_peak = 103.0;
+        check(!trailTriggered(st, book(90.0, 90.1), -1.0, c),
+              "ATR unknown disables trailing entirely");
+        // trailArmable has its OWN atr guard, and applyTrailing/trailTriggered
+        // each have one too -- so removing any single guard is invisible
+        // unless the function is exercised directly. It was, and a mutant
+        // survived.
+        check(!trailArmable(st, book(200.0, 200.1), -1.0, c),
+              "trailArmable refuses an unknown ATR on its own");
+        LadderState s = applyTrailing(st, book(110.0, 110.1), -1.0, c);
+        checkClose(s.trail_peak, 103.0, 1e-9, "and does not move the peak");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "MM LADDER PASS" : "MM LADDER FAIL",
                 g_checks, g_failures);
