@@ -9,7 +9,15 @@
 # Usage:  bash tests/run_order_path_mutants.sh [<sentinel_stan_code_dir>]
 set -uo pipefail
 
-SDK="${1:-/home/stan/sandbox/sentinel/Strategy/ltp_release/ltp_strat_sdk/stan_code}"
+# No default. A hardcoded path here silently tested whichever copy of the
+# header happened to live on ONE machine -- on any other it failed with a
+# confusing "no such header" instead of saying what it wanted. Ask for it.
+if [ -z "${1:-}" ]; then
+    echo "usage: $0 <path-to-stan_code>" >&2
+    echo "  e.g. $0 ~/sandbox/sentinel/Strategy/ltp_release/ltp_strat_sdk/stan_code" >&2
+    exit 2
+fi
+SDK="$1"
 SRC="$SDK/order_path_math.hpp"
 DRV="$(cd "$(dirname "$0")" && pwd)/order_path_driver.cpp"
 [ -f "$SRC" ] || { echo "no order_path_math.hpp at $SRC"; exit 2; }
