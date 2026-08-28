@@ -281,5 +281,22 @@ mutate "rung count ignores MAX_RUNGS_PER_LADDER" \
     "        if (false) n_ = aCfg.max_rungs_per_ladder;"
 
 echo
+# THE RUNAWAY (hydra 2026-08-28). If an unrecordable placement does not halt,
+# the ladder keeps re-emitting the same ENTRY every reprice tick -- four live
+# AAVE sells in 31 seconds. Neutering the halt must be caught.
+mutate "unrecordable placement does not halt" \
+    "inline LadderState onPlaceUnrecordable(const LadderState& aState)
+{
+    LadderState s_ = aState;
+    s_.halted = true;
+    return s_;
+}" \
+    "inline LadderState onPlaceUnrecordable(const LadderState& aState)
+{
+    LadderState s_ = aState;
+    return s_;
+}"
+
+
 echo "=== killed: $killed   survived: $survived ==="
 [ "$survived" -eq 0 ]

@@ -788,6 +788,57 @@ int main()
         check(d.kind == LadderKind::NONE, "a one-sided book rests nothing");
     }
 
+    std::printf("[16] a placement that cannot be RECORDED halts the ladder\n");
+    // THE RUNAWAY (hydra, 2026-08-28 15:45). AgamottoStrategy::sendGtxLimit
+    // stamped the order with get_next_order_id() and never checked it. The SDK
+    // returned 0. The order went to the venue anyway, and 0 is simultaneously:
+    //
+    //   * a value get_next_order_id() can legitimately return,
+    //   * the sentinel the RESPONSE path uses for "not one of mine", and
+    //   * the caller's signal for "send_order failed" (`if (uid_==0) continue`).
+    //
+    // So the fills came back and were discarded as junk, the ladder never
+    // recorded the rung, and desiredLadder re-emitted the identical ENTRY on
+    // every 10 s reprice tick. Four live AAVE sells in 31 seconds, -3.2 on the
+    // venue against a 110 USD arm, sentinel reading pos=0 sent=3 fills=0
+    // throughout. Nothing in the strategy bounded it -- the reconciler halting
+    // the fleet is the only reason it stopped.
+    //
+    // The reducer's job here is narrow and it is the part that must not
+    // re-place: once a placement cannot be recorded, the ladder is not a
+    // trustworthy model of the venue, so it halts and rests nothing further.
+    {
+        LadderState st{};
+        st.phase = Phase::FLAT;
+        Target t{};
+        t.fired = true;
+        t.side = -1;
+        t.qty = 0.8;
+        t.signal_close = 123.60;
+
+        Desired first = desiredLadder(st, t, book(123.73, 123.74), bid_depth, 4,
+                                      cfg(), NOW_S);
+        check(first.kind == LadderKind::ENTRY,
+              "precondition: a flat ladder with a target wants an ENTRY");
+
+        // The send went out but came back unrecordable.
+        LadderState after = onPlaceUnrecordable(st);
+        check(after.halted,
+              "an unrecordable placement must HALT -- the alternative is what "
+              "put four live orders on the venue in 31 seconds");
+
+        Desired again = desiredLadder(after, t, book(123.76, 123.77), bid_depth,
+                                      4, cfg(), NOW_S + 10.0);
+        check(again.kind == LadderKind::NONE,
+              "and the NEXT reprice tick must rest nothing -- this is the "
+              "assertion that would have caught the runaway");
+
+        Desired later = desiredLadder(after, t, book(123.85, 123.86), bid_depth,
+                                      4, cfg(), NOW_S + 20.0);
+        check(later.kind == LadderKind::NONE, "still nothing 20s later");
+        check(onPlaceUnrecordable(after).halted, "halting is idempotent");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "MM LADDER PASS" : "MM LADDER FAIL",
                 g_checks, g_failures);
