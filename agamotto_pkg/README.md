@@ -66,7 +66,6 @@ Key `setting.json` fields consumed by Agamotto:
 | `SWEEP_MODELS` | Models to train: `LightGBM`, `XGBoost`, `Ridge`, `ElasticNet` |
 | `CAPITAL` | Position sizing base (qty = CAPITAL / price, default 100) |
 | `FEE` | Fee rate in bps (e.g., 2.0 = 0.02%) |
-| `TRADING_MODE` | `"both"`, `"long_only"`, `"short_only"` |
 | `LONG_PRED_THRESHOLD` | Min prediction to open long (default 0.0) |
 | `SHORT_PRED_THRESHOLD` | Max prediction to open short (default 0.0) |
 | `MA_PERIODS` | Moving average periods (default [7, 25, 99]) |
