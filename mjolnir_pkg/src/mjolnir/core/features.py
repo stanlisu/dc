@@ -47,6 +47,15 @@ class MjolnirFeatures:
         target_tf:       Target time resolution (e.g. "1m").  When target_tf !=
                          bar_tf, each row's target is the return to the next
                          target_tf boundary, not a fixed-horizon shift.
+        zero_fill_prices: ``True`` (default = today's live behaviour) fills
+                         EVERY non-target feature column with 0.0 after
+                         replacing inf.  ``False`` fills only the flow /
+                         activity columns (``_ZERO_FILL_PREFIXES``) and leaves
+                         price levels and price-derived TA indicators NaN.
+                         Must be ``False`` for bars built with
+                         ``StreamAligner(fill_zero_trade=False)``, otherwise a
+                         single zero-trade bar pins 21 TA columns to exactly
+                         0.0 for the rest of the series.
     """
 
     # Columns that must NOT be prefixed regardless of the prefix setting.
@@ -91,6 +100,37 @@ class MjolnirFeatures:
         "basis_pct",
     })
 
+    # ------------------------------------------------------------------
+    # Zero-fill policy (see `zero_fill_prices` in __init__)
+    # ------------------------------------------------------------------
+    # Columns where 0.0 is a TRUE observation rather than a stand-in: flow /
+    # activity counters and their direct derivatives. On a zero-trade 5s bar
+    # there really were zero trades, zero volume, zero net imbalance, zero
+    # order-flow imbalance and zero liquidations — 0.0 states a fact.
+    #
+    # Everything NOT matched here is a price LEVEL or an indicator derived from
+    # one, and for those 0.0 is not "no data", it is a fabricated extreme:
+    # close 0 prices the asset at zero, rsi 0 is maximally oversold, bb_pctb 0
+    # is pinned to the lower band, atr/std 0 is zero volatility. A blanket
+    # fillna(0.0) over those is what pins 21 TA columns to exactly 0.0 for the
+    # remainder of a day after a single interior NaN (one zero-trade bar is
+    # enough — TA-Lib propagates NaN to the end of the series).
+    _ZERO_FILL_PREFIXES: tuple = (
+        # trade-flow aggregates and every rolling/lagged derivative of them
+        "trade_imbalance", "dollar_tsi", "trade_intensity", "kyle_lambda",
+        "volume", "n_trades", "buy_vol", "sell_vol", "has_trade",
+        # order-flow imbalance (a depth DIFFERENCE — 0 = no change)
+        "ofi_",
+        # liquidation counts / notionals / their ratios
+        "liq_",
+        # BTC cross-asset flow twins (btc_trade_imbalance, btc_liq_directional)
+        "btc_trade_imbalance", "btc_liq_directional",
+    )
+
+    def _zero_fill_columns(self, cols: List[str]) -> List[str]:
+        """Subset of `cols` for which 0.0 is a valid 'no activity' value."""
+        return [c for c in cols if c.startswith(self._ZERO_FILL_PREFIXES)]
+
     def _point_in_time_columns(self, df: pd.DataFrame) -> List[str]:
         """Columns whose value at row T reflects bar T's CLOSE and must shift +1."""
         cols: List[str] = []
@@ -107,7 +147,22 @@ class MjolnirFeatures:
         prefix: Optional[str] = None,
         bar_tf: str = "5s",
         target_tf: str = "5s",
+        zero_fill_prices: bool = True,
     ) -> None:
+        # zero_fill_prices defaults to True = TODAY's behaviour, deliberately.
+        # compute() runs on the LIVE inference path (knull/mjolnir_bridge.py →
+        # mjolnir/trading.py), whose bars come from knull/live_bar.py, which
+        # still forward-fills zero-trade bars. Live must not change behaviour
+        # because a research caller was updated, so the default is the live
+        # convention and every research caller states its choice explicitly.
+        # Set False ONLY for bars built with StreamAligner(fill_zero_trade=False):
+        # then a NaN price is real missing data and only the flow columns in
+        # _ZERO_FILL_PREFIXES are zero-filled; price levels and the TA
+        # indicators derived from them are left NaN for the model layer to
+        # impute explicitly (LightGBM is NaN-native; the Ridge/ElasticNet leg
+        # imputes with TRAIN-period medians in marvel
+        # gauntlet/rolling_predict_returns.py:1542-1546, never with 0.0).
+        self.zero_fill_prices = zero_fill_prices
         self.feature_windows = feature_windows or DEFAULT_WINDOWS
         self.target_horizon = target_horizon
         self.fee_rate = fee_rate
@@ -175,17 +230,31 @@ class MjolnirFeatures:
         if self._boundary_mode:
             df = self._compute_cycle_features(df)
 
-        # Sanitise microstructure features: inf/NaN on sparse bars (zero-trade
-        # 5s bars) is replaced with 0.0, which is a valid "no activity" value.
-        # Target columns (return, return_long, return_short, *_raw) are excluded
-        # so NaN at the tail (incomplete forward window) is preserved for the
-        # training pipeline to drop correctly.
+        # Sanitise microstructure features. Target columns (return, return_long,
+        # return_short, *_raw) are excluded in BOTH branches so NaN at the tail
+        # (incomplete forward window) is preserved for the training pipeline to
+        # drop correctly.
         feature_cols = [c for c in df.columns if c not in self._META_COLS]
-        df[feature_cols] = (
-            df[feature_cols]
-            .replace([np.inf, -np.inf], 0.0)
-            .fillna(0.0)
-        )
+        if self.zero_fill_prices:
+            # Legacy blanket fill — every non-target column, inf and NaN alike,
+            # becomes 0.0. Correct only when the bars carry no genuine missing
+            # prices, i.e. StreamAligner(fill_zero_trade=True).
+            df[feature_cols] = (
+                df[feature_cols]
+                .replace([np.inf, -np.inf], 0.0)
+                .fillna(0.0)
+            )
+        else:
+            # Bars may carry genuine NaN prices on zero-trade bars. 0.0 is a
+            # valid value ONLY for the flow/activity columns; for a price level
+            # or a TA indicator derived from one it is a fabricated extreme, so
+            # those stay NaN and the model layer imputes explicitly. inf is
+            # degenerate arithmetic on either kind and becomes NaN first, so a
+            # non-flow inf can never be laundered into a plausible 0.0 either.
+            df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
+            flow_cols = self._zero_fill_columns(feature_cols)
+            if flow_cols:
+                df[flow_cols] = df[flow_cols].fillna(0.0)
 
         # Apply column prefix for multi-resolution merging.  Only feature
         # columns are renamed — target/metadata columns (in _META_COLS) keep

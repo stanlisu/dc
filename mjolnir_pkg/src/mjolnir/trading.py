@@ -102,12 +102,20 @@ class MjolnirTrading:
                 "FEATURE_WINDOWS is deprecated; remove it from setting.json — "
                 "windows are constants now (mjolnir/core/research.py)"
             )
+        # zero_fill_prices is pinned True on the LIVE path and is NOT read from
+        # setting.json. Live bars are built by knull/live_bar.py, which still
+        # forward-fills zero-trade bars, so their prices are never NaN and the
+        # legacy blanket fill is a no-op on them. Reading FILL_ZERO_TRADE here
+        # would let a research-side flag flip live feature semantics without a
+        # live change. Flip this only together with live_bar.py — that is the
+        # promotion step, not this one.
         self._feat_engine = MjolnirFeatures(
             feature_windows=list(_DEFAULT_FEATURE_WINDOWS),
             target_horizon=int(config.get("TARGET_HORIZON_BARS", 1)),
             fee_rate=float(config.get("FEE", 2.0)) / 10000.0,
             bar_tf=self._base_tf,
             target_tf=self._base_tf,
+            zero_fill_prices=True,
         )
         # One trivial-window engine per cross-TF (mirrors research.py:287-297).
         self._tf_engines: Dict[str, MjolnirFeatures] = {
@@ -118,6 +126,7 @@ class MjolnirTrading:
                 prefix=tf,
                 bar_tf=tf,
                 target_tf=tf,
+                zero_fill_prices=True,  # see _feat_engine above — LIVE path
             )
             for tf in self._multi_tfs
         }
