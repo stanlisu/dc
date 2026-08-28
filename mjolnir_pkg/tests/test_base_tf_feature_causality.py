@@ -66,6 +66,7 @@ def _engine() -> MjolnirFeatures:
         fee_rate=0.0002,
         bar_tf="5s",
         target_tf="5s",
+        ta_price_source="close",
     )
 
 

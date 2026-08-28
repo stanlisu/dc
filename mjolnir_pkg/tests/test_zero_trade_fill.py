@@ -341,6 +341,7 @@ def _features(zero_fill_prices: bool, fill_zero_trade: bool) -> pd.DataFrame:
         feature_windows=[30], target_horizon=1,
         fee_rate=0.0, bar_tf=BAR_FREQ, target_tf=BAR_FREQ,
         zero_fill_prices=zero_fill_prices,
+        ta_price_source="close",
     )
     return eng.compute(bars)
 
@@ -376,7 +377,8 @@ class TestFeatureFillSplit:
     def test_default_is_the_legacy_blanket_fill(self):
         """The LIVE default must be today's behaviour (knull/mjolnir_bridge)."""
         eng = MjolnirFeatures(feature_windows=[30], target_horizon=1,
-                              fee_rate=0.0, bar_tf=BAR_FREQ, target_tf=BAR_FREQ)
+                              fee_rate=0.0, bar_tf=BAR_FREQ, target_tf=BAR_FREQ,
+                              ta_price_source="close")
         assert eng.zero_fill_prices is True
 
 

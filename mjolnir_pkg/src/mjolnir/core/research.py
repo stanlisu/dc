@@ -18,7 +18,7 @@ import pandas as pd
 import pyarrow as pa  # noqa: F401  -- imported here so missing pyarrow fails at import time
 import pyarrow.parquet as pq
 
-from .features import MjolnirFeatures, _TF_SECONDS
+from .features import MjolnirFeatures, TA_PRICE_SOURCES, _TF_SECONDS
 from .loader import MjolnirLoader
 from .aligner import StreamAligner
 from .multi_tf_merge import merge_cross_tf_features
@@ -56,6 +56,40 @@ def _filter_parquet_filenames(
             continue
         out.append(f)
     return out
+
+
+def resolve_ta_price_source(config: Dict) -> str:
+    """Read the REQUIRED ``TA_PRICE_SOURCE`` key from setting.json.
+
+    No default. The key decides which price every TA-Lib indicator is computed
+    on: ``"close"`` (the last TRADE price — today's behaviour and the live
+    convention) or ``"book_mid"`` (``(bids_0_price + asks_0_price) / 2``, the
+    book_snapshot_25 level-0 mid).
+
+    It exists because the two choices are not interchangeable under
+    ``FILL_ZERO_TRADE=false``: a zero-trade bar has NO trade price, TA-Lib
+    propagates the resulting NaN to the end of the series, and 21 indicator
+    columns go 99.7% NaN on XMRUSDT / 53.4% on SOLUSDT and are dropped by the
+    IC screen. The book is quoted on 100% of bars, so ``"book_mid"`` is dense
+    without fabricating anything. Guessing the key would silently decide which
+    price a whole corpus of features was built on.
+    """
+    if "TA_PRICE_SOURCE" not in config:
+        raise KeyError(
+            "setting.json is missing TA_PRICE_SOURCE. It is required and has "
+            "no default: it selects the price every TA-Lib indicator is "
+            f"computed on, one of {list(TA_PRICE_SOURCES)}. \"close\" is the "
+            "last trade price (today's behaviour); \"book_mid\" is the "
+            "book_snapshot_25 level-0 mid, which is the only source that stays "
+            "dense when FILL_ZERO_TRADE=false."
+        )
+    val = config["TA_PRICE_SOURCE"]
+    if not isinstance(val, str) or val not in TA_PRICE_SOURCES:
+        raise ValueError(
+            f"TA_PRICE_SOURCE must be one of {list(TA_PRICE_SOURCES)}, got "
+            f"{val!r} ({type(val).__name__})."
+        )
+    return val
 
 
 def resolve_fill_zero_trade(config: Dict) -> bool:
@@ -454,6 +488,9 @@ class MjolnirResearch:
         # fillna(0.0) in features would pin 21 TA columns to exactly 0.0 for
         # the rest of the series — strictly worse than the fill it replaced.
         zero_fill_prices = resolve_fill_zero_trade(cfg)
+        # Required, no default. Which price the TA indicators ride on; the
+        # TARGET is untouched by it (it stays on the book_ticker mid_price).
+        ta_price_source = resolve_ta_price_source(cfg)
 
         feat_engine = MjolnirFeatures(
             feature_windows=feature_windows,
@@ -462,6 +499,7 @@ class MjolnirResearch:
             bar_tf=bar_tf,
             target_tf=time_unit,
             zero_fill_prices=zero_fill_prices,
+            ta_price_source=ta_price_source,
         )
 
         # BTC must be processed first so cross-features are available for other symbols
@@ -485,6 +523,7 @@ class MjolnirResearch:
                 bar_tf=tf,
                 target_tf=tf,
                 zero_fill_prices=zero_fill_prices,
+                ta_price_source=ta_price_source,
             )
             for tf in multi_tfs
         }
