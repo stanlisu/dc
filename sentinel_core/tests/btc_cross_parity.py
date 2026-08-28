@@ -49,7 +49,8 @@ def main() -> int:
     bar_mod = load_reference(Path(args.ref_bar))
     feat_mod = load_reference(Path(args.ref_feat))
     fe = feat_mod.MjolnirFeatures(feature_windows=[30, 60, 300, 900],
-                                  bar_tf="5s", target_tf="5s")
+                                  bar_tf="5s", target_tf="5s",
+                                  ta_price_source="close")
 
     a_panel = fe.compute(ref_bars_df(bar_mod, a_ev))
     p_panel = fe.compute(ref_bars_df(bar_mod, p_ev))

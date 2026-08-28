@@ -19,6 +19,45 @@ MA_PERIODS = [7, 25, 99]
 # Bar-TF → seconds mapping (used for boundary-aligned target computation)
 _TF_SECONDS: dict = {"5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900}
 
+# Accepted values for `ta_price_source` (see MjolnirFeatures.__init__).
+TA_PRICE_SOURCES: tuple = ("close", "book_mid")
+
+# The book_snapshot_25 LEVEL-0 columns the "book_mid" source is built from.
+# NOT `bid_price`/`ask_price`, which are the book_ticker L1 stream — a
+# different feed at a different cadence. See book_mid_price().
+BOOK_MID_SOURCE_COLS: tuple = ("bids_0_price", "asks_0_price")
+
+
+def book_mid_price(df: pd.DataFrame) -> pd.Series:
+    """The book_snapshot_25 level-0 mid, ``(bids_0_price + asks_0_price) / 2``.
+
+    NOT the same thing as the ``mid_price`` column ``_compute_book_features``
+    publishes, which is ``(bid_price + ask_price) / 2`` off the **book_ticker**
+    L1 stream. The two feeds have different cadences (book_ticker updates
+    sub-millisecond; book_snapshot_25 has a ~30-60 ms median inter-update gap)
+    and therefore different last-in-bar values: measured on 6 symbols x 20 days
+    of the 5s corpus they disagree on 1.3-2.5% of bars, by a median 0.9-3.7 bps
+    where they disagree, and the disagreement concentrates hard on zero-trade
+    bars for deep books (BTC 52.4% of zero-trade bars vs 1.5% of traded ones).
+    Usually equal is not always equal, so the two must never be conflated.
+
+    Raises:
+        KeyError: if either level-0 column is absent. 10 of 13,800 day-files in
+            the 5s mirror carry no ``bids_*``/``asks_*`` columns at all; those
+            days must fail loudly, never be filled from another source.
+    """
+    missing = [c for c in BOOK_MID_SOURCE_COLS if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"book_mid_price: missing {missing} — cannot price TA indicators "
+            "off the book. These are the book_snapshot_25 level-0 columns; "
+            "some day-files in the bar corpus carry no book snapshot at all. "
+            "Rebuild those days, exclude them, or run with "
+            "ta_price_source='close'. No fallback to bid_price/ask_price: "
+            "that is the book_ticker stream, a different feed."
+        )
+    return (df[BOOK_MID_SOURCE_COLS[0]] + df[BOOK_MID_SOURCE_COLS[1]]) / 2
+
 
 class MjolnirFeatures:
     """Compute microstructure and price features on aligned bar DataFrames.
@@ -56,6 +95,16 @@ class MjolnirFeatures:
                          ``StreamAligner(fill_zero_trade=False)``, otherwise a
                          single zero-trade bar pins 21 TA columns to exactly
                          0.0 for the rest of the series.
+        ta_price_source: REQUIRED, keyword-only, no default. Which price the
+                         TA-Lib indicators are computed on.
+                         ``"close"``    — the last TRADE price (today's
+                                          behaviour, and the live convention).
+                         ``"book_mid"`` — ``(bids_0_price + asks_0_price)/2``,
+                                          the book_snapshot_25 level-0 mid.
+                         The book is observed on 100% of bars, zero-trade ones
+                         included, so ``"book_mid"`` is the only source that is
+                         dense under ``fill_zero_trade=False`` without
+                         fabricating a price. See _ta_price_inputs().
     """
 
     # Columns that must NOT be prefixed regardless of the prefix setting.
@@ -148,7 +197,23 @@ class MjolnirFeatures:
         bar_tf: str = "5s",
         target_tf: str = "5s",
         zero_fill_prices: bool = True,
+        *,
+        ta_price_source: str,
     ) -> None:
+        # ta_price_source is keyword-only with NO default: it selects which
+        # price series every TA-Lib indicator is computed on, and both answers
+        # are defensible, so guessing one would silently pick a research
+        # convention for the live path (or vice versa). CLAUDE.md "no magic
+        # defaults on required-looking params". Mirrors
+        # StreamAligner(fill_zero_trade=...).
+        if ta_price_source not in TA_PRICE_SOURCES:
+            raise ValueError(
+                f"ta_price_source={ta_price_source!r} is not one of "
+                f"{list(TA_PRICE_SOURCES)}. It comes from the required "
+                "TA_PRICE_SOURCE key in setting.json "
+                "(mjolnir/core/research.py:resolve_ta_price_source)."
+            )
+        self.ta_price_source = ta_price_source
         # zero_fill_prices defaults to True = TODAY's behaviour, deliberately.
         # compute() runs on the LIVE inference path (knull/mjolnir_bridge.py →
         # mjolnir/trading.py), whose bars come from knull/live_bar.py, which
@@ -411,7 +476,12 @@ class MjolnirFeatures:
     def _compute_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Standard price indicators using TA-Lib (or numpy fallback)."""
         close = df.get("close")
-        if close is None or close.isna().all():
+        if close is None:
+            return df
+        if close.isna().all() and self.ta_price_source == "close":
+            # Nothing to price the indicators off. Under "book_mid" the book
+            # still carries a mid on a day with no trade at all, so the bail-out
+            # would throw away the one usable source; keep going there.
             return df
 
         high = df.get("high", close)
@@ -435,7 +505,8 @@ class MjolnirFeatures:
         new_cols["low_open_pct"] = (low - open_) / (open_ + 1e-10)
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
-        df = self._compute_talib(df, close, high, low, volume)
+        ta_close, ta_high, ta_low = self._ta_price_inputs(df, close, high, low)
+        df = self._compute_talib(df, ta_close, ta_high, ta_low, volume)
 
         # Scale-free forms of the seven raw price/volume levels. verticalize()
         # pools symbols, so a price-unit column acts partly as a symbol ID;
@@ -452,7 +523,17 @@ class MjolnirFeatures:
             # mjolnir stores obv/ad as raw cumulative talib.OBV/AD, so the
             # default (differencing) is correct here — unlike agamotto, which
             # already diffs them and must pass obv_is_cumulative=False.
-            df = pd.concat([df, scale_free_levels(df)], axis=1)
+            #
+            # bb_pctb / bb_width / macd_norm / macdhist_norm divide an indicator
+            # by `close`, so they inherit the indicator's price source or they
+            # are NaN wherever the TRADE close is. Four of them are in the 21
+            # NaN-propagating columns this flag exists to densify, so under
+            # "book_mid" the normaliser must be the same mid the bands were
+            # built from. The `close` COLUMN in df is untouched — regime
+            # filters gate on it (research_filters.py `close < bb_lower`).
+            sf_src = df if self.ta_price_source == "close" \
+                else df.assign(close=ta_close)
+            df = pd.concat([df, scale_free_levels(sf_src)], axis=1)
         else:
             # WHY safe: _compute_talib falls back to _numpy_indicators when
             # TA-Lib is unavailable, which does not emit every column. Raising
@@ -461,6 +542,65 @@ class MjolnirFeatures:
             logger.warning("skipping scale-free level features, missing %s",
                            [c for c in need if c not in df.columns])
         return df
+
+    def _ta_price_inputs(
+        self,
+        df: pd.DataFrame,
+        close: pd.Series,
+        high: pd.Series,
+        low: pd.Series,
+    ) -> tuple:
+        """The (close, high, low) series the TA-Lib indicators are computed on.
+
+        ``"close"`` returns the trade OHLC unchanged — the legacy path, and the
+        live convention (knull/live_bar.py still fills zero-trade bars).
+
+        ``"book_mid"`` returns the book_snapshot_25 level-0 mid for all three.
+        There is no intrabar high/low OF THE BOOK in a bar row — the aligner
+        keeps the LAST snapshot in the bar, one point — so high == low == close
+        by construction, and that is stated rather than papered over: ATR
+        becomes |Δmid| (true range collapses to the close-to-close move) and
+        the ADX family becomes purely directional on the mid. Mixing a
+        trade-derived high/low with a book-derived close would be worse: the
+        range would span two different price processes.
+
+        The columns are read AFTER compute()'s point-in-time shift, so the mid
+        at row T is the PRIOR bar's closed book — known before the target
+        window opens, same causality correction ``mid_price`` gets.
+        """
+        if self.ta_price_source == "close":
+            return close, high, low
+        mid = book_mid_price(df)
+        return mid, mid, mid
+
+    def _ta_valid_mask(self, close: pd.Series) -> Optional[pd.Series]:
+        """Rows TA-Lib may see, or ``None`` to pass the series through whole.
+
+        TA-Lib has no NaN semantics: one NaN in the input array poisons the
+        output to the END of the series. Under ``"close"`` that propagation IS
+        the legacy behaviour and must be preserved bit-for-bit, so this returns
+        None and nothing is touched.
+
+        Under ``"book_mid"`` the input always begins with at least one NaN (the
+        point-in-time shift consumes row 0) and the corpus carries a residual
+        0.000-0.012% of NaN snapshot mids, so a pass-through would hand back an
+        all-NaN panel — the very failure this source exists to remove. The rows
+        with no observed book are DROPPED from the TA input and restored as NaN
+        in the output: a missing observation is treated as absent, never as a
+        value. Nothing is filled, back-filled or carried forward.
+        """
+        if self.ta_price_source == "close":
+            return None
+        keep = close.notna()
+        dropped = int((~keep).sum())
+        if dropped:
+            logger.warning(
+                "ta_price_source=%s: %d/%d rows (%.4f%%) have no book mid and "
+                "are excluded from the TA-Lib input; their indicator values "
+                "stay NaN.", self.ta_price_source, dropped, len(keep),
+                100.0 * dropped / max(len(keep), 1),
+            )
+        return keep
 
     def _compute_talib(
         self,
@@ -471,15 +611,22 @@ class MjolnirFeatures:
         volume: pd.Series,
     ) -> pd.DataFrame:
         """Apply TA-Lib indicators; fall back to numpy implementations."""
+        keep = self._ta_valid_mask(close)
+        if keep is None:
+            c, h, lo, v = close, high, low, volume
+        else:
+            c, h, lo, v = close[keep], high[keep], low[keep], volume[keep]
         try:
             import talib  # noqa: F401
-            df = self._talib_indicators(df, close, high, low, volume)
+            new = self._talib_indicators(c, h, lo, v)
         except ImportError:
             logger.debug("TA-Lib not available; using numpy fallbacks.")
-            df = self._numpy_indicators(df, close, high, low)
-        return df
+            new = self._numpy_indicators(c, h, lo)
+        if keep is not None:
+            new = new.reindex(df.index)
+        return pd.concat([df, new], axis=1)
 
-    def _talib_indicators(self, df, close, high, low, volume):
+    def _talib_indicators(self, close, high, low, volume):
         import talib
         c = close.values.astype(float)
         h = high.values.astype(float)
@@ -516,9 +663,9 @@ class MjolnirFeatures:
             "mfi":      talib.MFI(h, lo, c, v, timeperiod=14),
             "std":      talib.STDDEV(c, timeperiod=14),
         }
-        return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+        return pd.DataFrame(new_cols, index=close.index)
 
-    def _numpy_indicators(self, df, close, high, low):
+    def _numpy_indicators(self, close, high, low):
         """Minimal numpy fallbacks when TA-Lib is unavailable."""
         c = close
 
@@ -551,7 +698,7 @@ class MjolnirFeatures:
         for col in ["stoch_k", "stoch_d", "cci", "adx", "dx", "plus_di",
                     "minus_di", "willr", "cmo", "sar", "obv", "ad", "mfi"]:
             new_cols[col] = np.nan
-        return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+        return pd.DataFrame(new_cols, index=close.index)
 
     # ------------------------------------------------------------------
     # Rolling statistics on key microstructure signals

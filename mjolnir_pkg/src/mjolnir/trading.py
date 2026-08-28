@@ -116,6 +116,14 @@ class MjolnirTrading:
             bar_tf=self._base_tf,
             target_tf=self._base_tf,
             zero_fill_prices=True,
+            # LIVE path: TA rides on the trade close, as it always has. Live
+            # bars come from knull/live_bar.py, which still fills zero-trade
+            # bars, so `close` is never NaN there and there is nothing for a
+            # book mid to rescue. Reading TA_PRICE_SOURCE here would let a
+            # research-side flag repoint the live feature panel at a different
+            # price series without a live change. Flip this only together with
+            # live_bar.py — that is the promotion step, not this one.
+            ta_price_source="close",
         )
         # One trivial-window engine per cross-TF (mirrors research.py:287-297).
         self._tf_engines: Dict[str, MjolnirFeatures] = {
@@ -127,6 +135,7 @@ class MjolnirTrading:
                 bar_tf=tf,
                 target_tf=tf,
                 zero_fill_prices=True,  # see _feat_engine above — LIVE path
+                ta_price_source="close",  # see _feat_engine above — LIVE path
             )
             for tf in self._multi_tfs
         }
