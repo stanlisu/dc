@@ -281,6 +281,18 @@ class KlineBuilder {
     Accum   mCur{};
     bool    mHaveOpenBucket{false};
     bool    mCurIsPartial{false};
+    // Rule 3 applies to the ONE bucket this process joined late, and to nothing
+    // afterwards. Cleared the moment that bucket is disposed of, so a bucket
+    // opened later -- after flushDue() closed its predecessor and left no open
+    // bucket -- is correctly treated as fully observed. Conflating the two made
+    // every quiet symbol on hydra go dark; see the banner on onTick().
+    bool    mAttachPending{true};
+    // The newest bucket this builder has CLOSED on the live path (emitted or
+    // discarded), so a reopen after a flush knows which buckets it slept
+    // through and owes flat bars for. Not derived from mHistory: that is
+    // swapped out wholesale when a discontinuity quarantines the run.
+    bool    mHaveLastClosed{false};
+    int64_t mLastClosedBucketMs{0};
     bool    mHaveClose{false};
     double  mPrevClose{0.0};
 

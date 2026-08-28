@@ -523,6 +523,97 @@ void selftest()
 		      "a REST kline reports 0/0 rather than an invented figure");
 		check(b.tradesMissing() == 0, "and ingesting it moved no run counter");
 	}
+
+	std::printf("[20] a bucket opened AFTER a timer flush is whole, not partial\n");
+	{
+		// THE BUG THIS PINS (hydra, 2026-08-27). flushDue() closes a bucket and
+		// deliberately leaves no open bucket. The next trade therefore lands in
+		// the !mHaveOpenBucket branch -- the ATTACH branch -- which stamped
+		// mCurIsPartial, so the following bar was discarded as "half observed"
+		// even though the builder had been listening through every millisecond
+		// of it. Rule 3 is about joining a bucket LATE at process start; a
+		// bucket that opens after a clean close is not that.
+		//
+		// It hit the QUIET symbols, because the flush only wins when no trade
+		// with a next-bucket stamp arrives within the 250 ms grace: 8.8
+		// trades/s lost the race about half the time and 120 trades/s never
+		// did. On the 12:49-15:00 run, product 2000000035 built 2 bars where
+		// ETH built 8, and every miss was a whole bar the symbol could not
+		// score, gate or trade.
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 100, 1, 10.0, 1.0, 9.0, 11.0));           // attach: partial
+		b.onTick(trade(T0 + P + 10, 2, 100.0, 1.0, 99.0, 101.0));     // drops it, opens B1
+		check(drain(b).empty(), "the attach bucket is still discarded (rule 3 intact)");
+
+		// No trade rolls B1: the 250 ms grace expires and the TIMER closes it.
+		check(b.flushDue(T0 + 2 * P) == 1, "timer closed bucket 1");
+		check(drain(b).size() == 1, "and bucket 1 was emitted, not dropped");
+
+		// The first trade of bucket 2 arrives late, after that flush.
+		b.onTick(trade(T0 + 2 * P + 400, 3, 120.0, 1.0, 119.0, 121.0));
+		b.onTick(trade(T0 + 3 * P + 10, 4, 130.0, 1.0, 129.0, 131.0)); // rolls B2
+		auto bars = drain(b);
+		check(bars.size() == 1, "bucket 2 produced a bar");
+		check(bars.size() == 1 && bars[0].bucket_open_ms == T0 + 2 * P,
+		      "and it is bucket 2, at its own grid point");
+		check(bars.size() == 1 && bars[0].number_of_trades == 1,
+		      "carrying the trade that was seen in it");
+		check(b.partialBucketsDropped() == 1,
+		      "exactly ONE partial for the whole run -- the attach, nothing after");
+	}
+
+	std::printf("[21] consecutive timer flushes still yield an unbroken time axis\n");
+	{
+		// The compounding shape of the same defect: when the flush keeps
+		// winning -- which is what a persistently quiet symbol does -- EVERY
+		// bar was dropped, so the symbol went dark for the rest of the run and
+		// its history opened a multi-bucket hole that quarantined all 700 bars.
+		// That is the [AGGAP] "buckets 1787838300000 .. 1787841000000 are
+		// MISSING" line on hydra.
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 100, 1, 10.0, 1.0, 9.0, 11.0));            // attach
+		b.onTick(trade(T0 + P + 10, 2, 100.0, 1.0, 99.0, 101.0));      // opens B1
+		drain(b);
+		for (int i = 1; i <= 4; ++i) {
+			check(b.flushDue(T0 + (i + 1) * P) == 1, "timer closed a bucket");
+			check(drain(b).size() == 1, "which produced its bar");
+			b.onTick(trade(T0 + (i + 1) * P + 300,
+			               static_cast<uint64_t>(2 + i), 100.0 + i, 1.0,
+			               99.0 + i, 101.0 + i));
+		}
+		check(b.partialBucketsDropped() == 1,
+		      "still just the attach partial after four flush/reopen cycles");
+		check(b.contiguousBars() == 4, "four contiguous bars retained");
+		check(b.seamGaps() == 0, "and no history discontinuity was opened");
+	}
+
+	std::printf("[22] a trade that reappears several buckets after a flush is bridged flat\n");
+	{
+		// flushDue() leaves no open bucket ON PURPOSE ("a dead symbol should
+		// produce no bars"). When the symbol wakes up again the buckets it
+		// slept through are real, empty buckets and rule 4 owes them flat bars
+		// -- exactly as the bucket-roll path already does. Without that walk
+		// the reopen jumps the grid and pushHistory quarantines the run.
+		KlineBuilder b(900, 1000);
+		b.onTick(trade(T0 + 100, 1, 10.0, 1.0, 9.0, 11.0));           // attach
+		b.onTick(trade(T0 + P + 10, 2, 100.0, 1.0, 99.0, 101.0));     // opens B1
+		drain(b);
+		check(b.flushDue(T0 + 2 * P) == 1, "timer closed bucket 1");
+		drain(b);
+		// Nothing trades in buckets 2 and 3; the next trade is in bucket 4.
+		b.onTick(trade(T0 + 4 * P + 50, 3, 120.0, 1.0, 119.0, 121.0));
+		auto bars = drain(b);
+		check(bars.size() == 2, "buckets 2 and 3 emitted flat on the reopen");
+		if (bars.size() == 2) {
+			check(bars[0].bucket_open_ms == T0 + 2 * P
+			      && bars[1].bucket_open_ms == T0 + 3 * P, "at their own grid points");
+			check(bars[0].number_of_trades == 0 && bars[0].volume == 0.0,
+			      "flat bars carry no trades");
+			check(bars[0].close == 100.0,
+			      "and hold the previous close, like Binance's own empty kline");
+		}
+		check(b.seamGaps() == 0, "the time axis stayed contiguous");
+	}
 }
 
 // ---- replay mode ---------------------------------------------------------
