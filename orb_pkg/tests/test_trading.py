@@ -108,7 +108,10 @@ def _regime_aware_filter(inst):
 
 def test_initialization(orb):
     assert orb.config["CAPITAL"] == 1000
-    assert orb.trading_mode == "both"
+    # No TRADING_MODE read. It was a banned magic-default whose only use was a
+    # boot log line, and it names the EXECUTOR's vocabulary (execution style),
+    # not a direction. Direction comes from the regime stack's `position`.
+    assert not hasattr(orb, "trading_mode")
     assert "BINANCE_PERP_BTC_USDT" in orb.config["SYMBOLS"]
     assert isinstance(orb.regime_stack, list)
 

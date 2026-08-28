@@ -84,6 +84,21 @@ def test_initialization(mock_agamotto):
     assert mock_agamotto.config["CAPITAL"] == 1000
     assert "BINANCE_PERP_BTC_USDT" in mock_agamotto.config["SYMBOLS"]
 
+
+def test_no_trading_mode_attribute(mock_agamotto):
+    """agamotto does not read TRADING_MODE.
+
+    It used to hold `self.trading_mode = config.get("TRADING_MODE", "both")` --
+    a banned magic-default read whose ONLY use was a boot log line. Direction
+    comes from the regime stack's `position` column; TRADING_MODE now means
+    execution style and nothing else (knull/execution_style.py), so the read
+    is not just dead, it is dead in the WRONG vocabulary: the value logged as
+    "Trading Mode" was whatever the executor's style happened to be, which is
+    exactly the confusion that made a direction gate on the same key silently
+    flatten vomir. Pinned as ABSENT so it cannot come back as a gate.
+    """
+    assert not hasattr(mock_agamotto, "trading_mode")
+
 def test_make_decision_long(mock_agamotto):
     """Long decision via regime stack."""
     settled_ts = pd.Timestamp("2025-01-01 00:00:00")

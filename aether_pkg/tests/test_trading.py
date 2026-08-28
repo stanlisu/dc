@@ -99,7 +99,10 @@ def _regime_aware_filter(inst):
 def test_initialization():
     inst = _make_aether()
     assert inst.config["CAPITAL"] == 1000
-    assert inst.trading_mode == "both"
+    # No TRADING_MODE read. It was a banned magic-default that nothing ever
+    # consumed -- not even a log line. Direction comes from the regime stack's
+    # `position`; TRADING_MODE is the executor's execution style.
+    assert not hasattr(inst, "trading_mode")
     assert isinstance(inst.regime_stack, list)
     assert isinstance(inst.models, dict)
 

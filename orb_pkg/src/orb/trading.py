@@ -110,7 +110,6 @@ class OrbTrading(OrbResearch):
     ) -> None:
         super().__init__(config, home_root)
         self.period = self.config.get("WEIGHTS_PERIOD") or period
-        self.trading_mode = self.config.get("TRADING_MODE", "both")
         self.models: dict = {}
         self.latest_predictions: pd.DataFrame | None = None
         self.latest_predictions_path: Optional[str] = None
@@ -146,7 +145,6 @@ class OrbTrading(OrbResearch):
 
         logger.info(
             f"Orb initiated - Period: {self.period}, "
-            f"Trading Mode: {self.trading_mode}, "
             f"Timeframes: {self.timeframes}")
 
     # ------------------------------------------------------------------

@@ -159,8 +159,6 @@ class AgamottoTrading(AgamottoResearch):
         self._strict_filters = False
         # Use period from config or parameter (config takes precedence)
         self.period = self.config.get("WEIGHTS_PERIOD") or period
-        self.trading_mode = self.config.get(
-            "TRADING_MODE", "both")  # both, long_only, short_only
         self.models: dict[str, dict[str, dict[str, object]]] = {}
         self.latest_predictions: pd.DataFrame | None = None
         self.latest_predictions_path: Optional[str] = None
@@ -196,7 +194,7 @@ class AgamottoTrading(AgamottoResearch):
                 logger.warning(f"Failed to load initial data in __init__: {e}")
 
         logger.info(
-            f"Agamotto initiated V5 (STRATEGY_STACK_PATH fix) - Period: {self.period}, Trading Mode: {self.trading_mode}")
+            f"Agamotto initiated V5 (STRATEGY_STACK_PATH fix) - Period: {self.period}")
 
     def _calculate_sizes(self) -> None:
         """Calculate SIZES via the unified symbiote.sizing.compute_sizes helper.
