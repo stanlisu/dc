@@ -102,7 +102,9 @@ def vomir(base_config):
 def test_initialization(vomir):
     assert vomir.long_pred_threshold == 0.4
     assert vomir.short_pred_threshold == 0.4
-    assert vomir.trading_mode == "both"
+    # No direction mode. It came off TRADING_MODE, which knull's executor
+    # reads as an EXECUTION STYLE -- see the note in test_trading_decisions.py.
+    assert not hasattr(vomir, "trading_mode")
     assert vomir._vomir_clf is not None
     assert vomir._vomir_feature_cols == ["feat_a", "feat_b"]
 

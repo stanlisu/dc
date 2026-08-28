@@ -133,24 +133,91 @@ def test_conflict_both_exceed_short_stronger_neutral():
 
 
 # -------------------------------------------------------------------
-# Trading modes
+# Direction comes from the CLASSIFIER, never from TRADING_MODE
 # -------------------------------------------------------------------
+#
+# These two tests used to pin the opposite contract
+# (test_long_only_mode_blocks_short / test_short_only_mode_blocks_long): vomir
+# gated each leg on `self.trading_mode in ("both", "long_only")`. That gate is
+# gone -- direction is the classifier's answer, exactly as it is for every
+# other algo, where it comes from the regime stack's `position` column.
+#
+# WHY IT HAD TO GO. `TRADING_MODE` is a COLLIDING key: knull's BaseExecutor
+# reads it as an EXECUTION STYLE and hard-validates it against
+# ("MarketMaker", "LadderMaker", "Anchor", "Taker", "Dimer", "EntryTaker"),
+# while vomir read the same key as a DIRECTION mode with a silent "both"
+# default and matched neither vocabulary against the other. Measured on the
+# full (p_short, p_long) decision surface -- 1323 single-symbol cells, 21x21
+# grid at three threshold pairs -- before the removal:
+#
+#     TRADING_MODE          LONG cells   SHORT cells   FLAT cells
+#     "both"                       612           248          463
+#     key absent (default)         612           248          463   (identical)
+#     "long_only"                  612             0          711
+#     "short_only"                   0           588          735
+#     "MarketMaker"                  0             0         1323   <-- silent
+#
+# An execution style in that key made vomir trade NOTHING, with no error, on
+# every one of 1323 cells. The vocabulary that produced that is deleted rather
+# than validated: a key vomir does not read cannot be fed the wrong word.
 
 
-def test_long_only_mode_blocks_short():
-    inst = _make_vomir(config_overrides={"TRADING_MODE": "long_only"})
+@pytest.mark.parametrize("mode", [
+    "both", "long_only", "short_only", "long", "short",
+    "MarketMaker", "LadderMaker", "nonsense",
+])
+def test_short_fires_whatever_trading_mode_says(mode):
+    """P(SHORT)=0.9 => SHORT, for EVERY value of the colliding key."""
+    inst = _make_vomir(config_overrides={"TRADING_MODE": mode})
     inst._vomir_clf.predict_proba.return_value = np.array([[0.9, 0.05, 0.05]])
     decisions = inst.make_decision()
     _, qty = decisions["BINANCE_PERP_BTC_USDT"]
-    assert qty == 0.0, f"long_only mode should block SHORT, got qty={qty}"
+    assert qty < 0, (
+        f"TRADING_MODE={mode!r} must not gate direction; the classifier said "
+        f"SHORT (P=0.9) and got qty={qty}")
 
 
-def test_short_only_mode_blocks_long():
-    inst = _make_vomir(config_overrides={"TRADING_MODE": "short_only"})
+@pytest.mark.parametrize("mode", [
+    "both", "long_only", "short_only", "long", "short",
+    "MarketMaker", "LadderMaker", "nonsense",
+])
+def test_long_fires_whatever_trading_mode_says(mode):
+    """P(LONG)=0.9 => LONG, for EVERY value of the colliding key."""
+    inst = _make_vomir(config_overrides={"TRADING_MODE": mode})
     inst._vomir_clf.predict_proba.return_value = np.array([[0.05, 0.05, 0.9]])
     decisions = inst.make_decision()
     _, qty = decisions["BINANCE_PERP_BTC_USDT"]
-    assert qty == 0.0, f"short_only mode should block LONG, got qty={qty}"
+    assert qty > 0, (
+        f"TRADING_MODE={mode!r} must not gate direction; the classifier said "
+        f"LONG (P=0.9) and got qty={qty}")
+
+
+def test_both_legs_fire_with_no_trading_mode_key_at_all():
+    """The key is not read, so its ABSENCE is not a missing-config failure."""
+    cfg = {"TIME_UNIT": "1d", "TIMEFRAME_SECONDS": 86400, "SIZES": [0.01],
+           "SYMBOLS": ["BINANCE_PERP_BTC_USDT"], "CAPITAL": 1000,
+           "VOMIR_WEIGHTS_PATH": "/tmp/fake_vomir_weights",
+           "VOMIR_LONG_THRESHOLD": 0.4, "VOMIR_SHORT_THRESHOLD": 0.4,
+           "LOT_SIZES": {"BINANCE_PERP_BTC_USDT": {"step_size": 0.001,
+                                                   "min_notional": 5.0}}}
+    inst = _make_vomir()
+    inst.config = dict(cfg)          # no TRADING_MODE anywhere
+    inst._vomir_clf.predict_proba.return_value = np.array([[0.9, 0.05, 0.05]])
+    assert inst.make_decision()["BINANCE_PERP_BTC_USDT"][1] < 0
+    inst._vomir_clf.predict_proba.return_value = np.array([[0.05, 0.05, 0.9]])
+    assert inst.make_decision()["BINANCE_PERP_BTC_USDT"][1] > 0
+
+
+def test_vomir_does_not_read_trading_mode():
+    """No `trading_mode` attribute: the read itself is gone, not just its use.
+
+    An attribute that still exists is an attribute a future edit can gate on
+    again. Pins the absence, so reinstating the read fails here too.
+    """
+    inst = _make_vomir(config_overrides={"TRADING_MODE": "long_only"})
+    assert not hasattr(inst, "trading_mode"), (
+        "vomir must not carry a direction mode read off the colliding "
+        "TRADING_MODE key")
 
 
 # -------------------------------------------------------------------
