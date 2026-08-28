@@ -23,9 +23,16 @@ WORK="${TMPDIR:-/tmp}/mjolnir_taps_mutants"
 killed=0
 survived=0
 
-# mutate <name> <relative-file> <old> <new> [pytest -k selector]
+# mutate <name> <relative-file> <old> <new> [pytest -k selector] [test file]
+#
+# The 6th arg overrides the test file this mutant is scored against. It exists
+# because ta_price_source is CONSUMED outside mjolnir_pkg: agamotto's
+# test_scale_free_levels.py drives MjolnirFeatures._compute_price_features
+# directly, and one class of mutant (a value readable WITHOUT the constructor)
+# is invisible to every test in this package — see the class-attribute mutant
+# at the bottom of this file.
 mutate() {
-    local name="$1" rel="$2" old="$3" new="$4" sel="${5:-}"
+    local name="$1" rel="$2" old="$3" new="$4" sel="${5:-}" tests="${6:-$TESTS}"
     rm -rf "$WORK" && mkdir -p "$WORK"
     cp -R "$SRC/." "$WORK/"
 
@@ -47,9 +54,12 @@ PYEOF
         return
     fi
 
-    local args=(-q -p no:cacheprovider "$TESTS")
+    local args=(-q -p no:cacheprovider "$tests")
     [ -n "$sel" ] && args+=(-k "$sel")
-    if PYTHONPATH="$WORK" "$PY" -m pytest "${args[@]}" >/dev/null 2>&1; then
+    # agamotto_pkg/src is on the path unconditionally: harmless for mjolnir's
+    # own tests, required for the cross-package ones. $WORK comes FIRST so the
+    # mutated mjolnir shadows any installed copy.
+    if PYTHONPATH="$WORK:$ROOT/agamotto_pkg/src" "$PY" -m pytest "${args[@]}" >/dev/null 2>&1; then
         echo "  SURVIVED        $name"
         survived=$((survived + 1))
     else
@@ -160,6 +170,29 @@ mutate "research: value is not checked against the accepted set" "$R" \
     "    if not isinstance(val, str) or val not in TA_PRICE_SOURCES:" \
     "    if not isinstance(val, str):" \
     "invalid_value"
+
+# --- the default, re-added where no signature shows it ----------------------
+#
+# The first mutant in this file puts the default back in the __init__
+# SIGNATURE, and test_ta_price_source_has_no_default kills it. This one puts
+# the same default on the CLASS instead. The signature is untouched, so
+# `MjolnirFeatures()` still raises TypeError and every test in THIS package
+# passes — the mutant survives all 28 of them. What it silently restores is
+# the read path: `cls.__new__(cls)` gets a working `self.ta_price_source`
+# again, so any caller that skips __init__ picks up "close" without ever
+# stating it. That is exactly the magic default dc #62 deleted.
+#
+# It is scored against agamotto's suite because that is where the only
+# constructor-skipping caller lives (test_scale_free_levels.py — the one that
+# turned main red on 2026-08-28, CI run 33146271206).
+mutate "features: default re-added as a CLASS attribute, signature untouched" "$F" \
+    'class MjolnirFeatures:
+    """Compute microstructure' \
+    'class MjolnirFeatures:
+    ta_price_source = "close"
+    """Compute microstructure' \
+    "skipped_its_constructor" \
+    "$ROOT/agamotto_pkg/tests/test_scale_free_levels.py"
 
 echo
 echo "killed=$killed survived=$survived"

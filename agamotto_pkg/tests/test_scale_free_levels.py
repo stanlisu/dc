@@ -312,25 +312,47 @@ def test_mjolnir_mirror_is_identical_to_agamottos():
             mj_scale_free(df, window=N, obv_is_cumulative=cumulative))
 
 
-def test_mjolnir_price_features_emit_the_scale_free_columns():
-    """mjolnir's call site, end-to-end. Its obv/ad are raw cumulative talib
-    output, so it must use the DEFAULT differencing — the opposite of agamotto.
-    """
-    fe = pytest.importorskip("mjolnir.core.features",
-                             reason="mjolnir package not on PYTHONPATH")
-    rng = np.random.default_rng(3)
-    n = 400
+def _mjolnir_features_class(module):
+    """The mjolnir feature engine, located by capability rather than by name."""
+    return next(c for c in vars(module).values()
+                if isinstance(c, type) and hasattr(c, "_compute_price_features"))
+
+
+def _mjolnir_bars(n=400, seed=3):
+    rng = np.random.default_rng(seed)
     c = 100.0 * np.exp(np.cumsum(rng.normal(0, 4e-4, n)))
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "open": c, "close": c,
         "high": c * (1 + np.abs(rng.normal(0, 5e-4, n))),
         "low": c * (1 - np.abs(rng.normal(0, 5e-4, n))),
         "volume": np.abs(rng.normal(1000, 150, n)),
     }, index=pd.date_range("2026-01-01", periods=n, freq="15s"))
 
-    cls = next(c for c in vars(fe).values()
-               if isinstance(c, type) and hasattr(c, "_compute_price_features"))
-    out = cls.__new__(cls)._compute_price_features(df)
+
+def test_mjolnir_price_features_emit_the_scale_free_columns():
+    """mjolnir's call site, end-to-end. Its obv/ad are raw cumulative talib
+    output, so it must use the DEFAULT differencing — the opposite of agamotto.
+    """
+    fe = pytest.importorskip("mjolnir.core.features",
+                             reason="mjolnir package not on PYTHONPATH")
+    df = _mjolnir_bars()
+
+    # CONSTRUCT the engine — do NOT `cls.__new__(cls)`. That allocates an
+    # instance without running __init__, and it worked here only for as long
+    # as _compute_price_features touched no instance state. dc #62 made the TA
+    # price source a REQUIRED keyword-only ctor arg with no default
+    # (mjolnir/core/features.py:201) and reads it at :481/:534/:571, so the
+    # hollow instance began raising `AttributeError: 'MjolnirFeatures' object
+    # has no attribute 'ta_price_source'` — a symptom deep inside the engine
+    # instead of the TypeError a real call site would have got. That is what
+    # turned dc `main` red on 2026-08-28 (run 33146271206).
+    #
+    # "close" — the trade OHLC — is stated, not defaulted, because that is the
+    # source the 10-symbol x 360k-row measurement in this module's docstring
+    # was taken on. "book_mid" is not usable here anyway: it reads
+    # bids_0_price/asks_0_price, which synthetic OHLCV bars do not carry.
+    engine = _mjolnir_features_class(fe)(ta_price_source="close")
+    out = engine._compute_price_features(df)
 
     for col in SCALE_FREE_FEATURES:
         assert col in out.columns, f"mjolnir missing {col}"
@@ -338,3 +360,30 @@ def test_mjolnir_price_features_emit_the_scale_free_columns():
     for col in ("sar", "bb_upper", "bb_lower", "macdhist"):
         assert col in out.columns, f"mjolnir dropped raw {col}"
     assert out["obv_slope"].dropna().std() > 1e-12
+
+
+def test_an_engine_that_skipped_its_constructor_cannot_fabricate_features():
+    """The negative control for the test above — and a guard against the WRONG
+    fix for the red main it came from.
+
+    The tempting one-line repair was to hand `ta_price_source` a value the
+    engine can read without the constructor: a class attribute, a
+    `__getattr__`, a property with a fallback. Any of those makes
+    `cls.__new__(cls)` silently work again, which is exactly the magic default
+    dc #62 existed to delete — reinstated where no signature shows it.
+
+    mjolnir's own `TestFlag::test_ta_price_source_has_no_default` does NOT
+    cover that case: it inspects the `__init__` signature, and a CLASS
+    attribute leaves the signature untouched, so that test still passes while
+    the contract is gone.
+
+    So pin the negative directly. An instance that skipped `__init__` must
+    fail, loudly, naming the state it is missing — never return a frame.
+    """
+    fe = pytest.importorskip("mjolnir.core.features",
+                             reason="mjolnir package not on PYTHONPATH")
+    cls = _mjolnir_features_class(fe)
+
+    hollow = cls.__new__(cls)
+    with pytest.raises(AttributeError, match="ta_price_source"):
+        hollow._compute_price_features(_mjolnir_bars())
