@@ -156,6 +156,8 @@ void KlineBuilder::emitFlat(int64_t bucket_open_ms)
 	mReady.push_back(b);
 	pushHistory(b);
 	++mBarsSeen;
+	mHaveLastClosed = true;
+	mLastClosedBucketMs = bucket_open_ms;
 }
 
 int KlineBuilder::flushDue(int64_t cutoff_ms)
@@ -194,7 +196,10 @@ void KlineBuilder::emitCurrent(uint64_t close_trigger_recv_ns)
 		// looking bar with implausibly low volume into the series.
 		++mPartialBucketsDropped;
 		mCurIsPartial = false;
+		mAttachPending = false;
 		mHaveOpenBucket = false;
+		mHaveLastClosed = true;
+		mLastClosedBucketMs = mCur.bucket_open_ms;
 		if (mCur.has_any_trade) {
 			mPrevClose = mCur.close;
 			mHaveClose = true;
@@ -247,6 +252,9 @@ void KlineBuilder::emitCurrent(uint64_t close_trigger_recv_ns)
 	pushHistory(b);
 	++mBarsSeen;
 	mHaveOpenBucket = false;
+	mAttachPending = false;
+	mHaveLastClosed = true;
+	mLastClosedBucketMs = b.bucket_open_ms;
 }
 
 void KlineBuilder::applyTrade(const TickEvent& ev)
@@ -373,8 +381,37 @@ void KlineBuilder::onTick(const TickEvent& ev)
 	const int64_t bucket_ = bucketOf(ts_ms_);
 
 	if (!mHaveOpenBucket) {
+		// TWO WAYS TO GET HERE, and they are not the same event.
+		//
+		//   (a) ATTACH. The process just started and this is the first trade
+		//       it has ever seen. The bucket is half observed -- rule 3 -- and
+		//       its bar must be discarded rather than published short.
+		//   (b) REOPEN. flushDue() closed the previous bucket on the timer and
+		//       deliberately left none open ("a dead symbol should produce no
+		//       bars"). We have been listening continuously ever since, so the
+		//       bucket this trade opens is WHOLE.
+		//
+		// Stamping (b) as partial is the bar-coverage bug (hydra, 2026-08-27).
+		// The flush only wins the race when no trade carrying a next-bucket
+		// stamp arrives inside the strategy's 250 ms grace, which is a coin
+		// flip at ~9 trades/s and never happens at ~120, so it silently ate the
+		// bars of exactly the quiet symbols: product 2000000035 built 2 bars in
+		// the window ETH built 8, and once the flush started winning every
+		// following bar was dropped too -- the symbol went dark for the rest of
+		// the run and its history opened a multi-bucket hole that quarantined
+		// all 700 bars ([AGGAP] 1787838300000 .. 1787841000000). Nothing logged
+		// it; partialBucketsDropped is a counter nobody was reading.
+		if (!mAttachPending && mHaveLastClosed && mHaveClose) {
+			// Rule 4, same as the bucket-roll path below: the buckets slept
+			// through are real, empty buckets and each owes a flat bar. Without
+			// this the reopen jumps the grid and pushHistory quarantines the run.
+			for (int64_t b = mLastClosedBucketMs + mPeriodMs; b < bucket_;
+			     b += mPeriodMs) {
+				emitFlat(b);
+			}
+		}
 		startBucket(bucket_);
-		mCurIsPartial = true;   // Rule 3: attached mid-bucket
+		mCurIsPartial = mAttachPending;
 		applyTrade(ev);
 		return;
 	}
