@@ -26,18 +26,43 @@ class StreamAligner:
 
     Alignment strategy per stream:
     - ``trades``           → OHLCV aggregate + buy_vol, sell_vol, n_trades,
-                             vwap, trade_imbalance
+                             vwap, trade_imbalance, has_trade
     - ``book_ticker``      → last-value in bar (spread, microprice, bid/ask)
     - ``book_snapshot_25`` → last-value in bar (depth by level)
     - ``derivative_ticker``→ forward-fill to bar grid
     - ``liquidations``     → sum within bar (count + notional per side)
 
+    A quote is STATE; a trade is an EVENT
+    -------------------------------------
+    Three of the streams above are forward-filled UNCONDITIONALLY and that is
+    correct — ``_last_value`` (book_ticker), ``_last_value_snapshot``
+    (book_snapshot_25) and ``_ffill_derivative`` (mark/index/funding/OI) all
+    carry STATE.  The best bid/ask, the depth ladder and the mark price persist
+    on the exchange until something replaces them, so the last observed value
+    is still the *true* value during the next bar; carrying it forward
+    fabricates nothing.  Those three ffills must NEVER be made conditional on
+    ``fill_zero_trade``.
+
+    Trades are EVENTS.  A bar with ``n_trades == 0`` had no trade, so it has no
+    open/high/low/close/vwap at all.  Carrying the previous bar's price into it
+    invents a print that never happened and erases the fact that the market was
+    silent — which, in tick trading, is itself information.  That fill is
+    therefore OPTIONAL, and is the ONLY thing ``fill_zero_trade`` controls.
+
     Args:
         bar_freq: Bar width as a string, e.g. "5s", "1m", "1h".
+        fill_zero_trade: Keyword-only and REQUIRED (no default — every caller
+            must state its choice; see CLAUDE.md "no silent fallbacks").
+            ``True`` reproduces the historical convention byte-for-byte on
+            every legacy column: ffill ``close`` across zero-trade bars and set
+            ``open``/``high``/``low``/``vwap`` from it.  ``False`` leaves those
+            five price columns NaN on ``n_trades == 0`` rows.  The ``has_trade``
+            column and the zero-filled flow columns are written in BOTH modes.
     """
 
-    def __init__(self, bar_freq: str = "5s") -> None:
+    def __init__(self, bar_freq: str = "5s", *, fill_zero_trade: bool) -> None:
         self.bar_freq = bar_freq
+        self.fill_zero_trade = fill_zero_trade
         self._bar_seconds = bar_freq_to_seconds(bar_freq)
         # Pandas deprecated 'm' for minutes (now means month-end); use 'min' instead
         self._pd_freq = (
@@ -137,16 +162,32 @@ class StreamAligner:
 
         agg = agg.reindex(bar_index)
 
-        # Forward-fill close for zero-trade bars, then derive OHLC and zero volumes.
-        # Bars with no trades have NaN OHLCV, which propagates into all TA features
-        # and causes Ridge/ElasticNet failures. Standard microstructure convention:
-        # a zero-trade bar carries the last traded price with zero volume.
-        agg["close"] = agg["close"].ffill()
+        # Written in BOTH modes, so a bar file is self-describing: under
+        # fill_zero_trade=True the OHLC of a zero-trade bar is a CARRIED value
+        # and, without this column, that fact is unrecoverable downstream
+        # (volume == 0 alone does not identify it). Under fill_zero_trade=False
+        # it is what tells the loader that a NaN price is expected, not damage.
+        # NaN n_trades (bar absent from the groupby) compares False, as does 0.
+        agg["has_trade"] = agg["n_trades"].fillna(0.0) > 0
+
+        # `no_trade` is read BEFORE the ffill below; the ffill only touches
+        # `close`, so this is the same mask the legacy code computed after it.
         no_trade = agg["n_trades"].isna()
-        agg.loc[no_trade, "open"] = agg.loc[no_trade, "close"]
-        agg.loc[no_trade, "high"] = agg.loc[no_trade, "close"]
-        agg.loc[no_trade, "low"] = agg.loc[no_trade, "close"]
-        agg.loc[no_trade, "vwap"] = agg.loc[no_trade, "close"]
+
+        if self.fill_zero_trade:
+            # Legacy convention, kept byte-for-byte: carry the last traded price
+            # across a zero-trade bar so TA indicators stay finite. See the class
+            # docstring for why this is a fabrication and therefore optional.
+            agg["close"] = agg["close"].ffill()
+            agg.loc[no_trade, "open"] = agg.loc[no_trade, "close"]
+            agg.loc[no_trade, "high"] = agg.loc[no_trade, "close"]
+            agg.loc[no_trade, "low"] = agg.loc[no_trade, "close"]
+            agg.loc[no_trade, "vwap"] = agg.loc[no_trade, "close"]
+
+        # Flows are EVENT COUNTS, so 0.0 is the TRUE value on a zero-trade bar
+        # in BOTH modes — "no trades" really does mean volume 0 / n_trades 0 /
+        # imbalance 0. Only the five PRICE columns above are mode-dependent,
+        # because for those there is no true value to record.
         for col in ["volume", "n_trades", "buy_vol", "sell_vol"]:
             agg[col] = agg[col].fillna(0.0)
         agg["trade_imbalance"] = agg["trade_imbalance"].fillna(0.0)
