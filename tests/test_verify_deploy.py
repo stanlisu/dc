@@ -36,13 +36,27 @@ def _is_editable_finder(finder) -> bool:
     return getattr(type(finder), "__module__", "").startswith("__editable__")
 
 
-def _is_repo_pkg_src(entry: str) -> bool:
-    """True for a sys.path entry pointing at this repo's own <algo>_pkg/src."""
+def _is_pkg_src(entry: str) -> bool:
+    """True for ANY sys.path entry pointing at an `<algo>_pkg/src` tree.
+
+    Deliberately NOT scoped to this repo. The premise of these tests is that
+    `<algo>` must be UNIMPORTABLE, and a SECOND editable install elsewhere on
+    the host makes it importable exactly as well as this repo's own does —
+    where the foreign copy lives is irrelevant to that.
+
+    Scoping the strip to `_REPO in p.parents` is what made
+    `test_missing_install_fails` environment-sensitive: on shield2
+    (2026-08-28) site-packages carries `__editable__.orb-0.1.0.pth` holding
+    `/home/stan/sandbox/marvel/orb_pkg/src` — a different checkout, so the
+    entry survived, `find_spec("orb")` resolved, and `check()` reported
+    SHADOWED instead of "not importable". GitHub's runner has exactly one
+    install, so CI never saw it and the test passed there.
+    """
     try:
         p = pathlib.Path(entry).resolve()
     except (OSError, ValueError):
         return False
-    return p.name == "src" and p.parent.name.endswith("_pkg") and _REPO in p.parents
+    return p.name == "src" and p.parent.name.endswith("_pkg")
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +79,8 @@ def _clean_import_state():
     #      (tests.yml installs all 9 packages editable). sys.meta_path is
     #      consulted BEFORE sys.path, so sys.path.insert(0, ...) cannot outrank
     #      it — this is the one that actually bit;
-    #   3. a legacy .pth-style editable that appends <algo>_pkg/src to sys.path.
+    #   3. a .pth-style editable that appends <algo>_pkg/src to sys.path —
+    #      from ANY checkout, not just this one (see _is_pkg_src).
     #
     # Running this file ALONE on a machine where the packages are not installed
     # hits none of them, which is why these passed locally and failed in CI
@@ -74,7 +89,7 @@ def _clean_import_state():
         if name.split(".")[0] in (ALGO, "vibranium"):
             del sys.modules[name]
     sys.meta_path[:] = [f for f in sys.meta_path if not _is_editable_finder(f)]
-    sys.path[:] = [e for e in sys.path if not _is_repo_pkg_src(e)]
+    sys.path[:] = [e for e in sys.path if not _is_pkg_src(e)]
     importlib.invalidate_caches()
 
     yield
@@ -144,6 +159,38 @@ def test_missing_install_fails(tmp_path):
     ok, lines = verify_deploy.check(ALGO, str(root), {})
     assert ok is False
     assert "not importable" in "\n".join(lines)
+
+
+def test_pkg_src_strip_is_not_scoped_to_this_repo(tmp_path):
+    """Guards test_missing_install_fails against a SECOND install on the host.
+
+    CI has exactly one install, so the integration failure this defends
+    against cannot reproduce there — only this unit assertion can.
+    """
+    foreign = tmp_path / "another-checkout" / ("%s_pkg" % ALGO) / "src"
+    foreign.mkdir(parents=True)
+    assert _REPO not in foreign.resolve().parents, "fixture must be OUTSIDE the repo"
+
+    assert _is_pkg_src(str(foreign)) is True
+    assert _is_pkg_src(str(_REPO / ("%s_pkg" % ALGO) / "src")) is True
+    # ...and it must not eat unrelated entries.
+    assert _is_pkg_src(str(tmp_path)) is False
+    assert _is_pkg_src(str(foreign.parent)) is False
+
+
+def test_editable_finder_strip_is_not_scoped_to_this_repo():
+    """Rule 2 keys on the finder's module NAME, so it has no repo gap.
+
+    setuptools names the PEP 660 finder module `__editable___<dist>_<ver>_finder`
+    wherever the source tree lives, so a foreign editable install is stripped
+    by the same test as a local one.
+    """
+    class _Finder:
+        pass
+
+    _Finder.__module__ = "__editable___orb_0_1_0_finder"
+    assert _is_editable_finder(_Finder()) is True
+    assert _is_editable_finder(sys.meta_path[0]) is False
 
 
 def test_missing_obf_map_fails(tmp_path):
