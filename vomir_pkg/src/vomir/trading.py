@@ -21,16 +21,12 @@ from decimal import Decimal
 from typing import Dict, Optional
 
 import numpy as np
-import pandas as pd
 
 from agamotto.research import AgamottoResearch, _obf
-from agamotto.trading import AgamottoTrading
+# ONE implementation, in `agamotto/trading.py` — orb and aether import the same
+# function. `_get_latest_closes` explains why vomir switched to it.
+from agamotto.trading import AgamottoTrading, _closes_at_timestamp
 from vomir.classifier import VomirClassifier, CLASS_LONG, CLASS_SHORT
-
-try:
-    from agamotto.utils import _symbol_to_native
-except ImportError:
-    from agamotto import _symbol_to_native  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +172,7 @@ class VomirTrading(AgamottoTrading):
             else np.zeros(len(latest))
         )
 
-        latest_closes = self._get_latest_closes()
+        latest_closes = self._get_latest_closes(target_ts)
         capital = self.config.get("CAPITAL", 100)
         lot_sizes = self.config.get("LOT_SIZES", {})
 
@@ -223,23 +219,35 @@ class VomirTrading(AgamottoTrading):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_latest_closes(self) -> Dict[str, float]:
-        closes: Dict[str, float] = {}
-        raw = getattr(self, "raw", None)
-        if raw is None or raw.empty:
-            return closes
-        for sym in self.config.get("SYMBOLS", []):
-            native = _symbol_to_native(sym)
-            col = f"{native}_close"
-            if col in raw.columns:
-                val = raw[col].iloc[-1] if len(raw) >= 1 else 0.0
-                if pd.isna(val):
-                    valid = raw[col].dropna()
-                    val = float(valid.iloc[-1]) if len(valid) > 0 else 0.0
-                closes[sym] = float(val)
-            else:
-                closes[sym] = 0.0
-        return closes
+    def _get_latest_closes(self, target_ts) -> Dict[str, float]:
+        """Closes at ``target_ts`` — the row the classifier scored — by LABEL.
+
+        NOT the same defect as agamotto's ``iloc[-2]`` (dc ``f47d588``): this read
+        ``raw[col].iloc[-1]``, which IS the target row today.
+        ``AgamottoTrading._process_combined`` assigns ``self.raw`` and then calls
+        ``engineer_features()`` + ``verticalize()`` back to back (trading.py:487-489),
+        and ``engineer_features`` preserves ``raw.index`` row-for-row — verified
+        empirically, 60 bars in, ``features.index.max() ==
+        vertical_features["timestamp"].max() == raw.index.max()``. So the VALUE
+        was right.
+
+        Two reasons it changed anyway, 2026-08-17:
+
+        1. It was right only because of that back-to-back coupling — precisely the
+           "two layers each believe they own the bar bookkeeping" arrangement that
+           made agamotto's positional read wrong. A label states which bar it
+           means and raises when the two disagree; a position cannot.
+        2. The NaN fallback was a genuine unconstrained forward reach, worse than
+           the one ``cb454fd`` fixed in agamotto: ``raw[col].dropna().iloc[-1]``
+           takes the last valid close ANYWHERE in ``raw``, with no at-or-before
+           constraint at all. The shared helper's fallback is masked to
+           ``index <= target_ts``.
+        """
+        return _closes_at_timestamp(
+            getattr(self, "raw", None),
+            self.config.get("SYMBOLS", []),
+            target_ts=target_ts,
+        )
 
     def _compute_size(
         self,

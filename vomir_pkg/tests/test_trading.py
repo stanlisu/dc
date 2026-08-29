@@ -79,11 +79,20 @@ def vomir(base_config):
         inst = VomirTrading(
             config=base_config, home_root="/tmp", skip_load=True)
 
+    settled_ts = pd.Timestamp("2025-01-01 00:00:00")
+    # `raw` must END at the row the classifier scores.
+    # `AgamottoTrading._process_combined` assigns `self.raw` and then re-runs
+    # `engineer_features()` + `verticalize()` in the same breath, and
+    # `engineer_features` preserves `raw.index` row-for-row — so
+    # `vertical_features["timestamp"].max()` can never run past `raw.index.max()`.
+    # The old index ("2024-12-30", "2024-12-31") stopped a day SHORT of
+    # `settled_ts`, a state `_process_combined` cannot produce; it went unnoticed
+    # because the positional `iloc[-1]` never looked at the index at all.
     inst.raw = pd.DataFrame(
         {"BTCUSDT_close": [49000.0, 50000.0]},
-        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
+        index=pd.DatetimeIndex(
+            [settled_ts - pd.Timedelta(days=1), settled_ts]),
     )
-    settled_ts = pd.Timestamp("2025-01-01 00:00:00")
     inst.vertical_features = pd.DataFrame({
         "timestamp": [settled_ts],
         "symbol": ["BINANCE_PERP_BTC_USDT"],

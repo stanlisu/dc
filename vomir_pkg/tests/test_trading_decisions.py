@@ -94,9 +94,13 @@ def _make_vomir(config_overrides=None, symbols=None, feature_cols=None):
             row[fc] = 1.0
         vf_rows.append(row)
 
+    # `raw` must END at the row the classifier scores — see the same note in
+    # test_trading.py. The old index stopped a day short of `settled_ts`, which
+    # `_process_combined` cannot produce.
     inst.raw = pd.DataFrame(
         raw_data,
-        index=pd.to_datetime(["2024-12-30", "2024-12-31"]),
+        index=pd.DatetimeIndex(
+            [settled_ts - pd.Timedelta(days=1), settled_ts]),
     )
     inst.vertical_features = pd.DataFrame(vf_rows)
     inst._data_fresh = True
