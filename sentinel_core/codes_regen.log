@@ -1,0 +1,51 @@
+
+=== 2026-08-19  regenerate codes_generated.hpp (mjolnir) + rebuild + parity ===
+who/where : Claude Code, local (darwin), dc branch phase2/feature-engine-foundation @ db014ec
+why       : header said "GENERATED ... do not edit by hand" but had drifted 13
+            entries from obfuscation/map.json since 2026-07-30; generator
+            obfuscation/gen_codes_hpp.py now exists.
+
+1. drift verified (before):
+   python3 obfuscation/gen_codes_hpp.py --namespace mjolnir \
+       --out sentinel_core/src/codes_generated.hpp --check      -> EXIT 1
+   13 pure ADDITIONS, 0 deletions, 0 modifications:
+     f101 ad_slope  f102 bb_pctb  f103 bb_width  f104 macd_norm
+     f105 macdhist_norm  f106 obv_slope  f107 sar_dist
+     f108/f109/f110 price_range_pct_q80/q90/q95
+     r073/r074/r075 high_vol_q80/q90/q95
+
+2. regenerated (--check now EXIT 0):
+   wrote sentinel_core/src/codes_generated.hpp: 110 features, 75 regimes
+   git diff --stat: 1 file changed, 13 insertions(+), 0 deletions(-)
+
+3. rebuilt: ./build_linux.sh  -> build-linux/libmjolnir_core.so (706280 B)
+   sha tag core-db014ec-dirty ; artifact leak audit: PASS (python3.13)
+   strings: none of the 13 real names present; codes f101-f110 ABSENT from the
+   .so (unreferenced constexpr compile away); used codes f069/f073 present x1.
+   .so size unchanged vs pre-change build (706280 both); only strings delta was
+   the embedded build tag (core-db014ec vs core-db014ec-dirty).
+
+4. parity harnesses (drivers built via build_parity_drivers.sh in
+   mjolnir-core-build:latest; run in a linux/amd64 python:3.11 container with
+   TA-Lib 0.6.4 taken from that same image):
+     warmup_gate_driver ... PASS
+     bar_parity ......... PASS  1122 bars x 53 fields identical
+     feature_parity ..... PASS  all 160 shared columns identical
+     regime_parity ...... PASS  all 30 regime masks identical
+     btc_cross_parity ... PASS  all 191 columns incl. 31 cross-features
+   feature_parity "NOT YET IMPLEMENTED in C++": f101-f107 (the 7 twins) +
+   the 5 return_* target columns -- reported as a gap, not a failure.
+
+BLOCKED (pre-existing, NOT caused by this change):
+ a) m1_gate / model_parity / shadow drivers cannot link:
+    build_parity_drivers.sh:152 hardcodes /usr/local/lib/lib_lightgbm.a but
+    mjolnir-core-build:latest ships only lib_lightgbm.so. Script is committed
+    and unmodified; CMakeLists.txt correctly finds the .so.
+ b) feature_parity / regime_parity / btc_cross_parity die on
+    "attempted relative import with no known parent package": since dc 3fe8e57
+    (2026-08-06) mjolnir/core/features.py line 11 does
+    `from .features_scalefree import scale_free_levels`, but
+    bar_parity.load_reference() loads it as a standalone file. Worked around
+    for THIS run with an out-of-tree shim that imports it as a package member
+    (the idiom regime_parity.py already documents for regime_filters). No repo
+    file was modified. Permanent fix still owed.

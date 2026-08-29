@@ -56,6 +56,13 @@ IFS=',' read -r -a ALGOS <<< "$ALGOS_CSV"
 VERIFIER="$SCRIPT_DIR/verify_deploy.py"
 [ -f "$VERIFIER" ] || { echo "deploy_host.sh: $VERIFIER missing — a deploy that cannot be verified is not a deploy" >&2; exit 1; }
 
+# THE shared live-process gate, also sourced by marvel/scripts/sync_all_repos.sh.
+# One definition, so the two cannot drift apart again.
+GUARD="$SCRIPT_DIR/bot_guard.sh"
+[ -f "$GUARD" ] || { echo "deploy_host.sh: $GUARD missing — a deploy that cannot check the host is not a deploy" >&2; exit 1; }
+# shellcheck source=scripts/bot_guard.sh
+. "$GUARD"
+
 # shellcheck disable=SC2086  # SSH_OPTS is a deliberate word-split option list
 ssh_run() { ssh $SSH_OPTS "$HOST" "$@"; }
 
@@ -65,23 +72,29 @@ echo "    remote base: $REMOTE_BASE"
 echo "    algos:       ${ALGOS[*]}"
 
 # ---- 1. pre-flight ---------------------------------------------------------
-echo "--- pre-flight: live bots on $HOST?"
-# LIST the matches, never `grep -c`: a bare count matches the checking pipeline
-# itself and reads 1 when the true answer is 0. Bracket the first character of
-# EVERY pattern, or the remote grep matches its own command line.
-RUNNING="$(ssh_run "ps -eo pid,etime,args | grep -E '[r]un_knull|[t]rade_execution|[m]jolnir_bridge' | grep -v ' grep '" 2>/dev/null || true)"
-if [ -n "$RUNNING" ]; then
-    echo "    LIVE BOTS on $HOST:"
-    echo "$RUNNING" | sed 's/^/      /'
+echo "--- pre-flight: live processes on $HOST?"
+# The remote command carries NO pattern — a plain `ps`, classified locally by
+# bot_guard.py. The previous version grepped on the far side for three python
+# names; measured on hydra 2026-08-28 that reported CLEAR while tsLtpShmOms
+# (venue credentials), two tsBinanceFeedPublishers, launch_sentinel_bots.py and
+# refresh_fleet_klines.sh were all running. See scripts/bot_guard.py.
+LISTING="$(ssh_run "$BOT_GUARD_PS_CMD" 2>/dev/null || true)"
+GUARD_RC=0
+printf '%s\n' "$LISTING" | bot_guard_report "$HOST" || GUARD_RC=$?
+if [ "$GUARD_RC" -ne 0 ]; then
     if [ "$ALLOW_RUNNING_BOTS" -eq 0 ]; then
         echo "    REFUSING to deploy. rsync --delete plus a pip install under a"
-        echo "    running bot can tear its import tree and break pyarmor runtime"
-        echo "    binding. Stop the bots (kill-verify-start), then redeploy."
+        echo "    running process can tear its import tree and break pyarmor"
+        echo "    runtime binding. Stop it (kill-verify-start), then redeploy."
+        exit 1
+    fi
+    # The override covers a busy host, never an unknown one: there is nothing
+    # to accept when we could not read the host's state at all.
+    if [ "$GUARD_RC" -eq 2 ]; then
+        echo "    --i-accept-a-torn-import-tree does NOT cover an unreadable host." >&2
         exit 1
     fi
     echo "    --i-accept-a-torn-import-tree given; continuing anyway."
-else
-    echo "    none running."
 fi
 
 # ---- 2. rsync --------------------------------------------------------------

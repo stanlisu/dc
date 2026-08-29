@@ -454,3 +454,70 @@ Bots: none running on hydra before or after; nothing stopped, nothing
       restarted. shield and shield2 NOT touched — both have run the
       price-row build since 06:15Z, so all three hosts now agree again.
 ========================================================================
+
+=== 2026-08-23T07:20Z — MANUAL deploy to SHIELD ONLY (validation, NOT production) ===
+Operator-authorised. Packages: agamotto, orb. Source: branch fix/orb-crosstf-and-features
+@ 93fb72c (working tree clean, verified before build).
+Host: stan@192.168.72.135 (dev135) — python /opt/miniconda3/envs/py313/bin/python
+Pre-flight: shield listed ZERO bot processes at 07:17:23Z (listed, not counted).
+Result: "deployed and VERIFIED" — verify_deploy: 2/2 OK, deployed bytes == imported bytes.
+  agamotto digest 0f1945e6e2d2fce8 | orb digest a0b7e17d6bfcca8b | map.md5 cf0b9f6d49d909830b24a07e98a7ccf1
+Acceptance probe on shield: orb.research._DERIVED_FEATURES = 58 (pre-fix 51), all 7
+  scale-free twins present, agamotto.research_filters.apply_filter_mask has sub_filter_fn.
+PRODUCTION DELIBERATELY UNTOUCHED, confirmed post-deploy: hydra 51 / no sar_dist,
+  shield2 51 / no sar_dist. CI cannot reach shield (LAN 192.168.72.135), so this deploy
+  reaches production nowhere. dc was NOT merged to main — merging main IS the deploy.
+WHY shield only: 93fb72c changes the LIVE orb gate (OrbTrading inherits OrbResearch;
+  filter_signals -> self._apply_filter_mask), and e6d9ef5 renames target-TF feature
+  columns (15m_f064 -> f064), which deployed orb metas cannot resolve. Both require an
+  orb panel rebuild + full weight re-roll BEFORE any production deploy.
+NEXT: rebuild orb panel on shield (full history; 282G local, 55T NAS /opt/stan_data),
+  validate 15m block == 47 and set(agamotto 47) - set(orb 15m) empty, then re-roll all
+  five orb arms. Merge to main only after that.
+
+=== 2026-08-26 — GATE REWRITTEN (the 2026-08-23 NEXT criterion was unpassable) ===
+The prior entry's gate — "validate 15m block == 47 and set(agamotto 47) -
+set(orb 15m) empty" — CANNOT pass, and did not describe the defect. Superseded by
+the four checks below. Evidence for each is in the same commit's session notes.
+
+WHY THE OLD GATE WAS WRONG
+1. "== 47" was a TRAINED count, not a panel count. The panel holds CANDIDATES.
+   Post-fix orb 15m carries 58 (agamotto 61); 47 is what survives Step-2
+   top-N-IC selection and is therefore NOT checkable after Step 1 at all.
+2. "set(agamotto) - set(orb 15m) empty" can NEVER hold, by design. The
+   difference is exactly f108/f109/f110 = price_range_pct_q80/q90/q95, which
+   agamotto declares as VOL_QUANTILE_FEATURES (agamotto/research.py:69-73) and
+   orb deliberately drops as FILTER-ONLY CUTOFFS (orb/research.py:382, "dropped
+   here legitimately"). Two algos, two roles for the same three columns.
+
+THE REPLACEMENT GATE — run on the rebuilt panel, before any re-roll
+  a. 7/7 scale-free twins present: f101 ad_slope, f102 bb_pctb, f103 bb_width,
+     f104 macd_norm, f105 macdhist_norm, f106 obv_slope, f107 sar_dist.
+     This is the actual defect: orb/research.py:379 records that orb "lost all
+     seven scale-free twins between 2026-08-06 and 2026-08-22".
+     NOTE: probe by CODE, never by name. The panel stores obfuscated codes, so
+     grepping "sar_dist" reads ABSENT on a GOOD panel and proves nothing.
+  b. ZERO old-style `15m_fNNN` columns — e6d9ef5 renames TARGET_TF to bare
+     `fNNN`. A single `15m_f064` means the panel predates the fix.
+  c. Non-target TFs KEEP their prefix (1h_/4h_/1d_ blocks intact, each also
+     carrying f101..f107). One name each, never both.
+  d. 58 target-TF candidate features.
+  "47 trained" is checked AFTER Step 2, not here.
+
+STATUS 2026-08-26
+  pred_orb.base.15m_1  REBUILT on shield (10:04->12:57Z, 2h53m), gate a-d PASS:
+    7/7 twins, 0 old-style, 1h/4h/1d blocks intact, 58 features, 332 filter
+    parquets on NAS. Backup of the purged S3 state:
+    shield:~/orb_backup_20260826/pred_orb.base.15m_1 (972 files).
+  pred_orb.base.{1h,4h,1d}_1  rebuilding sequentially on shield.
+  pred_orb.clean.15m_1  OUTPUT_DIR=/opt/stan_data/orb_clean_15m_1, NOT reachable
+    via run_pipeline.sh (no --variant clean); needs a direct run_orb_research.py.
+  AGAMOTTO NEEDS NO REBUILD. Verified, not assumed: its panel carries 7/7 twins
+    and 0 old-style columns, and 93fb72c's agamotto-side change is a recursion
+    hook whose own docstring states "for agamotto itself the hook is this same
+    call with the same arguments, so single-TF behaviour is byte-identical" —
+    the compound-leg defect only bites cross-TF algos.
+
+STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
+  metas still cannot resolve the renamed columns. Do not merge dc to main until
+  the re-roll is done.

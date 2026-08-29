@@ -72,7 +72,12 @@ if [ -z "$AUDIT_PY" ]; then
     echo "         Set AUDIT_PYTHON=/path/to/python3, or audit the .so on a host that has one." >&2
     exit 2
 fi
-AUDIT_OUT="$("$AUDIT_PY" "$HERE/../obfuscation/audit_public_surface.py" --repo "$HERE/build-linux" 2>&1)"; AUDIT_RC=$?
+# --binaries IS LOAD-BEARING. Without it the scanner skips `.so`/`.o`/`.a` by
+# suffix (audit_public_surface.py:58-61) and this audit reads CMakeCache.txt and
+# the build logs while never opening the library it just built -- printing PASS
+# either way. agamotto_core/build_linux.sh:117 has always passed it; this script
+# did not, so every mjolnir "artifact leak audit: PASS" since 2026-07 was vacuous.
+AUDIT_OUT="$("$AUDIT_PY" "$HERE/../obfuscation/audit_public_surface.py" --repo "$HERE/build-linux" --binaries 2>&1)"; AUDIT_RC=$?
 if [ "$AUDIT_RC" -ne 0 ]; then
     echo "FAIL: leak audit found a distinctive name in the build output." >&2
     echo "$AUDIT_OUT" >&2

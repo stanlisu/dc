@@ -52,7 +52,6 @@ class VomirTrading(AgamottoTrading):
         AgamottoResearch.__init__(self, config, home_root)
 
         self.period = config.get("WEIGHTS_PERIOD") or period
-        self.trading_mode = config.get("TRADING_MODE", "both")
         self.models: dict = {}
         self.latest_predictions = None
         self.latest_predictions_path = None
@@ -186,7 +185,16 @@ class VomirTrading(AgamottoTrading):
             price = latest_closes.get(sym, 0.0)
             size = self._compute_size(sym, price, capital, lot_sizes)
 
-            if p_long > self.long_pred_threshold and self.trading_mode in ("both", "long_only"):
+            # DIRECTION IS THE CLASSIFIER'S ANSWER. There is no config gate on
+            # it -- the same contract every other algo has, where direction
+            # comes from the regime stack's `position` column. The gate that
+            # used to stand here read the COLLIDING TRADING_MODE key, which
+            # knull's BaseExecutor reads as an execution style; neither side
+            # rejected the other's vocabulary, so "MarketMaker" in that key
+            # matched no branch and vomir traded nothing, silently, on every
+            # one of 1323 measured cells of the decision surface. See
+            # vomir_pkg/tests/test_trading_decisions.py for the measurement.
+            if p_long > self.long_pred_threshold:
                 # If both exceed threshold, take the stronger signal
                 if p_short <= self.short_pred_threshold or p_long >= p_short:
                     self.decisions[sym] = [price, size]
@@ -194,7 +202,7 @@ class VomirTrading(AgamottoTrading):
                         "LONG  %s — P(L)=%.3f  P(S)=%.3f  size=%s",
                         sym, p_long, p_short, size,
                     )
-            elif p_short > self.short_pred_threshold and self.trading_mode in ("both", "short_only"):
+            elif p_short > self.short_pred_threshold:
                 self.decisions[sym] = [price, -size]
                 logger.info(
                     "SHORT %s — P(L)=%.3f  P(S)=%.3f  size=%s",

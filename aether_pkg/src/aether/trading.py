@@ -50,7 +50,6 @@ class AetherTrading(AetherResearch):
     ) -> None:
         super().__init__(config, home_root)
         self.period = self.config.get("WEIGHTS_PERIOD") or period
-        self.trading_mode = self.config.get("TRADING_MODE", "both")
         self.models: Dict[str, dict] = {}
         self.regime_stack: List[dict] = []
         self.decisions: Dict[str, list] = {}

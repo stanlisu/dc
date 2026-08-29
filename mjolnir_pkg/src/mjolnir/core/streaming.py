@@ -205,10 +205,19 @@ def stream_filter_parquets(
         )
     # Import here to avoid circular — _DEFAULT_FEATURE_WINDOWS is a constant
     # defined in research.py.
-    from .research import _DEFAULT_FEATURE_WINDOWS
+    from .research import (_DEFAULT_FEATURE_WINDOWS,
+                           resolve_fill_zero_trade,
+                           resolve_ta_price_source)
     feature_windows = list(_DEFAULT_FEATURE_WINDOWS)
     time_unit = cfg.get("TIME_UNIT", "5s")
     bar_tf = "5s" if cfg.get("TRAIN_BARS_DIR") else time_unit
+    # Required, no default. Bars built without the zero-trade price ffill carry
+    # genuine NaN prices; a blanket fillna(0.0) over those pins 21 TA columns
+    # to exactly 0.0 for the rest of the series. Mirrors engineer_features.
+    zero_fill_prices = resolve_fill_zero_trade(cfg)
+    # Required, no default — see resolve_ta_price_source. Mirrors
+    # engineer_features; the TARGET's price source is unaffected.
+    ta_price_source = resolve_ta_price_source(cfg)
 
     feat_engine = MjolnirFeatures(
         feature_windows=feature_windows,
@@ -216,6 +225,8 @@ def stream_filter_parquets(
         fee_rate=fee_rate,
         bar_tf=bar_tf,
         target_tf=time_unit,
+        zero_fill_prices=zero_fill_prices,
+        ta_price_source=ta_price_source,
     )
 
     multi_tfs = list(multi_tf_bars.keys())
@@ -227,6 +238,8 @@ def stream_filter_parquets(
             prefix=tf,
             bar_tf=tf,
             target_tf=tf,
+            zero_fill_prices=zero_fill_prices,
+            ta_price_source=ta_price_source,
         )
         for tf in multi_tfs
     }

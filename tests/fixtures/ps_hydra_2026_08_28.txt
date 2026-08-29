@@ -1,0 +1,57 @@
+      1  6-11:26:28 /sbin/init
+    282  6-11:26:26 /sbin/multipathd -d -s
+    285  6-11:26:26 /lib/systemd/systemd-udevd
+    491  6-11:26:24 /lib/systemd/systemd-networkd
+    493  6-11:26:24 /lib/systemd/systemd-resolved
+    538  6-11:26:22 /usr/sbin/acpid
+    540  6-11:26:22 @dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+    547  6-11:26:22 /usr/sbin/irqbalance --foreground
+    548  6-11:26:22 /usr/bin/python3 /usr/bin/networkd-dispatcher --run-startup-triggers
+    549  6-11:26:22 /usr/sbin/rsyslogd -n -iNONE
+    550  6-11:26:22 /snap/amazon-ssm-agent/13349/amazon-ssm-agent
+    555  6-11:26:22 /lib/systemd/systemd-logind
+    582  6-11:26:22 /usr/sbin/chronyd -F 1
+    607  6-11:26:22 /usr/sbin/chronyd -F 1
+    610  6-11:26:22 s3fs tardis-stan-data /mnt/tardis-stan-data -o rw,passwd_file=/home/ubuntu/.passwd-s3fs,url=https://s3.ap-northeast-1.amazonaws.com,endpoint=ap-northeast-1,use_path_request_style,allow_other,uid=1000,gid=1000,umask=022,dev,suid
+    611  6-11:26:22 s3fs optimus-tardis-data /mnt/tardis -o ro,passwd_file=/home/ubuntu/.passwd-s3fs,url=https://s3.ap-northeast-1.amazonaws.com,endpoint=ap-northeast-1,use_path_request_style,allow_other,uid=1000,gid=1000,umask=022,dev,suid
+    615  6-11:26:22 s3fs optimus-stan-binance-data /mnt/optimus-stan-binance-data -o ro,passwd_file=/home/ubuntu/.passwd-s3fs,url=https://s3-ap-northeast-1.amazonaws.com,use_path_request_style,uid=1000,gid=1000,umask=0002,allow_other,dev,suid
+    617  6-11:26:22 s3fs tardis-data-archive /mnt/tardis-data-archive -o ro,allow_other,passwd_file=/home/ubuntu/.passwd-s3fs,uid=1000,gid=1000,mp_umask=002,umask=0022,dev,suid
+    652  6-11:26:21 /usr/sbin/cron -f -P
+    665  6-11:26:21 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
+    675  6-11:26:21 /sbin/agetty -o -p -- \u --keep-baud 115200,57600,38400,9600 ttyS0 vt220
+    682  6-11:26:21 /sbin/agetty -o -p -- \u --noclear tty1 linux
+    690  6-11:26:21 /usr/libexec/polkitd --no-debug
+    737  6-11:26:21 sshd: /usr/sbin/sshd -D -o AuthorizedKeysCommand /usr/share/ec2-instance-connect/eic_run_authorized_keys %u %f -o AuthorizedKeysCommandUser ec2-instance-connect [listener] 0 of 10-100 startups
+   1882  6-11:18:07 /lib/systemd/systemd --user
+   1883  6-11:18:07 (sd-pam)
+  62975  6-05:09:33 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+ 598913    13:23:49 /opt/bin/tsBinanceFeedPublisher -f /opt/infra_configs/feed_publisher_p1.json
+ 598915    13:23:49 /opt/bin/tsBinanceFeedPublisher -f /opt/infra_configs/feed_publisher_p2.json
+1286380  2-20:01:38 bash -c cd /home/stan/sandbox/marvel && PYTHONPATH=agamotto_pkg/src:. python3 gauntlet/launch_sentinel_bots.py --algo agamotto.base.15m_1 --account LTP --shards 2 --order-path-symbols BTCUSDT --order-path-dry-run false --order-path-selftest 2>&1 | grep -E 'ORDER PATH|SELF TEST|started 2|advancing'; date -u +%H:%M:%SZ
+1286381  2-20:01:38 python3 gauntlet/launch_sentinel_bots.py --algo agamotto.base.15m_1 --account LTP --shards 2 --order-path-symbols BTCUSDT --order-path-dry-run false --order-path-selftest
+1286382  2-20:01:38 grep -E ORDER PATH|SELF TEST|started 2|advancing
+1286562  2-20:01:20 bash -lc cd /home/stan/agamotto_test && setsid nohup /bin/bash ./refresh_fleet_klines.sh > fleet_refresher.log 2>&1 < /dev/null & sleep 3; if [ -f fleet_refresher.pid ] &&    kill -0 $(cat fleet_refresher.pid) 2>/dev/null; then   echo 'refresher: STARTED (pid '$(cat fleet_refresher.pid)')'; else echo 'refresher: FAILED TO START'; exit 1; fi
+1286564  2-20:01:20 /bin/bash ./refresh_fleet_klines.sh
+1410712  2-19:09:03 /usr/sbin/zabbix_agentd --foreground
+1410715  2-19:09:03 /usr/sbin/zabbix_agentd: collector [idle 1 sec]
+1410716  2-19:09:03 /usr/sbin/zabbix_agentd: listener #1 [waiting for connection]
+1410717  2-19:09:03 /usr/sbin/zabbix_agentd: listener #2 [waiting for connection]
+1410718  2-19:09:03 /usr/sbin/zabbix_agentd: listener #3 [waiting for connection]
+1410719  2-19:09:03 /usr/sbin/zabbix_agentd: active checks #1 [idle 1 sec]
+1431590  5-12:40:10 /usr/libexec/packagekitd
+2909173    17:53:49 /opt/bin/tsLtpShmOms -f /opt/infra_configs/oms_ltp_config.json
+2920568    01:21:41 /usr/sbin/updatedb.plocate
+3404396  3-11:25:45 /snap/snapd/current/usr/lib/snapd/snapd
+3404454  3-11:25:45 /lib/systemd/systemd-journald
+3509418       06:20 sshd: stan [priv]
+3509520       06:19 sshd: stan@notty
+3509522       06:19 bash -c cd /tmp && nohup python3 rest_roll_probe.py /tmp/arm_setting.json 15 > /tmp/rest_roll.out 2>&1 & echo "started pid $!"
+3509523       06:19 python3 rest_roll_probe.py /tmp/arm_setting.json 15
+3636654       00:25 sleep 60
+3638915       00:07 sshd: stan [priv]
+3638962       00:06 sshd: stan@notty
+3638963       00:06 bash -c python3 - <<"EOF" import json,time,urllib.request def k(sym,limit=3):     u=f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval=1m&limit={limit}"     return json.load(urllib.request.urlopen(u,timeout=8)) # wait for a fresh boundary T=(time.time()//60+1)*60 time.sleep(T-time.time()+1.0) now=time.time() for sym in ["BTCUSDT","ETHUSDT","HBARUSDT","LTCUSDT"]:     r=k(sym)     opens=[int(x[0])//1000 for x in r]     print(f"{sym:10} now={now:.2f} T={int(T)} opens={opens} newest-T={opens[-1]-int(T)} ntrades={[x[8] for x in r]}") EOF
+3638964       00:06 python3 -
+3641131       00:01 sshd: stan [priv]
+3641178       00:01 sshd: stan@notty
+3641179       00:00 ps -eo pid,etime,args=

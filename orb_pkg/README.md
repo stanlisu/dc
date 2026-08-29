@@ -65,7 +65,6 @@ Orb-specific `setting.json` keys (in addition to standard Agamotto config):
 | `TIMEFRAMES` | `["15m","1h","4h","1d"]` | All TFs to merge |
 | `BASE_TF` | `"1h"` | Must equal TARGET_TF (prevents data leakage) |
 | `WINDOW_SIZE` | `4` | Rolling window size (not 12 like base Agamotto) |
-| `TRADING_MODE` | `"both"` | `"long"`, `"short"`, or `"both"` |
 | `RETAIN_THRESHOLD` | (float) | Early close signal threshold (asymmetric) |
 | `LONG_PRED_THRESHOLD` | `0.0` | Threshold for long predictions |
 | `SHORT_PRED_THRESHOLD` | `0.0` | Threshold for short predictions |

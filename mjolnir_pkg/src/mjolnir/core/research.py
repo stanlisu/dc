@@ -18,7 +18,7 @@ import pandas as pd
 import pyarrow as pa  # noqa: F401  -- imported here so missing pyarrow fails at import time
 import pyarrow.parquet as pq
 
-from .features import MjolnirFeatures, _TF_SECONDS
+from .features import MjolnirFeatures, TA_PRICE_SOURCES, _TF_SECONDS
 from .loader import MjolnirLoader
 from .aligner import StreamAligner
 from .multi_tf_merge import merge_cross_tf_features
@@ -56,6 +56,155 @@ def _filter_parquet_filenames(
             continue
         out.append(f)
     return out
+
+
+def resolve_ta_price_source(config: Dict) -> str:
+    """Read the REQUIRED ``TA_PRICE_SOURCE`` key from setting.json.
+
+    No default. The key decides which price every TA-Lib indicator is computed
+    on: ``"close"`` (the last TRADE price — today's behaviour and the live
+    convention) or ``"book_mid"`` (``(bids_0_price + asks_0_price) / 2``, the
+    book_snapshot_25 level-0 mid).
+
+    It exists because the two choices are not interchangeable under
+    ``FILL_ZERO_TRADE=false``: a zero-trade bar has NO trade price, TA-Lib
+    propagates the resulting NaN to the end of the series, and 21 indicator
+    columns go 99.7% NaN on XMRUSDT / 53.4% on SOLUSDT and are dropped by the
+    IC screen. The book is quoted on 100% of bars, so ``"book_mid"`` is dense
+    without fabricating anything. Guessing the key would silently decide which
+    price a whole corpus of features was built on.
+    """
+    if "TA_PRICE_SOURCE" not in config:
+        raise KeyError(
+            "setting.json is missing TA_PRICE_SOURCE. It is required and has "
+            "no default: it selects the price every TA-Lib indicator is "
+            f"computed on, one of {list(TA_PRICE_SOURCES)}. \"close\" is the "
+            "last trade price (today's behaviour); \"book_mid\" is the "
+            "book_snapshot_25 level-0 mid, which is the only source that stays "
+            "dense when FILL_ZERO_TRADE=false."
+        )
+    val = config["TA_PRICE_SOURCE"]
+    if not isinstance(val, str) or val not in TA_PRICE_SOURCES:
+        raise ValueError(
+            f"TA_PRICE_SOURCE must be one of {list(TA_PRICE_SOURCES)}, got "
+            f"{val!r} ({type(val).__name__})."
+        )
+    return val
+
+
+def resolve_fill_zero_trade(config: Dict) -> bool:
+    """Read the REQUIRED ``FILL_ZERO_TRADE`` key from setting.json.
+
+    No default. The key decides whether a zero-trade bar carries the previous
+    bar's price (``true`` — the historical convention) or is left NaN
+    (``false``). Guessing it here would either erase a no-fill rebuild or
+    poison a filled corpus, and both failures are invisible in the output.
+    It must match the value the bars in ``BARS_DIR`` were BUILT with
+    (marvel ``mjolnir/gauntlet/build_bars.py``).
+    """
+    if "FILL_ZERO_TRADE" not in config:
+        raise KeyError(
+            "setting.json is missing FILL_ZERO_TRADE. It is required and has "
+            "no default: it selects whether a zero-trade bar carries the "
+            "previous bar's price (true, the historical convention) or stays "
+            "NaN (false). Set it to the value the bars in BARS_DIR were built "
+            "with by mjolnir/gauntlet/build_bars.py."
+        )
+    val = config["FILL_ZERO_TRADE"]
+    if not isinstance(val, bool):
+        raise TypeError(
+            f"FILL_ZERO_TRADE must be a JSON boolean, got {val!r} "
+            f"({type(val).__name__}). A truthy string such as \"false\" would "
+            "silently select the fill path."
+        )
+    return val
+
+
+def _assert_nan_prices_are_zero_trade(df: pd.DataFrame, label: str) -> None:
+    """Audit bars loaded under ``FILL_ZERO_TRADE=false``.
+
+    Under the no-fill convention the ONLY legitimate NaN price is on a bar that
+    had no trade, and conversely a bar that had no trade must NOT already carry
+    a price. Both directions are checked, because both silently defeat the
+    experiment: an unexplained NaN means damaged bars the legacy loader would
+    have papered over, and a priced zero-trade bar means the corpus on disk was
+    built WITH the fill, so a whole no-fill rebuild would measure nothing.
+    """
+    if "has_trade" not in df.columns:
+        raise RuntimeError(
+            f"{label}: FILL_ZERO_TRADE=false but these bars carry no "
+            "`has_trade` column, so they predate "
+            "StreamAligner(fill_zero_trade=...) and were built with the price "
+            "ffill baked in. Loading them under a no-fill tree would measure "
+            "the OLD convention while claiming the new one. Rebuild the bars "
+            "with build_bars.py, or set FILL_ZERO_TRADE=true."
+        )
+    has_trade = df["has_trade"].astype(bool)
+    price_cols = [c for c in ("open", "high", "low", "close", "vwap")
+                  if c in df.columns]
+
+    unexplained = pd.Series(False, index=df.index)
+    for col in price_cols:
+        unexplained |= df[col].isna() & has_trade
+    n_unexplained = int(unexplained.sum())
+    if n_unexplained:
+        first = df.index[unexplained][0]
+        raise RuntimeError(
+            f"{label}: FILL_ZERO_TRADE=false, but {n_unexplained} bar(s) have "
+            f"a NaN price on a has_trade=True row (first at {first}). A NaN "
+            "price is only legitimate where the bar had no trade; the legacy "
+            "loader would have forward-filled these silently. The bars are "
+            "damaged or mis-built — rebuild them."
+        )
+
+    if "close" in df.columns:
+        prefilled = (~has_trade) & df["close"].notna()
+        n_prefilled = int(prefilled.sum())
+        if n_prefilled:
+            first = df.index[prefilled][0]
+            raise RuntimeError(
+                f"{label}: FILL_ZERO_TRADE=false, but {n_prefilled} zero-trade "
+                f"bar(s) already carry a close price (first at {first}). These "
+                "bars were built WITH the zero-trade ffill, so loading them "
+                "under a no-fill tree would silently reproduce the old "
+                "convention and make the rebuild invisible. Point BARS_DIR at "
+                "a no-fill build, or set FILL_ZERO_TRADE=true."
+            )
+
+
+def _apply_zero_trade_policy(
+    df: pd.DataFrame,
+    label: str,
+    fill_zero_trade: bool,
+) -> pd.DataFrame:
+    """Apply the configured zero-trade price policy to freshly loaded bars.
+
+    build_bars.py already resolved zero-trade bars at BUILD time; this exists
+    because a load concatenates many daily parquets and because the historical
+    loader unconditionally re-ran the identical ffill here. Under
+    ``fill_zero_trade=False`` that re-fill would silently undo an entire
+    no-fill rebuild — every downstream feature would come out identical to
+    before — so the fill is skipped and the bars are audited instead.
+    """
+    if "close" not in df.columns:
+        return df
+
+    if fill_zero_trade:
+        df["close"] = df["close"].ffill()
+        no_trade = df["n_trades"].isna() if "n_trades" in df.columns \
+            else pd.Series(False, index=df.index)
+        for col in ["open", "high", "low", "vwap"]:
+            if col in df.columns:
+                df.loc[no_trade, col] = df.loc[no_trade, "close"]
+    else:
+        _assert_nan_prices_are_zero_trade(df, label)
+
+    # Flow columns are zero-filled in BOTH modes — 0.0 is the true value for
+    # "no activity", not a stand-in. Mirrors aligner._agg_trades.
+    for col in ["volume", "n_trades", "buy_vol", "sell_vol", "trade_imbalance"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+    return df
 
 
 # Columns excluded from ML feature selection (mirrors rolling_predict_returns.py)
@@ -166,6 +315,9 @@ class MjolnirResearch:
         If ``BARS_DIR`` is set in config, that directory is used instead,
         allowing multiple horizon experiments to share one set of bar files.
         """
+        # Required, no default — see resolve_fill_zero_trade. Read FIRST so a
+        # misconfigured tree fails before any I/O rather than after a long load.
+        fill_zero_trade = resolve_fill_zero_trade(self.config)
         out_dir = self._resolve_out_dir()
         # TRAIN_BARS_DIR: optional override for the training base bars directory.
         # Used when the experiment trains at a finer resolution than TIME_UNIT
@@ -210,19 +362,9 @@ class MjolnirResearch:
             if frames:
                 combined = pd.concat(frames).sort_index()
                 combined = combined[~combined.index.duplicated(keep="last")]
-                # Forward-fill OHLCV for zero-trade bars (no trades in a 5s window
-                # → NaN OHLCV, which cascades into all TA features and breaks
-                # Ridge/ElasticNet). Standard convention: carry last traded price.
-                if "close" in combined.columns:
-                    combined["close"] = combined["close"].ffill()
-                    no_trade = combined["n_trades"].isna() if "n_trades" in combined.columns \
-                        else pd.Series(False, index=combined.index)
-                    for col in ["open", "high", "low", "vwap"]:
-                        if col in combined.columns:
-                            combined.loc[no_trade, col] = combined.loc[no_trade, "close"]
-                    for col in ["volume", "n_trades", "buy_vol", "sell_vol", "trade_imbalance"]:
-                        if col in combined.columns:
-                            combined[col] = combined[col].fillna(0.0)
+                combined = _apply_zero_trade_policy(
+                    combined, f"base bars {native}", fill_zero_trade
+                )
                 self._symbol_bars[native] = combined
                 logger.info("Loaded %d bars for %s", len(combined), native)
 
@@ -293,19 +435,11 @@ class MjolnirResearch:
                     if frames:
                         combined_tf = pd.concat(frames).sort_index()
                         combined_tf = combined_tf[~combined_tf.index.duplicated(keep="last")]
-                        if "close" in combined_tf.columns:
-                            combined_tf["close"] = combined_tf["close"].ffill()
-                            no_trade_tf = combined_tf["n_trades"].isna() \
-                                if "n_trades" in combined_tf.columns \
-                                else pd.Series(False, index=combined_tf.index)
-                            for col in ["open", "high", "low", "vwap"]:
-                                if col in combined_tf.columns:
-                                    combined_tf.loc[no_trade_tf, col] = \
-                                        combined_tf.loc[no_trade_tf, "close"]
-                            for col in ["volume", "n_trades", "buy_vol",
-                                        "sell_vol", "trade_imbalance"]:
-                                if col in combined_tf.columns:
-                                    combined_tf[col] = combined_tf[col].fillna(0.0)
+                        combined_tf = _apply_zero_trade_policy(
+                            combined_tf,
+                            f"cross-TF bars {native} TF={tf}",
+                            fill_zero_trade,
+                        )
                         tf_sym_bars[native] = combined_tf
                         logger.info(
                             "Loaded %d bars for %s TF=%s", len(combined_tf), native, tf
@@ -349,12 +483,23 @@ class MjolnirResearch:
         # base regardless of TIME_UNIT (which controls the target boundary).
         bar_tf = "5s" if cfg.get("TRAIN_BARS_DIR") else time_unit
 
+        # The two halves of the zero-trade decision are ONE switch: bars built
+        # without the price ffill carry genuine NaN prices, and a blanket
+        # fillna(0.0) in features would pin 21 TA columns to exactly 0.0 for
+        # the rest of the series — strictly worse than the fill it replaced.
+        zero_fill_prices = resolve_fill_zero_trade(cfg)
+        # Required, no default. Which price the TA indicators ride on; the
+        # TARGET is untouched by it (it stays on the book_ticker mid_price).
+        ta_price_source = resolve_ta_price_source(cfg)
+
         feat_engine = MjolnirFeatures(
             feature_windows=feature_windows,
             target_horizon=target_horizon,
             fee_rate=fee_rate,
             bar_tf=bar_tf,
             target_tf=time_unit,
+            zero_fill_prices=zero_fill_prices,
+            ta_price_source=ta_price_source,
         )
 
         # BTC must be processed first so cross-features are available for other symbols
@@ -377,6 +522,8 @@ class MjolnirResearch:
                 prefix=tf,
                 bar_tf=tf,
                 target_tf=tf,
+                zero_fill_prices=zero_fill_prices,
+                ta_price_source=ta_price_source,
             )
             for tf in multi_tfs
         }

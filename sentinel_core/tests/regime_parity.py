@@ -68,7 +68,8 @@ def main() -> int:
     bars = ref_bars_df(load_reference(Path(args.ref_bar)), events)
     feat_mod = load_reference(Path(args.ref_feat))
     fe = feat_mod.MjolnirFeatures(feature_windows=[30, 60, 300, 900],
-                                  bar_tf="5s", target_tf="5s")
+                                  bar_tf="5s", target_tf="5s",
+                                  ta_price_source="close")
     panel = fe.compute(bars)
     assert_reference_used_talib(panel, "reference panel")
 

@@ -26,6 +26,7 @@ Two things happen in this repo, and only here:
 | `obfuscation/` | Codec, inventory extractor, map builder, vendor sync |
 | `build_distribution.sh` | The single front door for build + deploy |
 | `scripts/deploy_host.sh` | One host, end to end: pre-flight → rsync → editable install → verify. Shared by `build_distribution.sh` and CI |
+| `scripts/bot_guard.sh` / `scripts/bot_guard.py` | THE pre-deploy gate: is this host running anything? Sourced by `deploy_host.sh` **and** by marvel's `scripts/sync_all_repos.sh` |
 | `scripts/verify_deploy.py` | The post-deploy gate. Runs on the target; proves the deployed bytes are the imported bytes |
 | `deploy.log` | **Append one entry per deploy** (see Logging below) |
 | `conftest.py` / `pytest.ini` | Regenerate map + vendored codec before every test session |
@@ -111,6 +112,46 @@ ssh shield '/opt/miniconda3/envs/py313/bin/python - /home/stan/sandbox/marvel' \
   note: CI rsynced and reinstalled all nine packages on hydra at
   2026-08-09 03:42Z while `run_knull.py` had been live with real money since
   2026-08-08 07:11Z.
+
+### The pre-deploy gate (`scripts/bot_guard.sh`)
+
+`deploy_host.sh` and marvel's `scripts/sync_all_repos.sh` **source the same
+file** — they used to carry two copies of one pattern, and both were wrong.
+marvel sources it from `${dc_root}/scripts/bot_guard.sh`; it lives here, not in
+marvel, because `.github/workflows/deploy.yml` checks out only dc.
+
+```bash
+. "$(dirname "$0")/bot_guard.sh"
+listing="$(ssh "$host" "$BOT_GUARD_PS_CMD" 2>/dev/null)"
+printf '%s\n' "$listing" | bot_guard_report "$host"     # or bot_guard_classify
+```
+
+Exit codes, which are the API: `0` clear · `1` TRADING/OPS (hard stop) ·
+`3` RESEARCH only · `2` listing unusable · `4` classifier missing.
+
+**Three classes, never one boolean.** A live trading process holds venue
+credentials and a mapped import tree — stop. A research job is also a reason to
+refuse (a `pip install -e` mid-run corrupts it) but the operator may prefer to
+wait it out, and cannot decide that if the gate only says "busy".
+
+**The remote command carries no pattern.** It ships a plain `ps` back and
+classifies locally by resolving `argv[0]` — a binary by basename (plus
+`/opt/bin/ts*` and `/opt/releases/*/bin/...`), an interpreter by the script it
+runs, and a `bash -c '<string>'` **not at all**. Reading a command line for a
+pattern counts the pipeline that asked the question; marvel's
+`tasks/lessons.md` (2026-08-05, 2026-08-24, 2026-08-26) records five wait-loops
+lost to that in one session, one of them spinning six days on hydra.
+`gauntlet/start_oms.py` in marvel is the reference implementation.
+
+**Why it was rewritten (2026-08-28).** Both gates matched three python names,
+`run_knull|trade_execution|mjolnir_bridge`. Measured on hydra while that gate
+reported the host CLEAR: `/opt/bin/tsLtpShmOms` (16h52m, holds the venue
+credentials), two `/opt/bin/tsBinanceFeedPublisher`, `agamotto_bridge.py`, two
+`/opt/releases/.../bin/Release/tsLtpBaseAlgo`, `launch_sentinel_bots.py
+--order-path-dry-run false`, and `refresh_fleet_klines.sh`; and on shield,
+`rolling_predict_returns.py --workers 20` at load 6.5. Covered by
+`tests/test_bot_guard.py`, whose every detection test is paired with a mutant
+reverting to the three-name pattern.
 - **`shield`'s python is `/opt/miniconda3/envs/py313`**, not `~/miniconda3`
   (hydra and shield2 use `~/miniconda3/envs/py313`).
 - **`shield` is the host `deploy.yml` cannot reach** — it is a LAN address
