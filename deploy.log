@@ -521,6 +521,8 @@ STATUS 2026-08-26
 STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
   metas still cannot resolve the renamed columns. Do not merge dc to main until
   the re-roll is done.
+  [SUPERSEDED 2026-09-03 — the PREMISE was wrong; the block was never satisfied,
+   it never applied. Evidence in the 2026-09-03 entry at the end of this log.]
 2026-08-31T01:08:42Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
 2026-08-31T01:31:45Z  deploy 9 algos -> hydra shield shield2  (via scripts/sync_all_repos.sh)  skipped: none  failed: none
 2026-09-01T06:02:17Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
@@ -551,3 +553,39 @@ STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
         merging dc to main auto-deploys to hydra and shield2.
   SCOPE: shield only, for the pred_orb.ic5.15m_1 research arm. Branch
     fix/orb-vol-quantile-carry on both shield (7cb786e) and local (23e5268).
+2026-09-03T02:03:23Z  deploy 9 algos -> shield shield2  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
+
+2026-09-03T02:27:16Z  UNBLOCK fix/orb-vol-quantile-carry for main  (analysis only, no deploy yet)
+  The two reasons recorded in the 2026-09-01 entry above were BOTH re-checked and
+  BOTH fail. The branch was held for a blocker that does not exist.
+
+  (1) "the five orb arms are not yet re-rolled / metas cannot resolve the renamed
+      columns" — FALSE ON EVERY ARM. Scanned feature_columns in every ridge_meta.pkl
+      of each arm's latest window on /mnt/tardis-stan-data:
+        base.15m_1  window_2026_08_31   33 legs   own-TF(15m_) cols = 0
+        base.1h_1   window_2026_07_31  304 legs   own-TF(1h_)  cols = 0
+        base.4h_1   window_2026_07_31  299 legs   own-TF(4h_)  cols = 0
+        base.1d_1   window_2026_07_31  275 legs   own-TF(1d_)  cols = 0
+        ic5.15m_1   window_2026_08_31  299 legs   own-TF(15m_) cols = 0
+      Base-TF features are ALREADY bare (f065, f057, f103) with only cross-TF ones
+      prefixed (1h_f039, 4h_f069) — i.e. already the post-e6d9ef5 form. There is no
+      prefixed column left for a rename to break.
+      The metas also POSTDATE the rename: e6d9ef5 is 2026-08-23; the metas were
+      written 2026-08-28..08-30. They were never pre-rename artifacts.
+
+  (2) "hydra is running 3 live knull bots" — NOT ANYMORE. hydra and shield2 both
+      show zero run_knull/trade_execution/mjolnir_bridge processes; both on main.
+
+  AND the branch renames NOTHING: diff vs main is 130 insertions / 0 deletions.
+  research.py adds one line, _RAW_COLUMNS += list(VOL_QUANTILE_FEATURES), exposing
+  price_range_pct_q80/q90/q95. Those cannot reach a model: marvel
+  gauntlet/rolling_predict_returns.py:1358 excludes all three by name and :1365
+  extends the exclusion to their obfuscated codes. No code renumbering either —
+  obfuscation/build_map.py:4-12 is stable/append-only and price_range_pct_q80
+  already holds f108 in the committed map.json.
+
+  A separate orb re-roll was started on shield2 this session and then DROPPED by
+  directive. It got through 1d only (rc=0): 1d filter panels now end 2026-08-30
+  (were 2026-08-03) and 24 net-new legs were written into 1d window_2026_07_31
+  alongside the 251 originals from 08-28. 4h/1h/15m untouched. Nothing live reads
+  any of it. The 2026-09 klines staged aside for that run were fully restored.
