@@ -12,6 +12,7 @@ import pandas as pd
 from agamotto import AgamottoResearch
 from agamotto.features_scalefree import SCALE_FREE_FEATURES
 from agamotto.ladder import compute_ladder_multiplier, ladder_params
+from agamotto.research import VOL_QUANTILE_FEATURES
 from agamotto.utils import _symbol_to_native
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,31 @@ _RAW_COLUMNS = [
     "taker_buy_base_volume", "taker_buy_quote_volume",
     "mvg1", "mvg2", "mvg3",
 ]
+
+# FILTER-ONLY trailing vol-quantile CUTOFFS. agamotto's `high_vol_q80/q90/q95`
+# atoms compare `price_range_pct` against these per-symbol cutoffs
+# (agamotto/research_filters.py:102-104), so a regime naming one is unevaluable
+# without them. orb ALREADY COMPUTES THEM: engineer_features() delegates per TF
+# to AgamottoResearch, whose engineer_features writes `{native}_price_range_pct_q80`
+# ... into that TF's wide frame. They were simply absent from BOTH carry lists, so
+# _remap_for_tf's `filter_cols` (= _RAW_COLUMNS | _DERIVED_FEATURES) never exposed
+# the bare alias and _apply_filter_mask raised "requires column
+# 'price_range_pct_q80'" on 144 of agamotto's 177 regimes (243 of 299 stack rows).
+# Same failure SHAPE as the seven scale-free twins above: computed, then dropped
+# by a list that did not name them.
+#
+# THEY BELONG HERE, NOT IN _DERIVED_FEATURES. They GATE ENTRY and are not model
+# inputs -- gauntlet/rolling_predict_returns.py:1358 excludes all three by name
+# AND by TF-stripped/obfuscated alias, and its comment says so outright ("they
+# GATE ENTRY, they are not model inputs ... Excluded HERE, not deleted in dc").
+# _RAW_COLUMNS carries them unprefixed from TARGET_TF, which is the only
+# timeframe agamotto's single-TF regimes read; _DERIVED_FEATURES would instead
+# mint 12 TF-prefixed copies that every consumer then has to exclude again.
+#
+# APPENDED FROM THE CANONICAL LIST, never re-typed here: a second hardcoded copy
+# drifting from agamotto.research.VOL_QUANTILE_FEATURES is exactly the defect
+# this repairs. Order follows VOL_Q_LEVELS (asserted in agamotto's tests).
+_RAW_COLUMNS += list(VOL_QUANTILE_FEATURES)
 
 _RETURN_COLUMNS = [
     "return", "return_long", "return_short",
