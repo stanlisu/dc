@@ -16,11 +16,12 @@ obfuscation/inventory.err
 # keep, not this.
 pyarmor.bug.log
 
-# sentinel_core cross-build output (artifact, never source-controlled)
+# sentinel_core / agamotto_core cross-build output (artifact, never
+# source-controlled)
 sentinel_core/build-linux/
+sentinel_core/build/
 agamotto_core/build-linux/
 agamotto_core/build/
-sentinel_core/build/
 
 # Core dumps from running the linux/amd64 drivers under qemu on an arm64 host.
 # Two land per crash: qemu dumps the emulated guest as qemu_<prog>_<stamp>.core,
