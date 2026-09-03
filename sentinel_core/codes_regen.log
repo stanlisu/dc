@@ -49,3 +49,59 @@ BLOCKED (pre-existing, NOT caused by this change):
     for THIS run with an out-of-tree shim that imports it as a package member
     (the idiom regime_parity.py already documents for regime_filters). No repo
     file was modified. Permanent fix still owed.
+
+=== 2026-08-20  permanent fix for BLOCKED (b): package-member reference load ===
+who/where : Claude Code, local (darwin, docker linux/amd64), dc worktree
+            claude/sad-allen-051dfb @ 6b236c5
+why       : the 2026-08-19 workaround was out-of-tree, so feature_parity /
+            regime_parity / btc_cross_parity stayed dead in the repo — every
+            run since dc 3fe8e57 (2026-08-06) died on
+            "attempted relative import with no known parent package" at
+            mjolnir/core/features.py:11.
+
+1. change (4 files, tests/ only; no C++, no reference source touched):
+   tests/bar_parity.py  + _package_qualname()  + load_reference_pkg()
+     - walks UP the __init__.py chain from the target file: the first parent
+       WITHOUT __init__.py is the sys.path src root, the rest form the dotted
+       name (.../mjolnir_pkg/src + mjolnir.core.features).
+     - load_reference() kept AS IS and documented as the standalone loader.
+       knull/ is a package too, so an "always import as a package member"
+       change would have altered the load path of the one currently-green
+       harness; bar_parity was left on the path that passes.
+   tests/{feature,regime,btc_cross}_parity.py: --ref-feat now goes through
+     load_reference_pkg. No CLI change — the src root is discovered, not
+     passed — so README invocations are unchanged. regime_parity keeps
+     --pkg-src: it still locates obfuscation/map.json through it.
+
+2. no silent fallbacks (CLAUDE.md). Three explicit fail-fasts, all exercised:
+     file not inside a package  -> "BLOCKED: ... is not inside a package"
+     ImportError on the import  -> "BLOCKED: cannot import mjolnir.core.features",
+       naming pyarrow, since the package path runs mjolnir/core/__init__.py ->
+       research -> pyarrow, which the old standalone load never needed
+     shadowed by another copy    -> "BLOCKED: ... resolved to /shadow/...",
+       so a stray installed mjolnir cannot be graded in place of the checkout
+
+3. drivers rebuilt from the committed recipe (no hand-rolled g++):
+   SENTINEL_REPO=~/Documents/sandbox/sentinel ./build_parity_drivers.sh \
+       feature_parity regime_parity btc_cross_parity bar_parity
+   image mjolnir-core-build:latest, sha 6b236c5, 4 drivers into build-linux/.
+
+4. prerequisites: mjolnir/_obf generated (build_map.py -> 75 regimes /
+   110 features, unchanged vs committed map.json; sync_vendor.py -> 8 pkgs).
+   Reference env = linux/amd64 python:3.11 + numpy/pandas/pyarrow + TA-Lib
+   0.6.4 wrapper built against the C library lifted out of
+   mjolnir-core-build:latest ("0.6.4 (Jul 29 2026 06:04:13)").
+
+5. harnesses, all four run against the drivers above:
+     bar_parity ......... PASS  1122 bars x 53 fields identical  (NOT regressed)
+     feature_parity ..... PASS  all 160 shared columns identical
+     regime_parity ...... PASS  all 30 regime masks identical
+     btc_cross_parity ... PASS  all 191 columns incl. 31 cross-features
+   Identical to the 2026-08-19 numbers, so the in-tree fix reproduces the
+   out-of-tree shim exactly. feature_parity still reports f101-f107 + the 5
+   return_* columns as "NOT YET IMPLEMENTED in C++" — a gap, not a failure.
+
+STILL BLOCKED (untouched by this change):
+ a) m1_gate / model_parity / shadow drivers cannot link:
+    build_parity_drivers.sh:152 hardcodes /usr/local/lib/lib_lightgbm.a but
+    mjolnir-core-build:latest ships only lib_lightgbm.so.
