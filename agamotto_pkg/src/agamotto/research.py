@@ -44,6 +44,56 @@ from .mm_target import (
 )
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
+# ── Route B: direct-to-S3 filter writes ──────────────────────────────────────
+# Mirrors mjolnir.core.streaming's Route B (same contract, same region, same
+# fail-loud rules) so kline research can write its bulk filter parquets straight
+# to s3:// instead of needing a local/NAS staging tree the size of the whole
+# filter set (orb 15m = 195 GB, which does not fit on shield2's local disk).
+#
+# Before this existed, an s3:// OUTPUT_DIR did NOT raise — os.path.isabs()
+# returns False for "s3://...", so create() joined the URI onto home_root and
+# os.makedirs() produced a local directory literally named "s3:". Probed
+# 2026-08-03 on shield2: 87 MB of parquets landed in marvel/s3:/tardis-stan-data/
+# and ZERO objects reached S3, exit 0.
+#
+# These names are re-exported from this module (not a separate research_common
+# module) — external callers and any future gauntlet.paths S3 probe read them
+# as attributes of agamotto.research.
+_S3_REGION = "ap-northeast-1"
+
+
+def _is_s3(path) -> bool:
+    """True if ``path`` is an ``s3://`` URI (Route B direct-to-S3 target)."""
+    return str(path).startswith("s3://")
+
+
+def _s3_key(uri) -> str:
+    """``s3://bucket/prefix`` -> ``bucket/prefix``.
+
+    pyarrow's ``S3FileSystem`` addresses objects by a bucket-qualified key, not
+    a bare key — same convention as mjolnir.core.streaming._s3_key.
+    """
+    return str(uri)[len("s3://"):].rstrip("/")
+
+
+def _open_s3fs():
+    """Open an ``S3FileSystem`` on the DEFAULT AWS credential chain.
+
+    Fails LOUDLY on any init/credential/region error: per CLAUDE.md there is NO
+    fallback to the local filesystem for an s3:// request. A broken S3 config
+    must abort the run, not silently write local (which is precisely the bug
+    this module previously had).
+    """
+    import pyarrow.fs as pafs
+    try:
+        return pafs.S3FileSystem(region=_S3_REGION)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to init S3FileSystem(region={_S3_REGION!r}) for s3:// filter "
+            f"writes via the default AWS credential chain: {exc!r}. Refusing to "
+            "fall back to local (CLAUDE.md: no silent fallbacks)."
+        ) from exc
+
 # ── Trailing volatility-quantile ENTRY gates (2026-08-16) ────────────────────
 # `price_range_pct` is the per-bar range; its TRAILING quantiles are the cutoffs
 # the `high_vol_q*` regime atoms compare each bar against (research_filters.
@@ -693,11 +743,18 @@ class AgamottoResearch:
         else:
             out_dir = os.path.join("gauntlet", f"pred_{version}")
         
-        if not os.path.isabs(out_dir):
-            out_dir = os.path.join(self.home_root, out_dir)
-            
-        os.makedirs(out_dir, exist_ok=True)
-        
+        # Route B: an s3:// OUTPUT_DIR is already absolute (bucket-qualified) and
+        # has no directories to create. os.path.isabs() returns False for it, so
+        # WITHOUT this branch the URI is joined onto home_root and makedirs()
+        # creates a local dir named "s3:" — the silent mis-write this guards.
+        out_is_s3 = _is_s3(out_dir)
+        if not out_is_s3:
+            # Ensure absolute path using home_root if relative
+            if not os.path.isabs(out_dir):
+                out_dir = os.path.join(self.home_root, out_dir)
+
+            os.makedirs(out_dir, exist_ok=True)
+
         # WRITE_VERTICAL_FEATURES_CSV — genuinely optional, ABSENT MEANS TRUE.
         #
         # Not a magic default for a required key (CLAUDE.md): this flag can only
@@ -719,8 +776,18 @@ class AgamottoResearch:
         if (write_vertical_csv
                 and hasattr(self, 'vertical_features')
                 and self.vertical_features is not None):
-            v_out_path = os.path.join(out_dir, "vertical_features.csv")
-            self.vertical_features.to_csv(v_out_path, index=False)
+            if out_is_s3:
+                # Small metadata, but it belongs under OUTPUT_DIR so downstream
+                # resolves it the same way for both routes — stream the CSV
+                # bytes straight to the object.
+                v_key = f"{_s3_key(out_dir)}/vertical_features.csv"
+                s3fs = _open_s3fs()
+                with s3fs.open_output_stream(v_key) as sink:
+                    sink.write(self.vertical_features.to_csv(index=False).encode())
+                logger.info("Route B: wrote vertical_features.csv to s3://%s", v_key)
+            else:
+                v_out_path = os.path.join(out_dir, "vertical_features.csv")
+                self.vertical_features.to_csv(v_out_path, index=False)
         elif not write_vertical_csv:
             logger.info(
                 "WRITE_VERTICAL_FEATURES_CSV=false — skipping vertical_features.csv "
@@ -960,10 +1027,18 @@ class AgamottoResearch:
             safe_name = f"{clean_regime}_{position}"
             safe_name = "".join([c if c.isalnum() or c in ['_'] else '_' for c in safe_name])
             
-            save_dir = os.path.join(out_dir, "filter")
-            os.makedirs(save_dir, exist_ok=True)
-            
-            save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
+            # Route B: write the bulk filter parquet DIRECTLY to S3 when out_dir
+            # is an s3:// URI. S3 has no directories, so save_dir is a bucket-
+            # qualified key prefix and there is nothing to mkdir.
+            save_is_s3 = _is_s3(out_dir)
+            if save_is_s3:
+                save_dir = f"{_s3_key(out_dir)}/filter"
+                save_path = f"{save_dir}/filter_{safe_name}.parquet"
+            else:
+                save_dir = os.path.join(out_dir, "filter")
+                os.makedirs(save_dir, exist_ok=True)
+
+                save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
             try:
                 _to_save = filtered_subset.rename(
                     columns=_obf().encode_columns(filtered_subset.columns))
@@ -971,10 +1046,36 @@ class AgamottoResearch:
                     c: "float32" for c in _to_save.columns
                     if _to_save[c].dtype == "float64"
                 }
-                _to_save.astype(_f64_to_f32).to_parquet(
-                    save_path, index=False, compression="zstd",
-                )
+                _narrowed = _to_save.astype(_f64_to_f32)
+                if save_is_s3:
+                    # pandas.to_parquet cannot address an S3FileSystem key, so
+                    # go through pyarrow directly. pq.write_table publishes the
+                    # object only on a successful close, so a torn write leaves
+                    # no readable object (no .tmp staging needed — and no s3fs
+                    # rename, which is what breaks the FUSE-mount route).
+                    import pyarrow as pa
+                    import pyarrow.parquet as pq
+                    pq.write_table(
+                        pa.Table.from_pandas(_narrowed, preserve_index=False),
+                        save_path, compression="zstd", filesystem=_open_s3fs(),
+                    )
+                else:
+                    _narrowed.to_parquet(
+                        save_path, index=False, compression="zstd",
+                    )
+                # logger.info(f"Saved filtered signals for {regime_id} to {save_path}")
             except Exception as e:
+                # Route B must fail LOUD: a swallowed S3 error would leave a
+                # silently incomplete filter tree that Step 2 then trains on,
+                # producing a partial book with no warning. The local path keeps
+                # its historical log-and-continue behaviour so this change is
+                # confined to the new route.
+                if save_is_s3:
+                    raise RuntimeError(
+                        f"Route B: failed to write filter parquet to s3://{save_path} "
+                        f"for {safe_name}: {e!r}. Refusing to continue with an "
+                        "incomplete filter tree (CLAUDE.md: no silent fallbacks)."
+                    ) from e
                 logger.error(f"Failed to save filtered signals for {safe_name}: {e}")
 
         return filtered_subset
