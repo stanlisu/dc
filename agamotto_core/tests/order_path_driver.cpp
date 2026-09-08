@@ -270,6 +270,76 @@ int main()
         checkClose(p.qty, 5.5, 1e-9, "9 votes capped to 5 BEFORE sizing");
     }
 
+    // ---- [11] side filter: which VOTE leg this fleet trades ----------------
+    // Orders go out POSITION_SIDE::BOTH, so long and short on ONE account net
+    // at the venue. A per-side book is two fleets on two accounts, and each
+    // must IGNORE the other side's votes rather than net them: a LONG fleet
+    // seeing 2L/2S is 2 long, not flat. Applied before the cap and before
+    // reverse. 0 (BOTH) must be byte-identical to the pre-filter difference.
+    std::printf("[11] filteredNet\n");
+    check(filteredNet(3, 2, SIDE_FILTER_LONG)  ==  3, "LONG: long votes alone (3L/2S -> +3)");
+    check(filteredNet(3, 2, SIDE_FILTER_SHORT) == -2, "SHORT: short votes alone, negative (3L/2S -> -2)");
+    check(filteredNet(3, 2, SIDE_FILTER_BOTH)  ==  1, "BOTH: the difference (3L/2S -> +1)");
+    check(filteredNet(2, 2, SIDE_FILTER_BOTH)  ==  0, "BOTH: 2L/2S nets to flat");
+    check(filteredNet(2, 2, SIDE_FILTER_LONG)  ==  2, "LONG: 2L/2S is 2 long, NOT flat");
+    check(filteredNet(2, 2, SIDE_FILTER_SHORT) == -2, "SHORT: 2L/2S is 2 short, NOT flat");
+    check(filteredNet(0, 0, SIDE_FILTER_LONG)  ==  0, "LONG: no votes -> 0");
+    check(filteredNet(0, 0, SIDE_FILTER_SHORT) ==  0, "SHORT: no votes -> 0");
+    check(filteredNet(0, 0, SIDE_FILTER_BOTH)  ==  0, "BOTH: no votes -> 0");
+    check(filteredNet(0, 4, SIDE_FILTER_LONG)  ==  0, "LONG: short-only votes are invisible");
+    check(filteredNet(4, 0, SIDE_FILTER_SHORT) ==  0, "SHORT: long-only votes are invisible");
+    {
+        // Through planOrder: a LONG fleet sees only short votes -> flat target,
+        // flat position -> nothing to do. The old netted path would have SOLD.
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_LONG;
+        const Plan p = planOrder(0, 2, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::NONE, "LONG fleet ignores a short-only bar (no order)");
+    }
+    {
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_SHORT;
+        const Plan p = planOrder(2, 0, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::NONE, "SHORT fleet ignores a long-only bar (no order)");
+    }
+    {
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_SHORT;
+        const Plan p = planOrder(0, 1, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::SEND && p.side == -1, "SHORT fleet SELLS on a short vote");
+    }
+    {
+        // 2L/2S on a LONG fleet is a 2-lot long, where BOTH would be flat.
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_LONG;
+        c.max_position_notional_usd = 1e9;
+        const Plan p = planOrder(2, 2, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::SEND && p.side == 1, "LONG fleet BUYS on 2L/2S");
+        checkClose(p.qty, 2.2, 1e-9, "LONG fleet sizes 2L/2S as 2 votes, not 0");
+    }
+    {
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_BOTH;
+        const Plan p = planOrder(2, 2, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::NONE, "BOTH still nets 2L/2S to flat (unchanged)");
+    }
+    {
+        // reverse still applies AFTER the filter: a LONG fleet with reverse=-1
+        // sells its long votes. The filter picks the LEG, reverse the SIDE.
+        OrderConfig c = btcCfg();
+        c.side_filter = SIDE_FILTER_LONG;
+        c.reverse = -1;
+        const Plan p = planOrder(1, 0, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::SEND && p.side == -1,
+              "filter picks the vote LEG; reverse still flips the traded side");
+    }
+    {
+        OrderConfig c = btcCfg();
+        c.side_filter = 2;
+        const Plan p = planOrder(1, 0, 0.0, goodBook(), c, NOW_NS);
+        check(p.action == Action::HALT, "side_filter=2 refuses rather than picking a leg");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "ORDER PATH PASS" : "ORDER PATH FAIL",
                 g_checks, g_failures);
