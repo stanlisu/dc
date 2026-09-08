@@ -100,6 +100,19 @@ mutate "stale book ignored" \
     "    if (!bookIsFresh(aBook, aNowNs, aCfg.quote_stale_ns)) {" \
     "    if (false) {"
 
+mutate "side filter: SHORT leg loses its sign (short votes read as long)" \
+    "if (aSideFilter < 0) return -static_cast<int>(aVotesShort);" \
+    "if (aSideFilter < 0) return static_cast<int>(aVotesShort);"
+
+mutate "side filter: LONG fleet nets instead of filtering" \
+    "if (aSideFilter > 0) return static_cast<int>(aVotesLong);" \
+    "if (aSideFilter > 0) return static_cast<int>(aVotesLong - aVotesShort);"
+
+mutate "side filter: out-of-range value accepted" \
+    "    if (aCfg.side_filter != SIDE_FILTER_LONG && aCfg.side_filter != SIDE_FILTER_SHORT
+        && aCfg.side_filter != SIDE_FILTER_BOTH) {" \
+    "    if (false) {"
+
 echo
 echo "=== killed: $killed   survived: $survived ==="
 echo
