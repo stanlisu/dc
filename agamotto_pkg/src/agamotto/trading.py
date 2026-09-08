@@ -163,6 +163,9 @@ class AgamottoTrading(AgamottoResearch):
         self.latest_predictions: pd.DataFrame | None = None
         self.latest_predictions_path: Optional[str] = None
         self.decisions: dict[str, tuple[str, float, float]] = {}
+        # (long_count, short_count) per symbol with predictions, raw and
+        # pre-REVERSE. Rebuilt by make_decision every cycle beside decisions.
+        self.leg_counts: dict[str, tuple[int, int]] = {}
 
         # Prediction Thresholds
         self.long_pred_threshold = float(
@@ -749,6 +752,14 @@ class AgamottoTrading(AgamottoResearch):
         """
         # 1. Initialize decisions
         self.decisions = {sym: [0.0, 0.0] for sym in self.config.get("SYMBOLS", [])}
+        # Per-side regime counts, RAW (pre-REVERSE), for every symbol that had
+        # predictions this cycle. `decisions` nets them (net_count below) and
+        # the two counts are lost; the knull bridge's per-side emission
+        # (MM_NET_LEGS == "side") needs them back. Reset here, beside
+        # `decisions`, so every return path below leaves it consistent with
+        # the decisions of THIS cycle — an early return means no symbol had
+        # predictions, and the dict is empty.
+        self.leg_counts = {}
 
         if not getattr(self, "_data_fresh", True):
             logger.warning(
@@ -843,6 +854,9 @@ class AgamottoTrading(AgamottoResearch):
 
             long_count = len(longs)
             short_count = len(shorts)
+            # Raw counts, pre-REVERSE: the bridge applies REVERSE itself when
+            # it splits sides (knull/orb_bridge._decisions_to_leg_signals).
+            self.leg_counts[sym] = (long_count, short_count)
 
             # Logging
             if long_count > 0 or short_count > 0:
@@ -869,4 +883,5 @@ class AgamottoTrading(AgamottoResearch):
     def clean(self) -> dict[str, list[float, float]]:
         symbols = self.config.get("SYMBOLS", [])
         self.decisions = {sym: [0.0, 0.0] for sym in symbols}
+        self.leg_counts = {}
         return self.decisions
