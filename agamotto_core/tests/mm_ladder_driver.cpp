@@ -839,6 +839,136 @@ int main()
         check(onPlaceUnrecordable(after).halted, "halting is idempotent");
     }
 
+    // ---- [17] SIZE-UP TIERS ARE WIRED -------------------------------------
+    // tierShouldFire was fully tested in [8] and had NO CALLERS: `level` was
+    // never incremented, tier_triggered never written, and Phase::OPEN always
+    // returned the aim ladder. So sentinel placed ONE tier per position while
+    // knull placed up to LADDER. armTier/onTierPlaced/settleTier close that,
+    // and these cases pin the lifecycle end to end.
+    std::printf("[17] size-up tiers are wired\n");
+    {
+        // A long, first tier whole at cost 100.0, LADDER=2, LADDER_BPS=1.
+        LadderState st{};
+        st.phase = Phase::OPEN;
+        st.side = +1;
+        st.filled_qty = 0.005;
+        st.avg_cost = 100.0;
+        st.tier_capacity = 0.005;
+        st.level = 1;
+        Target t{};                       // no live target: OPEN does not need one
+
+        // -- arming is separate from firing, and is sticky.
+        LadderState quiet = armTier(st, book(100.0, 100.1), cfg());
+        check(!quiet.tier_triggered[1],
+              "an unmoved market does not arm the tier");
+        LadderState armed = armTier(st, book(99.0, 99.1), cfg());
+        check(armed.tier_triggered[1],
+              "a move of LADDER_BPS against cost arms the tier");
+        check(armTier(armed, book(100.0, 100.1), cfg()).tier_triggered[1],
+              "arming is STICKY -- a recovery before the next reprice must not "
+              "disarm it, which is why arming is not on the reprice cadence");
+
+        // -- an armed tier emits an ENTRY ladder on the position's OWN side,
+        //    not the aim ladder.
+        Desired d = desiredLadder(armed, t, book(99.0, 99.1), nullptr, 0,
+                                  cfg(), NOW_S);
+        check(d.kind == LadderKind::ENTRY,
+              "an armed tier emits ENTRY while OPEN, not AIM");
+        check(d.side == +1, "a size-up on a long BUYS more");
+        check(!d.reduce_only, "a size-up OPENS exposure, so never reduce_only");
+        double total = 0.0;
+        for (int i = 0; i < d.n; ++i) total += d.qty[i];
+        checkClose(total, 0.005, 1e-9,
+                   "the tier is one capacity, taking the position to 2x");
+
+        // -- unarmed and unmoved, OPEN still aims. The new branch must not
+        //    steal the aim ladder.
+        Desired aim = desiredLadder(st, t, book(100.0, 100.1), nullptr, 0,
+                                    cfg(), NOW_S);
+        check(aim.kind == LadderKind::AIM,
+              "without a trigger OPEN still rests the aim ladder");
+        check(aim.reduce_only, "the aim ladder is still reduce_only");
+
+        // -- THE BUG THIS PREVENTS: the tier must survive the tick that placed
+        //    it. knull's second BTC tier took 14 s to fill on 2026-09-09 05:15
+        //    against a 10 s reprice, so a branch that reverted to AIM on the
+        //    next tick would cancel the rung before it could ever fill. The
+        //    sticky trigger is what holds it, and no extra state is needed.
+        Desired still = desiredLadder(armed, t, book(100.0, 100.1), nullptr, 0,
+                                      cfg(), NOW_S + 10.0);
+        check(still.kind == LadderKind::ENTRY,
+              "the tier keeps resting after the market RECOVERS -- otherwise "
+              "the aim ladder cancels it one cadence later and it never fills");
+        LadderState part = armed;
+        part.filled_qty = 0.007;                       // tier partly filled
+        Desired mid = desiredLadder(part, t, book(100.0, 100.1), nullptr, 0,
+                                    cfg(), NOW_S + 20.0);
+        check(mid.kind == LadderKind::ENTRY,
+              "and keeps resting while the tier is only PARTLY filled");
+        double rest = 0.0;
+        for (int i = 0; i < mid.n; ++i) rest += mid.qty[i];
+        checkClose(rest, 0.003, 1e-9,
+                   "re-emitting asks only for the REMAINDER of the tier, so a "
+                   "partial fill is not double-counted into an oversize");
+
+        // -- settling: only a WHOLE tier advances the level.
+        check(settleTier(part, cfg()).level == 1,
+              "a partially filled tier does not advance the level");
+        LadderState whole = armed;
+        whole.filled_qty = 0.010;                      // 2 x capacity
+        whole.avg_cost = 99.5;
+        LadderState done = settleTier(whole, cfg());
+        check(done.level == 2, "a whole tier advances the level");
+        Desired back = desiredLadder(done, t, book(99.5, 99.6), nullptr, 0,
+                                     cfg(), NOW_S + 20.0);
+        check(back.kind == LadderKind::AIM,
+              "once the tier is whole the aim ladder resumes, at the new cost");
+        check(settleTier(done, cfg()).level == 2,
+              "settling is idempotent -- it never walks past LADDER");
+
+        // -- LADDER is the ceiling.
+        check(!armTier(done, book(98.0, 98.1), cfg()).tier_triggered[2],
+              "at level == LADDER no further tier arms");
+
+        // -- settle only acts on a real OPEN position with real capacity.
+        LadderState exiting = whole;
+        exiting.phase = Phase::EXITING;
+        check(settleTier(exiting, cfg()).level == 1,
+              "settling does nothing once the ladder has left OPEN");
+        LadderState noCap = whole;
+        noCap.tier_capacity = 0.0;
+        check(settleTier(noCap, cfg()).level == 1,
+              "settling does nothing without a latched capacity");
+        LadderState unarmed = whole;
+        unarmed.tier_triggered[1] = false;
+        check(settleTier(unarmed, cfg()).level == 1,
+              "a level nobody armed never advances, however full the position");
+
+        // -- shorts mirror longs.
+        LadderState sh{};
+        sh.phase = Phase::OPEN;
+        sh.side = -1;
+        sh.filled_qty = 0.005;
+        sh.avg_cost = 100.0;
+        sh.tier_capacity = 0.005;
+        sh.level = 1;
+        check(!armTier(sh, book(99.9, 100.0), cfg()).tier_triggered[1],
+              "a short does not arm when the ask falls");
+        LadderState shArmed = armTier(sh, book(101.0, 101.1), cfg());
+        check(shArmed.tier_triggered[1],
+              "a short arms when the ask rises LADDER_BPS above cost");
+        Desired sd = desiredLadder(shArmed, t, book(101.0, 101.1), nullptr, 0,
+                                   cfg(), NOW_S);
+        check(sd.kind == LadderKind::ENTRY && sd.side == -1,
+              "a size-up on a short SELLS more");
+
+        // -- a halted ladder never arms.
+        LadderState halted = st;
+        halted.halted = true;
+        check(!armTier(halted, book(99.0, 99.1), cfg()).tier_triggered[1],
+              "a halted ladder arms nothing");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "MM LADDER PASS" : "MM LADDER FAIL",
                 g_checks, g_failures);
