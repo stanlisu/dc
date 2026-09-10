@@ -19,6 +19,34 @@ logger = logging.getLogger(__name__)
 # Don't add handlers here - let it propagate to root logger
 # This ensures it uses the same handler configuration as the main process
 
+# How many klines the live bot pulls per symbol per cycle.
+#
+# MUST EXCEED research.VOL_Q_WINDOW (700), NOT merely equal it. The
+# price_range_pct_q80/q90/q95 cutoffs are built with
+# ``rolling(VOL_Q_WINDOW, min_periods=VOL_Q_WINDOW)`` (research.py:421-425), so
+# they need 700 CLOSED bars before they emit a single non-NaN value, and
+# ``_process_combined`` drops the in-flight candle (``combined.iloc[:-1]``).
+# At the old default of 700 that left 699 closed bars -- one short -- so every
+# cutoff was NaN, ``price_range_pct > NaN`` was False on every bar, and every
+# high_vol_q80/q90/q95 regime was silently, permanently dead. Measured on the
+# deployed agamotto.base.15m_1 stack 2026-09-10: 48 of its 58 legs carry such an
+# atom and NONE had fired in production since the atoms were created
+# (dc 665b976, 2026-08-16) -- zero fires across every hydra bridge/exec log
+# 2026-08-05..2026-09-10, while those 48 legs hold 81% of the backtested trades.
+#
+# 701 is sufficient and reproduces the full-history cutoff bit-for-bit
+# (max abs diff 0.000e+00, measured over 28 symbols x 129,485 bars). 800 is
+# chosen for MARGIN: the REST window is time-anchored
+# (``start_ts = end_ts - tf_seconds * limit``), so a single missing or delayed
+# kline drops a bare 701 back under the threshold and the legs die again with no
+# error. 800 costs nothing -- Binance weights limit<=1000 identically to 700
+# (weight 5, measured via x-mbx-used-weight-1m), one page either way
+# (lib_binance caps a page at 1500).
+#
+# tesseract.PROD_LOOKBACK mirrors this for offline validation; move both together
+# or validation silently reproduces the blindness this fixes.
+DEFAULT_KLINE_LOOKBACK = 800
+
 
 def dual_gate_filter(sym_preds: "pd.DataFrame"):
     """Split one symbol's regime predictions into firing longs and shorts,
@@ -192,7 +220,7 @@ class AgamottoTrading(AgamottoResearch):
         # Load initial data to be ready for immediate trading
         if not skip_load:
             try:
-                self.load_data(limit=700)
+                self.load_data(limit=DEFAULT_KLINE_LOOKBACK)
             except Exception as e:
                 logger.warning(f"Failed to load initial data in __init__: {e}")
 
@@ -441,7 +469,7 @@ class AgamottoTrading(AgamottoResearch):
                     "filter": self.config.get("LONG_FILTER" if label == "long" else "SHORT_FILTER")
                 })
 
-    def load_data(self, limit: int = 700) -> None:
+    def load_data(self, limit: int = DEFAULT_KLINE_LOOKBACK) -> None:
         """Fetch and prepare market data with retry logic for staleness."""
         self._fetch_and_prepare_data(limit=limit)
 
@@ -524,7 +552,7 @@ class AgamottoTrading(AgamottoResearch):
                     if hasattr(t, "strftime") else str(t))
                 latest_row.to_csv(features_csv_path, index=False)
 
-    def _fetch_and_prepare_data(self, limit: int = 700) -> None:
+    def _fetch_and_prepare_data(self, limit: int = DEFAULT_KLINE_LOOKBACK) -> None:
         """Internal helper to fetch data without retry/recursion logic."""
         symbols = self.config["SYMBOLS"]
         if not symbols:
