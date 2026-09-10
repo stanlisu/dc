@@ -33,6 +33,7 @@ from agamotto.research import (
     VOL_Q_LEVELS,
     VOL_Q_WINDOW,
 )
+from agamotto.trading import DEFAULT_KLINE_LOOKBACK
 from agamotto.research_filters import (
     _VOL_QUANTILE_ATOMS,
     comprehensive_sweep_regimes,
@@ -587,6 +588,30 @@ class TestVolQuantileGate:
 
     def test_window_is_the_q50_window(self):
         assert VOL_Q_WINDOW == 700
+
+    def test_live_lookback_leaves_enough_closed_bars_to_warm_the_window(self):
+        """The live lookback must EXCEED VOL_Q_WINDOW, not equal it.
+
+        These cutoffs use ``min_periods=VOL_Q_WINDOW``, so they need
+        VOL_Q_WINDOW *closed* bars before emitting a non-NaN value, and
+        ``AgamottoTrading._process_combined`` drops the in-flight candle
+        (``combined.iloc[:-1]``). At ``DEFAULT_KLINE_LOOKBACK == VOL_Q_WINDOW``
+        that leaves VOL_Q_WINDOW - 1 closed bars, every cutoff is NaN, and
+        ``price_range_pct > NaN`` is False on every bar -- so every
+        high_vol_q80/q90/q95 regime dies SILENTLY: no raise, no warning, just a
+        leg that never fires.
+
+        That was live for the whole lifetime of these atoms (created 2026-08-16)
+        and was found on 2026-09-10, when 48 of the deployed
+        agamotto.base.15m_1 stack's 58 legs -- holding 81% of its backtested
+        trades -- were measured to have never fired once in production.
+        """
+        assert DEFAULT_KLINE_LOOKBACK - 1 >= VOL_Q_WINDOW, (
+            f"live lookback {DEFAULT_KLINE_LOOKBACK} leaves "
+            f"{DEFAULT_KLINE_LOOKBACK - 1} closed bars after the in-flight drop, "
+            f"which cannot warm a {VOL_Q_WINDOW}-bar min_periods window -- every "
+            f"high_vol_q* regime would be permanently and silently dead"
+        )
 
     @pytest.mark.parametrize("name", ATOMS)
     def test_mask_is_position_invariant(self, research, name):
