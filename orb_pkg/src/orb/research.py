@@ -11,7 +11,7 @@ import pandas as pd
 
 from agamotto import AgamottoResearch
 from agamotto.features_scalefree import SCALE_FREE_FEATURES
-from agamotto.ladder import compute_ladder_multiplier, ladder_params
+from agamotto.ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params
 from agamotto.research import VOL_QUANTILE_FEATURES
 from agamotto.utils import _symbol_to_native
 
@@ -487,10 +487,14 @@ class OrbResearch(AgamottoResearch):
                         # leg selected backwards. Nothing deployed moves: all five
                         # orb settings are BASE_TF == TARGET_TF and take the
                         # same-TF path, so this branch has never run in anger.
-                        sym_cols["return_long"] = (raw - fee_cost) * size_long
-                        sym_cols["return_short"] = (raw + fee_cost) * size_short
-                        sym_cols["return_long_raw"] = raw * size_long
-                        sym_cols["return_short_raw"] = raw * size_short
+                        # Per-rung entry pricing (2026-09-10), the same helper
+                        # agamotto's two same-TF copies call — not `raw * rungs`.
+                        long_raw = compute_ladder_return(raw, size_long, step_bps, "long")
+                        short_raw = compute_ladder_return(raw, size_short, step_bps, "short")
+                        sym_cols["return_long"] = long_raw - fee_cost * size_long
+                        sym_cols["return_short"] = short_raw + fee_cost * size_short
+                        sym_cols["return_long_raw"] = long_raw
+                        sym_cols["return_short_raw"] = short_raw
                     else:
                         # No exit low/high aligned -> no ladder, size 1 per leg.
                         # Same un-negated short convention as above.

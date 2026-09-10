@@ -35,7 +35,7 @@ except ImportError:
         pass
 
 from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
-from .ladder import compute_ladder_multiplier, ladder_params
+from .ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params
 from .mm_target import (
     MINUTE_TIMEFRAME,
     TARGET_MODE_MM,
@@ -370,12 +370,18 @@ class AgamottoResearch:
         size_short = compute_ladder_multiplier(
             close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
+        # Each rung is priced from ITS OWN entry (rung j fills (j-1)*LADDER_BPS
+        # against the anchor), not `price_return * rungs`, which booked every
+        # rung at the anchor — see agamotto.ladder.compute_ladder_return. The
+        # fee stays per rung.
         fee_cost = fee_rate * 2.0
+        long_raw = compute_ladder_return(price_return, size_long, step_bps, "long")
+        short_raw = compute_ladder_return(price_return, size_short, step_bps, "short")
         return pd.DataFrame({
-            "return_long": (price_return - fee_cost) * size_long,
-            "return_short": (price_return + fee_cost) * size_short,
-            "return_long_raw": price_return * size_long,
-            "return_short_raw": price_return * size_short,
+            "return_long": long_raw - fee_cost * size_long,
+            "return_short": short_raw + fee_cost * size_short,
+            "return_long_raw": long_raw,
+            "return_short_raw": short_raw,
         }, index=df.index)
 
     def engineer_features(self) -> None:
@@ -510,15 +516,14 @@ class AgamottoResearch:
                     price_return_short_raw = mm_cols["return_short_raw"].rename(
                         f"{base}_return_short_raw")
                 else:
+                    # Per-rung entry pricing, same as `_compute_ladder_returns`.
                     fee_cost = fee_rate * 2.0
-                    long_per_layer_return = price_return - fee_cost
-                    price_return_long = (long_per_layer_return * size_long).rename(f"{base}_return_long")
-
-                    short_raw_per_layer = price_return + fee_cost
-                    price_return_short = (short_raw_per_layer * size_short).rename(f"{base}_return_short")
-
-                    price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
-                    price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
+                    long_raw = compute_ladder_return(price_return, size_long, step_bps, "long")
+                    short_raw = compute_ladder_return(price_return, size_short, step_bps, "short")
+                    price_return_long = (long_raw - fee_cost * size_long).rename(f"{base}_return_long")
+                    price_return_short = (short_raw + fee_cost * size_short).rename(f"{base}_return_short")
+                    price_return_long_raw = long_raw.rename(f"{base}_return_long_raw")
+                    price_return_short_raw = short_raw.rename(f"{base}_return_short_raw")
 
                 if dual_horizon:
                     price_return_2bar = (close.shift(-2) / close_safe - 1)
@@ -535,10 +540,12 @@ class AgamottoResearch:
                         close_safe, 2.0 * close_safe - high_max2, ladder_short, step_bps)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
-                    return_long_2bar = ((price_return_2bar - fee_cost) * size_long2).rename(f"{base}_return_long_2bar")
-                    return_short_2bar = ((price_return_2bar + fee_cost) * size_short2).rename(f"{base}_return_short_2bar")
-                    return_long_2bar_raw = (price_return_2bar * size_long2).rename(f"{base}_return_long_2bar_raw")
-                    return_short_2bar_raw = (price_return_2bar * size_short2).rename(f"{base}_return_short_2bar_raw")
+                    long2_raw = compute_ladder_return(price_return_2bar, size_long2, step_bps, "long")
+                    short2_raw = compute_ladder_return(price_return_2bar, size_short2, step_bps, "short")
+                    return_long_2bar = (long2_raw - fee_cost * size_long2).rename(f"{base}_return_long_2bar")
+                    return_short_2bar = (short2_raw + fee_cost * size_short2).rename(f"{base}_return_short_2bar")
+                    return_long_2bar_raw = long2_raw.rename(f"{base}_return_long_2bar_raw")
+                    return_short_2bar_raw = short2_raw.rename(f"{base}_return_short_2bar_raw")
 
                 return_dip = (low_next / close_safe - 1).rename(f"{base}_return_dip")
                 return_rip = (high_next / close_safe - 1).rename(f"{base}_return_rip")
