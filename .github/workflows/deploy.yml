@@ -6,6 +6,16 @@ on:
     types: [completed]
     branches: [main]
 
+# One deploy at a time. Two Tests runs completing back to back (two merges
+# minutes apart) spawn two Deploy runs for the SAME head SHA; on 2026-09-10
+# runs 34483688052 and 34483718346 rsynced shield2 concurrently and the first
+# one's verify step saw the second one's bytes -> "FAILED VERIFICATION" on a
+# host that was in fact correctly deployed. Queue, never cancel: the later run
+# carries the newer tree and must still land.
+concurrency:
+  group: deploy-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
@@ -36,6 +46,12 @@ jobs:
             rm -rf "$build_dir"
             mkdir -p "$build_dir"
             pyarmor gen -O "$build_dir/src" -r "${algo}_pkg/src/$algo"
+            # Provenance stamp, same file build_distribution.sh writes
+            # (`src/<algo>/BUILD_SHA`). This step is an inline copy of that
+            # script's build, so #73's stamp never reached a CI deploy —
+            # measured on shield2 2026-09-10 after b053fdf: new PyArmor header,
+            # no BUILD_SHA. Never `-dirty` here: CI builds a clean checkout.
+            printf '%s\n' "${{ github.event.workflow_run.head_sha }}" > "$build_dir/src/$algo/BUILD_SHA"
             # map.json is DATA — pyarmor gen only processes .py and drops it;
             # codec.py loads it from next to itself.
             if [ -f "${algo}_pkg/src/$algo/_obf/map.json" ]; then

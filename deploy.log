@@ -610,3 +610,12 @@ STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
   (2) stripped-body sha256 of all 12 agamotto .py files on hydra == this Mac's build_dist, and hydra == shield2;
   (3) the dc reflog shows HEAD at 37129bf from 2026-09-03T17:14+08 until 2026-09-09T13:43+08, and no branch
   anywhere carries a commit in that window. So: **live dc = 37129bf**, all 9 algos, both hosts, deployed here.
+2026-09-10T05:36:44Z  deploy 9 algos -> shield2  (via .github/workflows/deploy.yml run 34483718346, dc=b053fdf2a #73 on top of #72)  skipped: hydra(live) shield(live)  failed: none
+  Verified on shield2 (run log + ssh): pre-flight clear, rsync, `verify_deploy: all 9 package(s) OK`, PyArmor
+  header on agamotto/research.py now `2026-09-10T13:36:49` (was `09-08T12:59:26`). NO BUILD_SHA landed: the
+  workflow's build step is an inline copy of build_distribution.sh's `pyarmor gen` and never ran the #73 stamp
+  — fixed in the commit carrying this line. A sibling run 34483688052 (same SHA, spawned by #72's Tests run
+  finishing 11s earlier) FAILED VERIFICATION on shield2: it rsynced at 13:36:27 and verified at 13:38:02, after
+  this run had overwritten the tree at 13:36:49 — a two-deploys-one-host race, not a bad build. Also fixed
+  here (workflow `concurrency` group, queue not cancel). Hydra and shield were refused by the live-process
+  gate, as designed; hydra still runs dc=37129bf (see the 2026-09-08 entry).
