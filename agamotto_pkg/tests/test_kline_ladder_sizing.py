@@ -47,6 +47,19 @@ def _cfg(**over):
     return cfg
 
 
+def _avg_entry(pr, k, side, step_bps=STEP_BPS):
+    """What a k-rung ladder earns when each rung is priced from ITS OWN entry
+    (2026-09-10). Derived from explicit prices, independently of the
+    implementation: anchor 100, exit 100*(1+pr), rung j fills (j-1)*step
+    against the anchor. Before this, the label was `pr * k` — every rung
+    booked at the anchor."""
+    a = 100.0
+    exit_px = a * (1.0 + pr)
+    sgn = -1.0 if side == "long" else 1.0
+    return sum(exit_px / (a * (1.0 + sgn * (j - 1) * step_bps * 1e-4)) - 1.0
+               for j in range(1, k + 1))
+
+
 # --------------------------------------------------------------------------- #
 # The pure sizing function
 # --------------------------------------------------------------------------- #
@@ -130,7 +143,8 @@ def test_step_bps_scales_rung_width():
 #
 # Old label: min(long=10, short=0) = 0  -> BOTH legs recorded 0.0. The bar
 # vanished, despite a real 10bp loss on a fully-laddered long.
-# New label: long -10bp x 10 rungs = -0.01 ; short -10bp x 1 rung = -0.001.
+# New label: long -10bp over 10 rungs priced from their own entries (_avg_entry,
+# a hair above -0.01); short -10bp x 1 rung = -0.001.
 # --------------------------------------------------------------------------- #
 DIP_NO_BOUNCE = pd.DataFrame({
     "open":  [100.0, 100.0],
@@ -150,9 +164,9 @@ def test_orb_labels_the_dip_no_bounce_loss_instead_of_zeroing_it():
     out = orb._compute_ladder_returns(
         DIP_NO_BOUNCE, close_col="close", low_col="low", high_col="high")
 
-    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.01, abs=1e-9), (
+    assert out["return_long_raw"].iloc[0] == pytest.approx(_avg_entry(-0.001, 10, "long"), abs=1e-12), (
         "fully-laddered long into a falling bar must book 10 rungs of loss")
-    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-9), (
+    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-12), (
         "short never got an adverse (upward) move: entry rung only")
 
 
@@ -165,8 +179,8 @@ def test_agamotto_labels_the_dip_no_bounce_loss_instead_of_zeroing_it():
     out = ag._compute_ladder_returns(
         DIP_NO_BOUNCE, close_col="close", low_col="low", high_col="high")
 
-    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.01, abs=1e-9)
-    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-9)
+    assert out["return_long_raw"].iloc[0] == pytest.approx(_avg_entry(-0.001, 10, "long"), abs=1e-12)
+    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-12)
 
 
 def test_both_engines_agree_bar_for_bar():
@@ -245,8 +259,8 @@ def test_per_leg_ladders_actually_size_the_two_legs_differently():
     out = r._compute_ladder_returns(df, "close", "low", "high")
     pr = -0.001
 
-    assert out["return_long_raw"].iloc[0] == pytest.approx(pr * 2, abs=1e-12)
-    assert out["return_short_raw"].iloc[0] == pytest.approx(pr * 10, abs=1e-12)
+    assert out["return_long_raw"].iloc[0] == pytest.approx(_avg_entry(pr, 2, "long"), abs=1e-12)
+    assert out["return_short_raw"].iloc[0] == pytest.approx(_avg_entry(pr, 10, "short"), abs=1e-12)
 
 
 def test_plain_LADDER_still_works_for_both_legs():
@@ -326,9 +340,9 @@ def test_cross_tf_dip_no_bounce_is_sized_not_zeroed():
     """
     out = _orb_cross_tf(_cfg(), [100.0], [99.90], [99.90], [100.00])
 
-    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.01, abs=1e-9), (
+    assert out["return_long_raw"].iloc[0] == pytest.approx(_avg_entry(-0.001, 10, "long"), abs=1e-12), (
         "fully-laddered long into a falling exit bar must book 10 rungs of loss")
-    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-9), (
+    assert out["return_short_raw"].iloc[0] == pytest.approx(-0.001, abs=1e-12), (
         "short never got an adverse (upward) move: entry rung only")
 
 
@@ -340,8 +354,8 @@ def test_cross_tf_per_leg_ladders_size_the_legs_differently():
     out = _orb_cross_tf(cfg, [100.0], [99.90], [99.90], [100.10])
     pr = -0.001
 
-    assert out["return_long_raw"].iloc[0] == pytest.approx(pr * 2, abs=1e-12)
-    assert out["return_short_raw"].iloc[0] == pytest.approx(pr * 10, abs=1e-12)
+    assert out["return_long_raw"].iloc[0] == pytest.approx(_avg_entry(pr, 2, "long"), abs=1e-12)
+    assert out["return_short_raw"].iloc[0] == pytest.approx(_avg_entry(pr, 10, "short"), abs=1e-12)
 
 
 def test_cross_tf_short_target_is_not_negated():
@@ -369,7 +383,8 @@ def test_cross_tf_honours_LADDER_BPS():
 
     # 10bp dip at 2bp per rung = 5 extra rungs + the entry rung = 6.
     # The hardcoded 0.0001 gave 10 extra, capped at LADDER-1 = 9, i.e. 10.
-    assert out["return_long_raw"].iloc[0] == pytest.approx(-0.001 * 6, abs=1e-12)
+    assert out["return_long_raw"].iloc[0] == pytest.approx(
+        _avg_entry(-0.001, 6, "long", step_bps=2.0), abs=1e-12)
 
 
 def test_cross_tf_matches_the_same_tf_engine_bar_for_bar():

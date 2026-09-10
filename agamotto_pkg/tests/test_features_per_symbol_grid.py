@@ -46,7 +46,7 @@ import pytest
 talib = pytest.importorskip("talib")
 
 from agamotto.features_scalefree import scale_free_levels  # noqa: E402
-from agamotto.ladder import compute_ladder_multiplier, ladder_params  # noqa: E402
+from agamotto.ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params  # noqa: E402
 from agamotto.research import AgamottoResearch  # noqa: E402
 
 N = 600
@@ -130,10 +130,15 @@ def _reference_old_path(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         size_short = compute_ladder_multiplier(close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
         fee_cost = fee_rate * 2.0
-        price_return_long = ((price_return - fee_cost) * size_long).rename(f"{base}_return_long")
-        price_return_short = ((price_return + fee_cost) * size_short).rename(f"{base}_return_short")
-        price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
-        price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
+        # Per-rung entry pricing (2026-09-10) — the target formula is incidental
+        # to this test (it pins per-symbol feature ALIGNMENT), so the reference
+        # copy calls the same helper the engine does.
+        long_raw = compute_ladder_return(price_return, size_long, step_bps, "long")
+        short_raw = compute_ladder_return(price_return, size_short, step_bps, "short")
+        price_return_long = (long_raw - fee_cost * size_long).rename(f"{base}_return_long")
+        price_return_short = (short_raw + fee_cost * size_short).rename(f"{base}_return_short")
+        price_return_long_raw = long_raw.rename(f"{base}_return_long_raw")
+        price_return_short_raw = short_raw.rename(f"{base}_return_short_raw")
 
         price_return_2bar = (close.shift(-2) / close_safe - 1)
         low_min2 = pd.concat([low_series.shift(-1), low_series.shift(-2)], axis=1).min(axis=1)
@@ -141,10 +146,12 @@ def _reference_old_path(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         size_long2 = compute_ladder_multiplier(close_safe, low_min2, ladder_long, step_bps)
         size_short2 = compute_ladder_multiplier(close_safe, 2.0 * close_safe - high_max2, ladder_short, step_bps)
         ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
-        return_long_2bar = ((price_return_2bar - fee_cost) * size_long2).rename(f"{base}_return_long_2bar")
-        return_short_2bar = ((price_return_2bar + fee_cost) * size_short2).rename(f"{base}_return_short_2bar")
-        return_long_2bar_raw = (price_return_2bar * size_long2).rename(f"{base}_return_long_2bar_raw")
-        return_short_2bar_raw = (price_return_2bar * size_short2).rename(f"{base}_return_short_2bar_raw")
+        long2_raw = compute_ladder_return(price_return_2bar, size_long2, step_bps, "long")
+        short2_raw = compute_ladder_return(price_return_2bar, size_short2, step_bps, "short")
+        return_long_2bar = (long2_raw - fee_cost * size_long2).rename(f"{base}_return_long_2bar")
+        return_short_2bar = (short2_raw + fee_cost * size_short2).rename(f"{base}_return_short_2bar")
+        return_long_2bar_raw = long2_raw.rename(f"{base}_return_long_2bar_raw")
+        return_short_2bar_raw = short2_raw.rename(f"{base}_return_short_2bar_raw")
 
         return_dip = (low_next / close_safe - 1).rename(f"{base}_return_dip")
         return_rip = (high_next / close_safe - 1).rename(f"{base}_return_rip")

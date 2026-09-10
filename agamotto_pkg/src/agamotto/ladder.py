@@ -33,6 +33,16 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
+# The MEANING of the kline target this package computes. A weights window is
+# stamped with the convention it trained under and every launcher refuses a
+# mismatch (marvel `gauntlet/target_convention.py`, xmen
+# `scripts/verify_weights_convention.py`). Bump it whenever the target's meaning
+# changes, so no pre-change window can be launched against the new gate.
+#   unsigned-v1          dc #23: return_{long,short}[_raw] are UNSIGNED market returns.
+#   ladder-avg-entry-v2  2026-09-10: each rung priced from ITS OWN entry
+#                        (`compute_ladder_return`), not `price_return * rungs`.
+TARGET_CONVENTION = "ladder-avg-entry-v2"
+
 
 def ladder_params(config: Dict) -> Tuple[int, int, float]:
     """Read (LADDER_LONG, LADDER_SHORT, LADDER_BPS) from a setting.json dict.
@@ -120,3 +130,61 @@ def compute_ladder_multiplier(close, adverse_extreme, ladder: int,
     layers = np.floor(distance / step_size + 1e-9).clip(
         0, max_extra).fillna(0).astype(int)
     return pd.Series(1 + layers, index=close_s.index)
+
+
+def compute_ladder_return(price_return, rungs, step_bps: float,
+                          side: str) -> pd.Series:
+    """Return earned by a k-rung ladder, each rung priced from ITS OWN entry.
+
+    The rung COUNT comes from `compute_ladder_multiplier`; this is the
+    aggregation over those rungs. Before 2026-09-10 the target was
+    `price_return * k`, which books every rung at the anchor — a k-rung stack
+    that fills `(k-1)*LADDER_BPS` against the anchor is worth strictly more
+    than that (long: cheaper entries; short: dearer ones), and inside the
+    `(k-1)*step` band the SIGN of the label differs. On the live 15m arm
+    (LADDER=2) it read as exactly `2 x close-to-close return`.
+
+        long   sum_{j=1..k} (exit/ent_j - 1),   ent_j = a * (1 - (j-1)*step)
+        short  sum_{j=1..k} (exit/ent_j - 1),   ent_j = a * (1 + (j-1)*step)
+
+    Both columns are UNSIGNED market returns from each rung's entry (the
+    `unsigned-v1` convention, dc #23): the consumer applies the trade
+    direction, so the short column is what it NEGATES. Rung 1 contributes
+    `price_return` itself, exactly. Fees are NOT charged here — the callers
+    keep charging them per rung, as before.
+
+    Args:
+        price_return: `exit/anchor - 1` per bar (NaN where there is no exit
+            bar; NaN stays NaN — never a silent 0.0 label).
+        rungs: integer rung count per bar, in [1, LADDER]; same index.
+        step_bps: adverse move between rungs, in bps (LADDER_BPS), > 0.
+        side: "long" or "short" — which way rung j>=2 is priced off the anchor.
+
+    Raises:
+        ValueError: on an unknown side, a non-positive step, a rung count
+            below 1 or non-integer, or misaligned indexes. Never realigns.
+    """
+    if side not in ("long", "short"):
+        raise ValueError(f"side must be 'long' or 'short', got {side!r}")
+    step = float(step_bps) * 1e-4
+    if not step > 0:
+        raise ValueError(f"step_bps must be > 0, got {step_bps!r}")
+    r = pd.Series(price_return, dtype=float)
+    k = pd.Series(rungs)
+    if not r.index.equals(k.index):
+        raise ValueError("price_return and rungs must share the same index — "
+                         "refusing to realign silently")
+    kv = k.to_numpy(dtype=float)
+    if np.isnan(kv).any() or (kv < 1).any() or (kv != np.floor(kv)).any():
+        raise ValueError("rungs must be integers >= 1 (rung 1 is the entry rung); "
+                         f"got {sorted(set(kv.tolist()))[:5]}")
+    kv = kv.astype(int)
+    # Long rungs fill BELOW the anchor, short rungs ABOVE it.
+    adverse = -1.0 if side == "long" else 1.0
+    rv = r.to_numpy()
+    out = rv.copy()                       # rung 1: the anchor return, exactly
+    for j in range(2, int(kv.max()) + 1):
+        filled = kv >= j
+        entry_factor = 1.0 + adverse * (j - 1) * step
+        out[filled] += (1.0 + rv[filled]) / entry_factor - 1.0
+    return pd.Series(out, index=r.index)
