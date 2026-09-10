@@ -123,6 +123,23 @@ build_algo() {
         exit 1
     fi
 
+    # Stamp the build with the dc commit it was cut from (2026-09-10). Until now a
+    # deployed package carried NO provenance: no SHA file, deploy.log names no
+    # commit, and PyArmor's header carries only a timestamp. On 2026-09-10 the
+    # commit behind the LIVE agamotto package on hydra had to be recovered by
+    # hashing obfuscated bodies against a local build_dist and reading the reflog
+    # (dc/deploy.log, the 2026-09-08T05:03:20Z entry). This file is what makes
+    # that a `cat`, not a forensic exercise. Written INSIDE the package dir so the
+    # rsync carries it and `import <algo>` sits next to it on the host.
+    local _sha _dirty
+    _sha="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+    _dirty=""
+    if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- "$pkg_dir" 2>/dev/null)" ]; then
+        _dirty="-dirty"
+    fi
+    printf '%s%s\n' "$_sha" "$_dirty" > "$build_dir/src/$algo/BUILD_SHA"
+    echo "  Stamped BUILD_SHA ${_sha:0:9}${_dirty}"
+
     # Carry the vendored obfuscation codec map (a DATA file — pyarmor gen only
     # processes .py and drops it). codec.py loads map.json from next to itself,
     # so it must sit beside the obfuscated codec in the build output.
