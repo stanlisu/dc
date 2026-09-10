@@ -71,6 +71,25 @@ import argparse
 import csv
 import json
 import math
+
+
+def _panel_bars_from_header() -> int:
+    """Read PANEL_BARS from src/feature_engine.hpp — never duplicate the width.
+
+    A literal here silently stops matching the engine the moment the panel is
+    resized, which is exactly how the 699-vs-700 off-by-one (marvel PR #532)
+    survived: two places held the number and only one of them moved.
+    """
+    import pathlib as _pl
+    hdr = _pl.Path(__file__).resolve().parent.parent / "src" / "feature_engine.hpp"
+    for line in hdr.read_text().splitlines():
+        if line.startswith("constexpr size_t PANEL_BARS"):
+            return int(line.split("=")[1].split(";")[0].strip())
+    raise SystemExit(f"cannot read PANEL_BARS from {hdr} — refusing to guess")
+
+
+PANEL_BARS = _panel_bars_from_header()
+VOL_Q_MIN_PERIODS = 700   # research.py:371-376 / feature_engine.hpp VOL_Q_WINDOW
 import re
 import shlex
 import subprocess
@@ -443,7 +462,7 @@ def main() -> int:
                     help="how many of the most recent SHARED bars to reconcile (>=3)")
     ap.add_argument("--counterfactual-driver", default=None,
                     help="path to feature_parity_driver. Runs the SAME engine over the "
-                         "PURE BINANCE 699-bar window ending at each reconciled bar and "
+                         "PURE BINANCE PANEL_BARS-bar window ending at each reconciled bar and "
                          "diffs THAT against the bot. See STEP 5 — this is what separates "
                          "'the engine is wrong' from 'the bars were wrong'.")
     # ---- PHASE 5: the decision reconciliation ---------------------------
@@ -812,17 +831,22 @@ def main() -> int:
             print("      -> FINDING: the maker flag IS exact and buy_pressure still "
                   "disagrees on clean inputs.")
 
-    # The three vol-quantile cutoffs are NaN on a 699-row panel (min_periods=700).
-    # Both sides must be NaN. If the bot is NOT NaN, the bot is engineering more
-    # than 699 rows and the two are not comparable at all.
+    # The three vol-quantile cutoffs are NaN only while fewer than
+    # VOL_Q_MIN_PERIODS rows precede the row. On a PANEL_BARS-row panel that is
+    # the leading rows only, so on the reconciled (latest) rows both sides
+    # should now be NUMBERS. What matters is that the two sides AGREE: a bot
+    # that is NaN where the engine is not, or vice versa, is engineering a
+    # different number of rows and the two are not comparable at all.
     for real in ("price_range_pct_q80", "price_range_pct_q90", "price_range_pct_q95"):
         code = enc(real)
         if code not in cpp_cols or real not in bot_cols:
             continue
         c_nan = all(math.isnan(panel[t][code]) for t in use)
         b_nan = all(math.isnan(bot[t][real]) for t in use)
-        state = "both NaN (expected: min_periods=700 > 699 rows)" if (c_nan and b_nan) \
-            else f"cpp_nan={c_nan} bot_nan={b_nan}  <-- MISMATCH"
+        state = (f"both NaN (fewer than {VOL_Q_MIN_PERIODS} rows precede)"
+                 if (c_nan and b_nan)
+                 else "both populated" if (not c_nan and not b_nan)
+                 else f"cpp_nan={c_nan} bot_nan={b_nan}  <-- MISMATCH")
         print(f"  {real:<22} {state}")
 
     # Panel shape and cost, from the strategy's own [AGFEAT] lines.
@@ -841,7 +865,7 @@ def main() -> int:
     # THE COUNTERFACTUAL, and the only step that can actually exonerate or
     # convict the engine when the live bars are not bit-exact.
     #
-    # It runs the SAME engine binary over the PURE BINANCE 699-bar window ending
+    # It runs the SAME engine binary over the PURE BINANCE PANEL_BARS-bar window ending
     # at the reconciled bar — the identical input the bot's own pipeline is
     # supposed to be working from — and diffs THAT against the bot's row. The
     # live panel is held out entirely.
@@ -867,10 +891,10 @@ def main() -> int:
                 print(f"  {iso(ts)}: not in the Binance CSV — skipped")
                 continue
             end = order.index(ts)
-            start = end + 1 - 699
+            start = end + 1 - PANEL_BARS
             if start < 0:
-                print(f"  {iso(ts)}: only {end + 1} Binance bars precede it, 699 needed "
-                      f"— skipped (widen --binance-csv)")
+                print(f"  {iso(ts)}: only {end + 1} Binance bars precede it, "
+                      f"{PANEL_BARS} needed — skipped (widen --binance-csv)")
                 continue
             win = order[start:end + 1]
             # Contiguity is a CORRECTNESS precondition, not a formality: a hole
@@ -1024,7 +1048,7 @@ def main() -> int:
 
             The mask is evaluated on a ONE-ROW frame, which is correct here and
             only here: every predicate is a per-row comparison against columns
-            the FEATURE ENGINE already computed over the whole 699-bar panel
+            the FEATURE ENGINE already computed over the whole PANEL_BARS-bar panel
             (`price_range_pct_q50` is a 700-bar rolling median and arrives as a
             COLUMN of that row). It is the ENGINE that must see the panel, not
             the gate. Running the engine on one row would be the real error.

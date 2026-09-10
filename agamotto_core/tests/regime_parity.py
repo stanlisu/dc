@@ -29,21 +29,24 @@ side is ever shown a real regime name.
 
 THE TRAP THIS HARNESS EXISTS TO AVOID
 -------------------------------------
-53 of the 62 regimes in the deployed stack CANNOT FIRE LIVE. Their vol-quantile
-cutoff columns (``price_range_pct_q80/q90/q95``) are
-``rolling(700, min_periods=700)`` on a 699-row panel, hence NaN everywhere, and
-``x > NaN`` is False. That is today's production behaviour under an open finding
-(marvel PR #532, docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md)
-and this port reproduces it deliberately.
+Until 2026-09-11, 53 of the 62 regimes in the deployed stack COULD NOT FIRE
+LIVE: their vol-quantile cutoff columns (``price_range_pct_q80/q90/q95``) are
+``rolling(700, min_periods=700)`` and the panel was 699 rows, so they were NaN
+everywhere and ``x > NaN`` is False (marvel PR #532,
+docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md). That finding is
+now RESOLVED on both sides — python first (dc PR #76, limit 700 -> 800), then
+this port (PANEL_BARS 699 -> 799) — so the cutoff is NaN only on the first 699
+rows and those regimes are live on the warm tail.
 
 Which means a gate that returned all-False for EVERYTHING would agree with the
 reference on 53 of 62 regimes and would look like a strong pass. So the harness
 asserts the SHAPE of the answer, not only its equality:
 
   * every regime's mask must be exactly equal, cell for cell;
-  * the 53 r073/r074/r075-gated regimes must be ALL-FALSE on both sides, and
-    the q80/q90/q95 columns of the panel the gate READ must be all-NaN — the
-    inertness is asserted at its cause, not only at its effect;
+  * the r073/r074/r075-gated regimes must be FALSE on every row whose cutoff
+    is NaN (the first min_periods - 1 of them) on both sides — asserted at the
+    cause, not only at the effect. Whether they fire on the warm tail is a
+    property of the data and is reported, not asserted;
   * each of the 53 is ALSO evaluated with its vol-quantile atom STRIPPED (a
     "probe" regime, not deployed), and those must fire. That is the causal
     control: it separates "inert because the cutoff is NaN" from "inert because
@@ -83,6 +86,7 @@ sys.path.insert(0, str(HERE))
 import feature_parity as fp  # noqa: E402
 
 PANEL_BARS = fp.PANEL_BARS
+VOL_Q_MIN_PERIODS = fp.VOL_Q_MIN_PERIODS
 
 
 # ---------------------------------------------------------------------------
@@ -284,23 +288,43 @@ def compare(scenario: str, specs, cpp_masks: pd.DataFrame,
     live = [i for i, (_n, _p, k) in enumerate(specs) if k == "live"]
     probe = [i for i, (_n, _p, k) in enumerate(specs) if k == "probe"]
 
-    # ---- 2. the vol-quantile regimes must be INERT ------------------------
-    # Asserted on BOTH sides. "Both agree" is satisfied by two engines wrong in
-    # the same way, and THIS wrongness — a gate firing where production's
-    # cannot — is precisely the one Phase 3 was told to preserve.
-    bad_inert = [specs[i][0] for i in inert
-                 if cpp_masks.iloc[:, i].to_numpy().any()
-                 or ref_masks.iloc[:, i].to_numpy().any()]
-    if bad_inert:
+    # ---- 2. the vol-quantile regimes must be COLD WHILE THE CUTOFF IS NaN --
+    # Until 2026-09-11 PANEL_BARS was 699 < min_periods 700, so these were
+    # all-NaN on EVERY row and this block asserted the regimes were ALL-FALSE
+    # (marvel PR #532). PANEL_BARS is now 799, so the cutoff is NaN on exactly
+    # the first VOL_Q_MIN_PERIODS - 1 rows and real thereafter, and the regimes
+    # are live on the warm tail. Whether they actually fire there is a property
+    # of the data, so it is NOT asserted.
+    #
+    # What IS asserted is the CAUSAL half, which is deterministic and is the
+    # half that matters: on every row where the cutoff cannot exist, the mask
+    # must be False, on BOTH sides. "Both agree" is satisfied by two engines
+    # wrong the same way, so this is asserted at the cause, per this harness's
+    # own philosophy. If PANEL_BARS ever narrows below min_periods again this
+    # block still holds while check (3) below and feature_parity's warm-row
+    # count both fail loudly — the deadness cannot come back quietly.
+    _cold = VOL_Q_MIN_PERIODS - 1     # rows whose cutoff is NaN by construction
+    bad_cold = []
+    for i in inert:
+        for side, frame in (("C++", cpp_masks), ("reference", ref_masks)):
+            head = frame.iloc[:_cold, i].to_numpy().astype(bool)
+            if head.any():
+                bad_cold.append(f"{specs[i][0]}[{side}]")
+                break
+    if bad_cold:
         failures += 1
-        print(f"=== FAIL: {len(bad_inert)} r07x-gated regime(s) FIRED: "
-              f"{bad_inert[:6]} ===")
-        print("    They compare price_range_pct against a rolling(700, "
-              "min_periods=700) cutoff on a 699-row panel, which is NaN on "
-              "every row. Firing means the all-NaN property broke — see marvel "
-              "PR #532 / docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md.")
+        print(f"=== FAIL: {len(bad_cold)} r07x-gated regime(s) fired on a row "
+              f"whose cutoff is NaN: {bad_cold[:6]} ===")
+        print(f"    The first {_cold} rows cannot have a rolling("
+              f"{VOL_Q_MIN_PERIODS}, min_periods={VOL_Q_MIN_PERIODS}) cutoff, "
+              "so `price_range_pct > cutoff` must be False there. Firing means "
+              "the gate is reading something other than the cutoff.")
     else:
-        print(f"  inert:  {len(inert)} r07x-gated regime(s) ALL-FALSE on both sides")
+        n_warm = sum(int(cpp_masks.iloc[_cold:, i].to_numpy().astype(bool).any())
+                     for i in inert)
+        print(f"  volq:   {len(inert)} r07x-gated regime(s) cold on all "
+              f"{_cold} NaN-cutoff rows on both sides; {n_warm} fire on the "
+              f"warm tail (live since PR #532 was resolved)")
 
     # ---- 3. no DEPLOYED regime may be all-TRUE ----------------------------
     # An all-True mask is `baseline` — the unconditional fire-on-every-bar

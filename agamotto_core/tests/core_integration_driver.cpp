@@ -15,7 +15,7 @@
 //      short must leave panel_rows == 0 and panels_computed == 0. A core that
 //      engineered a short panel would be caught by engineerFeatures' width
 //      check; a core that engineered a panel it should not have YET would not.
-//   2. EXACTLY 699 x 65 ON THE FIRST WARM BAR — the width live engineers
+//   2. EXACTLY PANEL_BARS x 65 ON THE FIRST WARM BAR — the width live engineers
 //      (trading.py fetches 700 and drops the incomplete one), not the 700 the
 //      ring retains, and the full declared column set.
 //   3. THE PANEL IS STAMPED WITH THE BAR THAT WAS POPPED, so a Phase-3 gate
@@ -96,7 +96,11 @@ void checkEq(T got, T want, const std::string& what)
 }
 
 constexpr int      kBarSec  = 900;               // agamotto 15m
-constexpr int      kWarmup  = 700;               // the contract's warmup
+constexpr int      kWarmup  = static_cast<int>(PANEL_BARS) + 1;  // the contract's warmup:
+                                                 // one ABOVE the slice, so the slice is never
+                                                 // the whole ring (core_impl.cpp:117-142).
+                                                 // Derived, never a literal -- a hardcoded 700
+                                                 // beside a 799 panel is how this drifts.
 constexpr int64_t  kPeriodMs = kBarSec * 1000LL;
 constexpr int64_t  kProduct = 2000000170LL;
 // An on-grid bucket well inside the plausible-timestamp window the builder
@@ -439,8 +443,9 @@ int run(int bench_n, const std::string& weights_override,
         {{29, 45},     2, +1},   // r029_and_r045_long
         {{69, 65},     2, -1},   // r069_and_r065_short
         {{39, 8},      2, +1},   // r039_and_r008_long
-        // INERT: each carries a vol-quantile atom whose cutoff column is
-        // all-NaN on a 699-row panel. These must never fire — PR #532.
+        // vol-quantile legs: each carries an r073/r074/r075 atom. These were
+        // INERT while PANEL_BARS was 699 (cutoff all-NaN, PR #532); at 799
+        // they are live and may or may not fire on this data.
         {{60, 75},     2, +1},   // r060_and_r075_long
         {{29, 66, 73}, 3, +1},   // r029_and_r066_and_r073_long
         {{69, 40, 74}, 3, -1},   // r069_and_r040_and_r074_short
@@ -535,38 +540,40 @@ int run(int bench_n, const std::string& weights_override,
     check(!core->regimeFiredLatest(-1), "a negative index reads false");
 
     // ----------------------------------------------------------------- (1)
-    // Backfill 699 CLOSED bars — one short of warm, exactly as a real boot is
-    // before the seam is repaired.
-    std::printf("\n[1] backfill 699 closed bars -> contiguous but NOT warm\n");
+    // Backfill PANEL_BARS CLOSED bars — one short of warm, exactly as a real
+    // boot is before the seam is repaired.
+    std::printf("\n[1] backfill %zu closed bars -> contiguous but NOT warm\n", PANEL_BARS);
     Walk w;
     std::vector<KlineBar> bf;
     double px = 64000.0;
-    for (int i = 0; i < 699; ++i) {
+    for (int i = 0; i < static_cast<int>(PANEL_BARS); ++i) {
         px *= 1.0 + (w.next() - 0.5) * 0.004;
         bf.push_back(makeBar(kBase + static_cast<int64_t>(i) * kPeriodMs, px, w));
     }
     check(core->ingestBackfill(bf.data(), static_cast<int>(bf.size())),
-          "ingestBackfill accepts 699 contiguous on-grid bars");
-    checkEq<int64_t>(core->barsBuffered(), 699, "contiguous after backfill");
-    check(!core->isWarm(), "699 < 700 is NOT warm");
+          "ingestBackfill accepts PANEL_BARS contiguous on-grid bars");
+    checkEq<int64_t>(core->barsBuffered(), static_cast<int64_t>(PANEL_BARS),
+                     "contiguous after backfill");
+    check(!core->isWarm(), "PANEL_BARS < kWarmup is NOT warm");
     checkEq<int64_t>(core->diagnostics().panels_computed, 0,
                      "backfill alone computes no panel (nothing was popped)");
 
     // ----------------------------------------------------------------- (2)
-    // Attach mid-bucket at 699 (discarded as a partial, rule 3), then trade in
+    // Attach mid-bucket at the seam bar (discarded as a partial, rule 3), then trade in
     // 700 and 701 so bar 700 is emitted. That opens the STRUCTURAL boot seam:
-    // bucket 699 is in neither half, so the run is one live bar long.
+    // the seam bucket is in neither half, so the run is one live bar long.
     std::printf("\n[2] attach mid-bucket -> boot seam -> the popped bar is NOT warm\n");
     uint64_t tid = 0;
-    const int64_t b699 = kBase + 699 * kPeriodMs;
-    tick(*core, b699 + 300000, px, 1.5, tid);                 // partial, dropped
-    tick(*core, b699 + kPeriodMs + 10000, px * 1.001, 2.0, tid);
-    tick(*core, b699 + 2 * kPeriodMs + 10000, px * 1.002, 1.0, tid);
+    const int64_t bSeam = kBase + static_cast<int64_t>(PANEL_BARS) * kPeriodMs;
+    tick(*core, bSeam + 300000, px, 1.5, tid);                 // partial, dropped
+    tick(*core, bSeam + kPeriodMs + 10000, px * 1.001, 2.0, tid);
+    tick(*core, bSeam + 2 * kPeriodMs + 10000, px * 1.002, 1.0, tid);
     std::vector<KlineBar> got = drain(*core);
     checkEq<size_t>(got.size(), 1u, "one bar built across the seam");
     CoreDiagnostics d = core->diagnostics();
     checkEq<int64_t>(d.seam_gaps, 1, "the boot seam is reported as one gap");
-    checkEq<int64_t>(d.pending_bars, 699, "the pre-seam backfill is quarantined, not destroyed");
+    checkEq<int64_t>(d.pending_bars, static_cast<int64_t>(PANEL_BARS),
+                     "the pre-seam backfill is quarantined, not destroyed");
     check(!core->isWarm(), "a 1-bar contiguous run is not warm");
     checkEq<int64_t>(d.panels_computed, 0, "NO panel is computed before warm");
     checkEq<int64_t>(d.panel_rows, 0, "no panel is held");
@@ -580,18 +587,21 @@ int run(int bench_n, const std::string& weights_override,
     // does from a refreshed CSV. The quarantine splices back and the run
     // becomes 701 bars — warm.
     std::printf("\n[3] repair the seam -> warm -> the NEXT bar produces the panel\n");
-    KlineBar fill = makeBar(b699, px, w);
+    KlineBar fill = makeBar(bSeam, px, w);
     check(core->ingestBackfill(&fill, 1), "ingestBackfill accepts exactly the missing bucket");
-    // 701 bars are spliced and the ring caps at max_history (= warmup = 700), so
-    // the OLDEST is trimmed. Asserted as 700, not 701, because the cap is the
-    // designed behaviour: the panel needs 699 and the ring is deliberately one
-    // longer, so trimming the 701st loses nothing the engine reads.
-    checkEq<int64_t>(core->barsBuffered(), 700, "the quarantine is spliced back, ring capped");
+    // kWarmup + 1 bars are spliced and the ring caps at max_history (= kWarmup),
+    // so the OLDEST is trimmed. Asserted as kWarmup, not kWarmup + 1, because
+    // the cap is the designed behaviour: the panel needs PANEL_BARS and the ring
+    // is deliberately one longer, so trimming the extra loses nothing the engine
+    // reads. DERIVED from kWarmup -- a literal here is what failed when
+    // PANEL_BARS moved 699 -> 799 and the ring correctly went 700 -> 800.
+    checkEq<int64_t>(core->barsBuffered(), static_cast<int64_t>(kWarmup),
+                     "the quarantine is spliced back, ring capped");
     check(core->isWarm(), "700 >= 700 is warm");
     checkEq<int64_t>(core->diagnostics().panels_computed, 0,
                      "a splice alone computes no panel — only a popped bar does");
 
-    tick(*core, b699 + 3 * kPeriodMs + 10000, px * 1.003, 1.0, tid);
+    tick(*core, bSeam + 3 * kPeriodMs + 10000, px * 1.003, 1.0, tid);
     got = drain(*core);
     checkEq<size_t>(got.size(), 1u, "one bar built after the repair");
     d = core->diagnostics();
@@ -619,8 +629,8 @@ int run(int bench_n, const std::string& weights_override,
     check(core->panelColumnCode(-1) == nullptr, "column -1 is out of range");
     check(std::isnan(core->panelLatest(65)), "panelLatest(65) is NaN, not a neighbour");
 
-    // The three vol-quantile cutoffs are ALL-NaN on a 699-row panel
-    // (min_periods=700 > 699). Pinned here as well as in the parity harness:
+    // The three vol-quantile cutoffs are POPULATED on a 799-row panel
+    // (min_periods=700 <= 799). Pinned here as well as in the parity harness:
     // this is the live path, and it is the subject of marvel PR #532. If it
     // ever stops being NaN, 53 deployed regimes start firing against models
     // never trained on a firing regime.
@@ -639,10 +649,15 @@ int run(int bench_n, const std::string& weights_override,
     // lands verbatim in the built binary; the artifact audit build_linux.sh
     // runs scans printable runs, and an assertion message is one of the easiest
     // places for a real name to re-enter a compiled object unnoticed.
-    checkEq<int>(nan_q_, 3, std::string(codes::F_PRICE_RANGE_PCT_Q80) + "/" +
+    // WAS: checkEq(nan_q_, 3) -- the three were all-NaN on the old 699-row
+    // panel and that deadness was pinned here. PANEL_BARS is now 799, which
+    // is >= the 700 min_periods, so the latest row MUST carry a real cutoff.
+    // If this ever reads 3 again the panel silently narrowed and 48 of the
+    // 58 deployed legs are inert once more (marvel PR #532).
+    checkEq<int>(nan_q_, 0, std::string(codes::F_PRICE_RANGE_PCT_Q80) + "/" +
                             codes::F_PRICE_RANGE_PCT_Q90 + "/" +
                             codes::F_PRICE_RANGE_PCT_Q95 +
-                            " are NaN on a 699-row panel (min_periods=700)");
+                            " are POPULATED on a PANEL_BARS-row panel (min_periods=700)");
 
     // ----------------------------------------------------------------- (3b)
     // STAGE 3: the gate RAN, on the panel that was just computed. Every check
@@ -653,12 +668,23 @@ int run(int bench_n, const std::string& weights_override,
     checkEq<int64_t>(d.regime_errors, 0, "the gate did not throw");
     checkEq<int64_t>(d.regimes_configured, kNStack, "still the stack we installed");
     check(d.regime_gate_us >= 0, "the gate's cost was measured");
-    for (int i = kNFirable; i < kNStack; ++i) {
-        check(!core->regimeFiredLatest(i),
-              "an r07x-gated regime CANNOT fire: its cutoff column is all-NaN "
-              "(marvel PR #532)");
-        checkEq<int64_t>(core->regimeFireCount(i), 0,
-                         "and its run count stays at zero");
+    // WAS: an assertion that every r07x-gated regime CANNOT fire, because its
+    // cutoff was all-NaN on the old 699-row panel (marvel PR #532). PANEL_BARS
+    // is now 799 >= min_periods 700, so those regimes are LIVE and whether any
+    // of them fires is a property of the data, not of the engine -- asserting
+    // either outcome here would be asserting the random walk.
+    //
+    // What IS invariant, and is what the old assertion was really protecting:
+    // the fire FLAG and the fire COUNT must agree, for every regime. A regime
+    // that reads fired-latest with a zero run count (or the reverse) means the
+    // gate and the bookkeeping disagree, which is how a leg silently stops
+    // being scored. The cutoffs being non-NaN is pinned separately, above.
+    for (int i = 0; i < kNStack; ++i) {
+        const bool fired_ = core->regimeFiredLatest(i);
+        const int64_t n_ = core->regimeFireCount(i);
+        check(!(fired_ && n_ == 0),
+              "a regime that fired on this bar has a non-zero run count");
+        check(n_ >= 0, "a run count is never negative");
     }
     check(core->regimeFireCount(kNStack) == 0, "an out-of-range fire count is 0");
 
@@ -811,7 +837,7 @@ int run(int bench_n, const std::string& weights_override,
     // the NEWEST may carry a panel.
     std::printf("\n[4] a 4-bar burst -> 3 stale bars SKIPPED, only the newest gets a panel\n");
     const int64_t before_computed_ = d.panels_computed;
-    tick(*core, b699 + 7 * kPeriodMs + 10000, px * 1.004, 1.0, tid);
+    tick(*core, bSeam + 7 * kPeriodMs + 10000, px * 1.004, 1.0, tid);
     got = drain(*core);
     checkEq<size_t>(got.size(), 4u, "one real bar plus three flat bars");
     d = core->diagnostics();
@@ -821,7 +847,8 @@ int run(int bench_n, const std::string& weights_override,
                      "the three superseded bars are skipped and COUNTED");
     checkEq<int64_t>(d.panel_bar_ts_ms, got.back().bucket_open_ms,
                      "the panel belongs to the NEWEST bar of the burst");
-    checkEq<int64_t>(d.panel_rows, static_cast<int64_t>(PANEL_BARS), "still 699 rows");
+    checkEq<int64_t>(d.panel_rows, static_cast<int64_t>(PANEL_BARS),
+                     "still PANEL_BARS rows");
     checkEq<int64_t>(d.panel_cols, 65, "still 65 columns");
 
     // ----------------------------------------------------------------- (5)
@@ -831,7 +858,7 @@ int run(int bench_n, const std::string& weights_override,
     std::vector<int64_t> us;
     int graded_ = 0;
     const int n_bench = bench_n > 0 ? bench_n : 20;
-    int64_t ts = b699 + 8 * kPeriodMs + 10000;
+    int64_t ts = bSeam + 8 * kPeriodMs + 10000;
     for (int i = 0; i < n_bench; ++i) {
         ts += kPeriodMs;
         px *= 1.0 + (w.next() - 0.5) * 0.004;
@@ -1056,19 +1083,19 @@ int run(int bench_n, const std::string& weights_override,
         double p2 = px;
         uint64_t id_s = 900001;
         uint64_t id_a = 900001;
-        tick(*sync_,  b699 + 10000, p2, 1.0, id_s);
-        tick(*async_, b699 + 10000, p2, 1.0, id_a);
+        tick(*sync_,  bSeam + 10000, p2, 1.0, id_s);
+        tick(*async_, bSeam + 10000, p2, 1.0, id_a);
         drain(*sync_);
         drain(*async_);
 
         Walk wfill;
-        const KlineBar fill2 = makeBar(b699, p2, wfill);
+        const KlineBar fill2 = makeBar(bSeam, p2, wfill);
         check(sync_->ingestBackfill(&fill2, 1),  "control core closes the seam");
         check(async_->ingestBackfill(&fill2, 1), "async core closes the same seam");
         check(sync_->isWarm() && async_->isWarm(), "both cores are warm");
 
-        tick(*sync_,  b699 + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_s);
-        tick(*async_, b699 + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_a);
+        tick(*sync_,  bSeam + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_s);
+        tick(*async_, bSeam + 3 * kPeriodMs + 10000, p2 * 1.003, 1.0, id_a);
         drain(*sync_);          // scores inline
         drain(*async_);         // enqueues; the worker scores
 
