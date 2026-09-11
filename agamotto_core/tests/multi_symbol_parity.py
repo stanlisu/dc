@@ -18,8 +18,8 @@ builder was graded separately against Binance's own klines and matched 36/36
 columns over 4 live bars, so REST klines are exactly what the tick path was
 proven to reproduce.
 
-ALIGNMENT. Only the NEWEST row of each panel is compared. Row k of a 699-row
-panel was computed with k rows of history, not 699, so its rolling features
+ALIGNMENT. Only the NEWEST row of each panel is compared. Row k of a PANEL_BARS-row
+panel was computed with k rows of history, not PANEL_BARS, so its rolling features
 differ from what the bot -- which always holds a full window -- computed at that
 bar. Comparing every row would manufacture disagreements that live never sees.
 To grade several bars, the panel is re-sliced to end at each one, which is what
@@ -39,6 +39,8 @@ import shlex
 import subprocess
 import sys
 import time
+
+import feature_parity as fp   # PANEL_BARS, read from the C++ header
 import urllib.request
 from pathlib import Path
 
@@ -164,7 +166,9 @@ def main() -> int:
     ap.add_argument("--bridge-log", type=Path)
     ap.add_argument("--bars", type=int, default=1,
                     help="how many recent bars to grade (panel re-sliced per bar)")
-    ap.add_argument("--panel", type=int, default=699)
+    # Default READ from src/feature_engine.hpp, never a literal: a hardcoded
+    # width silently stops matching the engine (marvel PR #532).
+    ap.add_argument("--panel", type=int, default=fp.PANEL_BARS)
     ap.add_argument("--interval", default="15m")
     args = ap.parse_args()
 
