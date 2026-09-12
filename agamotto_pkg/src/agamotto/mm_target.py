@@ -38,7 +38,8 @@ SIGN CONVENTION — read before touching the short leg. The target columns live 
 **price-return space, not PnL space**, because the canonical PnL engine applies the position
 sign itself (marvel `gauntlet/evaluate_regimes.py:196-197`:
 ``sign = 1 if position == 'long' else -1; rets = grp[ret_col].values * sign``). The existing
-target obeys this — `return_short_raw = price_return * size_short`, NOT negated. An MM target
+target obeys this — `return_short_raw = compute_ladder_return(price_return, size_short, ..., "short")`,
+an UNSIGNED per-rung market return, NOT negated (`agamotto/ladder.py`). An MM target
 returning a short's true PnL would be sign-flipped a SECOND time and would silently invert
 the whole short book. Hence:
 

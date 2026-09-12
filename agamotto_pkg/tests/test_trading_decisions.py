@@ -219,3 +219,67 @@ def test_nan_features_still_produces_prediction(trading_instance):
     price, qty = decisions["BINANCE_PERP_BTC_USDT"]
     # Should still produce a long signal despite NaN
     assert qty > 0, f"Expected positive qty after NaN fill, got {qty}"
+
+
+# ---------------------------------------------------------------------------
+# leg_counts — the raw per-side counts that `decisions` nets away
+# ---------------------------------------------------------------------------
+
+def test_leg_counts_recorded_raw_beside_netted_decisions(trading_instance):
+    """2 long + 1 short: decisions carries net=+1, leg_counts carries (2, 1)."""
+    r_long1 = _make_regime("r_long1", "long", 0.005, 0.01)
+    r_long2 = _make_regime("r_long2", "long", 0.005, 0.02)
+    r_short = _make_regime("r_short", "short", -0.005, -0.01)
+    trading_instance.regime_stack = [r_long1, r_long2, r_short]
+    trading_instance.filter_signals = _regime_aware_filter(trading_instance)
+
+    decisions = trading_instance.make_decision()
+    _price, qty = decisions["BINANCE_PERP_BTC_USDT"]
+    assert qty > 0
+    assert trading_instance.leg_counts == {"BINANCE_PERP_BTC_USDT": (2, 1)}
+
+
+def test_leg_counts_are_pre_reverse(trading_instance):
+    """REVERSE flips the netted qty but NOT the raw counts."""
+    trading_instance.config["REVERSE"] = -1
+    r_long = _make_regime("r_long", "long", 0.005, 0.01)
+    trading_instance.regime_stack = [r_long]
+    trading_instance.filter_signals = _regime_aware_filter(trading_instance)
+
+    decisions = trading_instance.make_decision()
+    _price, qty = decisions["BINANCE_PERP_BTC_USDT"]
+    assert qty < 0, "REVERSE=-1 must flip the netted decision"
+    assert trading_instance.leg_counts == {"BINANCE_PERP_BTC_USDT": (1, 0)}
+
+
+def test_leg_counts_balanced_legs_keep_both_counts(trading_instance):
+    """1 long + 1 short nets to zero in decisions; leg_counts keeps (1, 1)."""
+    r_long = _make_regime("r_long", "long", 0.005, 0.01)
+    r_short = _make_regime("r_short", "short", -0.005, -0.01)
+    trading_instance.regime_stack = [r_long, r_short]
+    trading_instance.filter_signals = _regime_aware_filter(trading_instance)
+
+    decisions = trading_instance.make_decision()
+    _price, qty = decisions["BINANCE_PERP_BTC_USDT"]
+    assert qty == 0.0
+    assert trading_instance.leg_counts == {"BINANCE_PERP_BTC_USDT": (1, 1)}
+
+
+def test_leg_counts_reset_every_cycle(trading_instance):
+    """A cycle with no predictions must not leave last cycle's counts behind."""
+    r_long = _make_regime("r_long", "long", 0.005, 0.01)
+    trading_instance.regime_stack = [r_long]
+    trading_instance.filter_signals = _regime_aware_filter(trading_instance)
+    trading_instance.make_decision()
+    assert trading_instance.leg_counts == {"BINANCE_PERP_BTC_USDT": (1, 0)}
+
+    trading_instance.regime_stack = []
+    trading_instance.make_decision()
+    assert trading_instance.leg_counts == {}
+    assert trading_instance.decisions == {"BINANCE_PERP_BTC_USDT": [0.0, 0.0]}
+
+
+def test_clean_resets_leg_counts(trading_instance):
+    trading_instance.leg_counts = {"BINANCE_PERP_BTC_USDT": (1, 0)}
+    trading_instance.clean()
+    assert trading_instance.leg_counts == {}

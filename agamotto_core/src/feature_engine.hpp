@@ -246,41 +246,54 @@ void compute(const std::vector<double>& open,
 //
 // PANEL WIDTH IS A CORRECTNESS PARAMETER, NOT A BUFFER SIZE.
 //
-//   trading.py:443  load_data(limit: int = 700)
-//   trading.py:480  combined = combined.tail(limit)   -> 700 rows
-//   trading.py:485  combined = combined.iloc[:-1]     -> the incomplete bar is
-//                                                        dropped -> 699 CLOSED
+//   trading.py  DEFAULT_KLINE_LOOKBACK = 800
+//   trading.py  load_data(limit: int = DEFAULT_KLINE_LOOKBACK)
+//               combined = combined.tail(limit)   -> 800 rows
+//               combined = combined.iloc[:-1]     -> the incomplete bar is
+//                                                    dropped -> 799 CLOSED
 //
-// So live engineers EXACTLY 699 bars, and two columns read the row count
+// So live engineers EXACTLY 799 bars, and two columns read the row count
 // directly rather than only a trailing window of it:
 //
 //   * price_range_pct_q50 is rolling(700, min_periods=1) (research.py:363).
 //     On any frame SHORTER than 700 rows that is an EXPANDING median — the
-//     value on row i is the median of rows 0..i, of ALL of them. Hand it 700
-//     rows instead of 699 and every cell from row 0 on can move; hand it 1000
-//     and they all do. "More history is safer" is a silent parity break here,
-//     not a performance tweak.
-//   * price_range_pct_q80/q90/q95 are rolling(700, min_periods=700), so on a
-//     699-row frame they are ALL-NaN by construction (see VOL_Q_WINDOW).
+//     value on row i is the median of rows 0..i, of ALL of them. At 799 rows
+//     the first 700 rows are still expanding and the rest are true 700-wide
+//     medians. Either way the width must MATCH trading.py exactly: picking a
+//     width independently is a silent parity break, not a performance tweak.
+//   * price_range_pct_q80/q90/q95 are rolling(700, min_periods=700). At 799
+//     rows they are populated on the last 100 rows — INCLUDING the latest,
+//     which is the only row the gate reads. At the old 699 they were all-NaN
+//     on every row, which is what made 48 of 58 deployed regimes inert.
 //
 // `engineerFeatures` therefore REFUSES a panel of any other width instead of
 // quietly producing numbers live would never see.
-constexpr size_t PANEL_BARS = 699;
+//
+// 2026-09-11: WAS 699, MIRRORING trading.py's OLD limit=700. That off-by-one
+// is the subject of marvel PR #532 /
+// docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md, and it is now
+// RESOLVED: dc PR #76 moved the python side to
+// DEFAULT_KLINE_LOOKBACK = 800 (799 closed), and this is the mirror the
+// finding prescribes ("resolved in research.py first and mirrored here").
+// The two MUST move together — a python-side change alone leaves the C++ bot
+// computing different features from the python bot with nothing raising.
+constexpr size_t PANEL_BARS = 799;
 
 // research.py:61. Doubles as the min_periods of the q80/q90/q95 cutoffs
 // (research.py:373), which is why those three columns are ENTIRELY NaN on a
 // PANEL_BARS-wide panel: 699 observations < 700 min_periods, on every row.
 //
-// THIS IS REPRODUCED DELIBERATELY AND MUST NOT BE "FIXED" HERE. It is the
-// live behaviour, and it is the subject of a filed production finding —
-// marvel PR #532, docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md
-// — which measures that 53 of 62 deployed regimes cannot fire live because of
-// it (`x > NaN` is False on every bar). A port that "helpfully" lowered
-// min_periods, or widened the panel to 700, would make those regimes start
-// firing against models that were never trained on a firing regime, and the
-// port would look like the cause. tests/feature_parity.py asserts the
-// all-NaN property explicitly so it is pinned rather than incidental; when the
-// finding is resolved, it is resolved in research.py first and mirrored here.
+// This is the window AND the min_periods, exactly as research.py has it. Do
+// not lower min_periods here to make the columns populate on a short panel —
+// that would be a unilateral divergence from python. The width of the PANEL is
+// the knob (PANEL_BARS above), and it is set to match trading.py.
+//
+// HISTORY, kept because it will be re-litigated: while PANEL_BARS was 699
+// these three columns were all-NaN on every row, so every regime gated on them
+// evaluated False forever — marvel PR #532 measured 53 of 62 deployed regimes
+// inert. That was reproduced here DELIBERATELY, to match live, and pinned by
+// tests. It was resolved on 2026-09-11 in the prescribed order: python first
+// (dc PR #76, limit 700 -> 800), then this mirror.
 constexpr int VOL_Q_WINDOW = 700;
 
 // --- stage 2.4: the rolling return-moment stats ------------------------------

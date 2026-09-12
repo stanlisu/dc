@@ -24,19 +24,23 @@ agamotto differs from mjolnir in a way that a copied harness would hide:
    `isnan`) also stops +inf on one side and NaN on the other from cancelling
    out as "both non-finite".
 
-2. **The panel is exactly PANEL_BARS = 699 rows.** trading.py:443
-   `load_data(limit=700)` -> :480 `tail(limit)` -> :485 `iloc[:-1]`.
-   `price_range_pct_q50` is `rolling(700, min_periods=1)`, i.e. an EXPANDING
-   median at this width, so its values depend on the ROW COUNT: at 700 or 1000
-   rows this harness would compare numbers live never computes.
+2. **The panel is exactly PANEL_BARS = 799 rows.** trading.py
+   `DEFAULT_KLINE_LOOKBACK = 800` -> `tail(limit)` -> `iloc[:-1]`.
+   `price_range_pct_q50` is `rolling(700, min_periods=1)`: below 700 rows it is
+   an EXPANDING median, so its values depend on the ROW COUNT. The width here
+   must equal the live width or this harness compares numbers live never
+   computes. PANEL_BARS is READ FROM THE HEADER, never duplicated.
 
-3. **q80/q90/q95 must be ENTIRELY NaN, and that is asserted.** They are
-   `rolling(700, min_periods=700)` (research.py:371-376), so on 699 rows they
-   are NaN everywhere by construction. This is live behaviour under an open
-   production finding (marvel PR #532,
-   docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md: 53 of 62
-   deployed regimes cannot fire because `x > NaN` is False). It is reproduced,
-   not fixed, and pinned here so it cannot become incidental.
+3. **q80/q90/q95 must be populated on exactly the last
+   `PANEL_BARS - 700 + 1` rows, and that is asserted.** They are
+   `rolling(700, min_periods=700)` (research.py:371-376). At 799 rows that is
+   the trailing 100 rows -- including the LATEST, the only row the gate reads.
+   Until 2026-09-11 PANEL_BARS was 699 and these were NaN everywhere, which is
+   the production finding marvel PR #532 /
+   docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md (53 of 62
+   deployed regimes could not fire, because `x > NaN` is False). That is now
+   RESOLVED on both sides; the count is pinned here so a silently narrowed
+   panel brings the deadness back loudly instead of quietly.
 
 4. **Two price scales.** BTC-like (~64000) and 1000PEPE-like (~0.0045). The
    `+1e-8` epsilons are ABSOLUTE and inline per expression, so on BTC they are
@@ -314,8 +318,10 @@ _REAL_NAMES_CODED += _STATS_NAMES + _SCALE_FREE_NAMES
 # for the `close` passthrough, so both sides carry the real name.
 _REAL_NAMES_UNCODED = ["close", "mvg1", "mvg2", "mvg3"]
 
-# The three q* columns whose all-NaN-ness is the pinned production property.
+# The three q* columns whose warm-row COUNT is the pinned production property.
 VOL_Q_COLS = ["price_range_pct_q80", "price_range_pct_q90", "price_range_pct_q95"]
+# research.py:371-376 / feature_engine.hpp VOL_Q_WINDOW -- window AND min_periods.
+VOL_Q_MIN_PERIODS = 700
 
 # ---------------------------------------------------------------------------
 # LOOKAHEAD. Every one of these reads shift(-1) or shift(-2) on close/high/low:
@@ -784,18 +790,33 @@ def compare(name: str, ref: pd.DataFrame, cpp: pd.DataFrame, enc, tol: float,
         print(f"=== FAIL: rows ref={len(ref)} cpp={len(cpp)} ===")
         return failures + 1
 
-    # (3) the pinned production property: all-NaN vol-quantile cutoffs.
+    # (3) the pinned production property: the vol-quantile cutoffs are
+    # populated on exactly the rows where min_periods is satisfied, and NOWHERE
+    # else. Derived from PANEL_BARS (read from the header), never a literal --
+    # a hardcoded count here is how this silently stops matching the engine.
+    _expected_finite = max(0, PANEL_BARS - VOL_Q_MIN_PERIODS + 1)
     for col in VOL_Q_COLS:
         code = enc(col)
         for side, frame in (("reference", ref), ("C++", cpp)):
             if code not in frame.columns:
                 continue
             v = frame[code].to_numpy(float)
-            if not np.isnan(v).all():
-                print(f"=== FAIL: {col} is NOT all-NaN on the {side} side "
-                      f"({int((~np.isnan(v)).sum())} finite cells) — at "
-                      f"{PANEL_BARS} rows < min_periods={700} it must be. See "
-                      "marvel PR #532. ===")
+            n_finite = int((~np.isnan(v)).sum())
+            if n_finite != _expected_finite:
+                print(f"=== FAIL: {col} has {n_finite} finite cells on the "
+                      f"{side} side, expected {_expected_finite} "
+                      f"(PANEL_BARS={PANEL_BARS}, "
+                      f"min_periods={VOL_Q_MIN_PERIODS}). If this reads 0 the "
+                      "panel narrowed below min_periods and 48 of the 58 "
+                      "deployed legs are inert again — marvel PR #532. ===")
+                failures += 1
+            # the warm rows must be the TRAILING ones: a leading block would
+            # mean the window ran the wrong way round.
+            if n_finite and not np.isnan(v[-1]):
+                pass
+            elif n_finite:
+                print(f"=== FAIL: {col} is populated but its LAST row is NaN "
+                      f"on the {side} side — the gate reads that row. ===")
                 failures += 1
 
     # The TA-Lib NATR defect (ta_NATR.c:334-338). Derived from the defect AND

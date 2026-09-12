@@ -35,7 +35,7 @@ except ImportError:
         pass
 
 from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
-from .ladder import compute_ladder_multiplier, ladder_params
+from .ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params
 from .mm_target import (
     MINUTE_TIMEFRAME,
     TARGET_MODE_MM,
@@ -370,12 +370,18 @@ class AgamottoResearch:
         size_short = compute_ladder_multiplier(
             close_safe, 2.0 * close_safe - high_next, ladder_short, step_bps)
 
+        # Each rung is priced from ITS OWN entry (rung j fills (j-1)*LADDER_BPS
+        # against the anchor), not `price_return * rungs`, which booked every
+        # rung at the anchor — see agamotto.ladder.compute_ladder_return. The
+        # fee stays per rung.
         fee_cost = fee_rate * 2.0
+        long_raw = compute_ladder_return(price_return, size_long, step_bps, "long")
+        short_raw = compute_ladder_return(price_return, size_short, step_bps, "short")
         return pd.DataFrame({
-            "return_long": (price_return - fee_cost) * size_long,
-            "return_short": (price_return + fee_cost) * size_short,
-            "return_long_raw": price_return * size_long,
-            "return_short_raw": price_return * size_short,
+            "return_long": long_raw - fee_cost * size_long,
+            "return_short": short_raw + fee_cost * size_short,
+            "return_long_raw": long_raw,
+            "return_short_raw": short_raw,
         }, index=df.index)
 
     def engineer_features(self) -> None:
@@ -399,14 +405,51 @@ class AgamottoResearch:
         for col in df.columns:
             if col.endswith("_close"):
                 base = col[:-6]
-                close = df[col]
+                # Every per-symbol feature is computed on the symbol's OWN bars,
+                # then reindexed back onto the wide frame at the end of this
+                # block. `self.raw` is an OUTER join across symbols (load():
+                # `pd.concat(frames, axis=1)`), so a bar that another symbol has
+                # and this one lacks is a NaN row in this symbol's columns.
+                # Computed on that grid, the features read the injected row as
+                # data: TA-Lib carries an interior NaN forward — for good on the
+                # recursive indicators (RSI/ADX/ATR/MACD/BBANDS/STOCH/TRIX/
+                # ULTOSC/CMO, all running-sum or Wilder-smoothed) — and the
+                # pandas features count it in every rolling window, drop the
+                # return across the gap, NaN the forward target of the bar
+                # before it, and `fillna(0.0)` a fabricated acf_lag1. Measured
+                # 2026-09-10 on a 115-symbol US 15m panel: 24 of 73 feature
+                # columns finite on exactly 17.2% of rows (the 24 TA-Lib
+                # outputs), vs 100% on the crypto control panel; and on a
+                # synthetic two-symbol panel where B lacks 5 interior bars, 64
+                # of 84 B columns differ from the own-bar computation. Binance
+                # perps share one grid, so `own` is all-True there and this is
+                # a no-op (tests/test_features_per_symbol_grid.py pins that
+                # bit-for-bit). Rows the symbol genuinely lacks stay NaN — no
+                # forward-fill, no fabricated bars.
+                #
+                # "Lacks" is decided on EVERY one of the symbol's columns, not
+                # on close alone: a row the join manufactured is NaN across all
+                # of them, while a bar in the symbol's own data with a NaN cell
+                # (a missing high, a NaN close beside a finite volume) is still
+                # a bar, is KEPT, and keeps pandas/TA-Lib's NaN semantics
+                # exactly as before. agamotto_core's feature engine — the live
+                # sentinel bots — reproduces those semantics cell for cell, and
+                # its gate (agamotto_core/tests/feature_parity.py, the "NaN
+                # holes" and "staggered LEADING NaNs" scenarios) fails on a
+                # close-only rule. The two rules agree on every join-injected
+                # row, which is the whole measured defect.
+                sym_cols = [c for c in df.columns if c.startswith(f"{base}_")]
+                own = df[sym_cols].notna().any(axis=1)
+                sdf = df.loc[own, sym_cols]
+                sym_frames: List[pd.Series] = []
+                close = sdf[col]
                 open_col = f"{base}_open"
                 high_col = f"{base}_high"
                 low_col = f"{base}_low"
 
-                open_series = df.get(open_col, close)
-                high_series = df.get(high_col, close)
-                low_series = df.get(low_col, close)
+                open_series = sdf.get(open_col, close)
+                high_series = sdf.get(high_col, close)
+                low_series = sdf.get(low_col, close)
 
                 price_range = (high_series - low_series).rename(f"{base}_price_range")
                 price_range_pct = ((high_series - low_series) / (open_series + 1e-8)).rename(f"{base}_price_range_pct")
@@ -473,15 +516,14 @@ class AgamottoResearch:
                     price_return_short_raw = mm_cols["return_short_raw"].rename(
                         f"{base}_return_short_raw")
                 else:
+                    # Per-rung entry pricing, same as `_compute_ladder_returns`.
                     fee_cost = fee_rate * 2.0
-                    long_per_layer_return = price_return - fee_cost
-                    price_return_long = (long_per_layer_return * size_long).rename(f"{base}_return_long")
-
-                    short_raw_per_layer = price_return + fee_cost
-                    price_return_short = (short_raw_per_layer * size_short).rename(f"{base}_return_short")
-
-                    price_return_long_raw = (price_return * size_long).rename(f"{base}_return_long_raw")
-                    price_return_short_raw = (price_return * size_short).rename(f"{base}_return_short_raw")
+                    long_raw = compute_ladder_return(price_return, size_long, step_bps, "long")
+                    short_raw = compute_ladder_return(price_return, size_short, step_bps, "short")
+                    price_return_long = (long_raw - fee_cost * size_long).rename(f"{base}_return_long")
+                    price_return_short = (short_raw + fee_cost * size_short).rename(f"{base}_return_short")
+                    price_return_long_raw = long_raw.rename(f"{base}_return_long_raw")
+                    price_return_short_raw = short_raw.rename(f"{base}_return_short_raw")
 
                 if dual_horizon:
                     price_return_2bar = (close.shift(-2) / close_safe - 1)
@@ -498,10 +540,12 @@ class AgamottoResearch:
                         close_safe, 2.0 * close_safe - high_max2, ladder_short, step_bps)
 
                     ret_2bar = price_return_2bar.rename(f"{base}_ret_2bar")
-                    return_long_2bar = ((price_return_2bar - fee_cost) * size_long2).rename(f"{base}_return_long_2bar")
-                    return_short_2bar = ((price_return_2bar + fee_cost) * size_short2).rename(f"{base}_return_short_2bar")
-                    return_long_2bar_raw = (price_return_2bar * size_long2).rename(f"{base}_return_long_2bar_raw")
-                    return_short_2bar_raw = (price_return_2bar * size_short2).rename(f"{base}_return_short_2bar_raw")
+                    long2_raw = compute_ladder_return(price_return_2bar, size_long2, step_bps, "long")
+                    short2_raw = compute_ladder_return(price_return_2bar, size_short2, step_bps, "short")
+                    return_long_2bar = (long2_raw - fee_cost * size_long2).rename(f"{base}_return_long_2bar")
+                    return_short_2bar = (short2_raw + fee_cost * size_short2).rename(f"{base}_return_short_2bar")
+                    return_long_2bar_raw = long2_raw.rename(f"{base}_return_long_2bar_raw")
+                    return_short_2bar_raw = short2_raw.rename(f"{base}_return_short_2bar_raw")
 
                 return_dip = (low_next / close_safe - 1).rename(f"{base}_return_dip")
                 return_rip = (high_next / close_safe - 1).rename(f"{base}_return_rip")
@@ -519,8 +563,8 @@ class AgamottoResearch:
 
                 volume_features = []
                 
-                if f"{base}_volume" in df.columns:
-                    vol = df[f"{base}_volume"]
+                if f"{base}_volume" in sdf.columns:
+                    vol = sdf[f"{base}_volume"]
                     vol_ma = vol.rolling(7, min_periods=1).mean()
                     vol_ratio = (vol / (vol_ma + 1e-8)).rename(f"{base}_vol_ratio")
                     volume_features.append(vol_ratio)
@@ -529,21 +573,21 @@ class AgamottoResearch:
                     volume_features.append(vol_ret.shift(2).rename(f"{base}_vol_ret_lag2"))
                     volume_features.append(vol_ret.shift(3).rename(f"{base}_vol_ret_lag3"))
 
-                if f"{base}_quote_volume" in df.columns:
-                    quote_vol = df[f"{base}_quote_volume"]
+                if f"{base}_quote_volume" in sdf.columns:
+                    quote_vol = sdf[f"{base}_quote_volume"]
                     quote_vol_ma = quote_vol.rolling(7, min_periods=1).mean()
                     quote_vol_ratio = (quote_vol / (quote_vol_ma + 1e-8)).rename(f"{base}_quote_vol_ratio")
                     volume_features.append(quote_vol_ratio)
 
                     taker_buy_col = f"{base}_taker_buy_quote_volume"
-                    if taker_buy_col in df.columns:
-                        taker_buy = df[taker_buy_col]
+                    if taker_buy_col in sdf.columns:
+                        taker_buy = sdf[taker_buy_col]
                         buy_pressure = (taker_buy / (quote_vol + 1e-8)).rename(f"{base}_buy_pressure")
                         volume_features.append(buy_pressure)
                     
                     trades_col = f"{base}_number_of_trades"
-                    if trades_col in df.columns:
-                        num_trades = df[trades_col]
+                    if trades_col in sdf.columns:
+                        num_trades = sdf[trades_col]
                         trades_ma = num_trades.rolling(7, min_periods=1).mean()
                         trade_intensity = (num_trades / (trades_ma + 1e-8)).rename(f"{base}_trade_intensity")
                         volume_features.append(trade_intensity)
@@ -555,52 +599,52 @@ class AgamottoResearch:
                     h_vals = high_series.values.astype(float)
                     l_vals = low_series.values.astype(float)
                     
-                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=14), index=df.index, name=f"{base}_rsi"))
-                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=7), index=df.index, name=f"{base}_rsi_7"))
-                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=28), index=df.index, name=f"{base}_rsi_28"))
+                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=14), index=close.index, name=f"{base}_rsi"))
+                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=7), index=close.index, name=f"{base}_rsi_7"))
+                    ta_features.append(pd.Series(talib.RSI(c_vals, timeperiod=28), index=close.index, name=f"{base}_rsi_28"))
                     macd, macdsignal, macdhist = talib.MACD(c_vals, fastperiod=12, slowperiod=26, signalperiod=9)
-                    ta_features.append(pd.Series(macd, index=df.index, name=f"{base}_macd"))
-                    ta_features.append(pd.Series(macdhist, index=df.index, name=f"{base}_macdhist"))
+                    ta_features.append(pd.Series(macd, index=close.index, name=f"{base}_macd"))
+                    ta_features.append(pd.Series(macdhist, index=close.index, name=f"{base}_macdhist"))
                     
                     slowk, slowd = talib.STOCH(h_vals, l_vals, c_vals, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)
-                    ta_features.append(pd.Series(slowk, index=df.index, name=f"{base}_stoch_k"))
-                    ta_features.append(pd.Series(slowd, index=df.index, name=f"{base}_stoch_d"))
+                    ta_features.append(pd.Series(slowk, index=close.index, name=f"{base}_stoch_k"))
+                    ta_features.append(pd.Series(slowd, index=close.index, name=f"{base}_stoch_d"))
                     
-                    ta_features.append(pd.Series(talib.CCI(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_cci"))
-                    ta_features.append(pd.Series(talib.ADX(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_adx"))
-                    ta_features.append(pd.Series(talib.DX(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_dx"))
-                    ta_features.append(pd.Series(talib.PLUS_DI(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_plus_di"))
-                    ta_features.append(pd.Series(talib.MINUS_DI(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_minus_di"))
-                    ta_features.append(pd.Series(talib.MOM(c_vals, timeperiod=10), index=df.index, name=f"{base}_mom"))
-                    ta_features.append(pd.Series(talib.ROC(c_vals, timeperiod=10), index=df.index, name=f"{base}_roc"))
-                    ta_features.append(pd.Series(talib.WILLR(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_willr"))
-                    ta_features.append(pd.Series(talib.CMO(c_vals, timeperiod=14), index=df.index, name=f"{base}_cmo"))
-                    ta_features.append(pd.Series(talib.TRIX(c_vals, timeperiod=30), index=df.index, name=f"{base}_trix"))
-                    ta_features.append(pd.Series(talib.ULTOSC(h_vals, l_vals, c_vals, timeperiod1=7, timeperiod2=14, timeperiod3=28), index=df.index, name=f"{base}_ultosc"))
+                    ta_features.append(pd.Series(talib.CCI(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_cci"))
+                    ta_features.append(pd.Series(talib.ADX(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_adx"))
+                    ta_features.append(pd.Series(talib.DX(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_dx"))
+                    ta_features.append(pd.Series(talib.PLUS_DI(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_plus_di"))
+                    ta_features.append(pd.Series(talib.MINUS_DI(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_minus_di"))
+                    ta_features.append(pd.Series(talib.MOM(c_vals, timeperiod=10), index=close.index, name=f"{base}_mom"))
+                    ta_features.append(pd.Series(talib.ROC(c_vals, timeperiod=10), index=close.index, name=f"{base}_roc"))
+                    ta_features.append(pd.Series(talib.WILLR(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_willr"))
+                    ta_features.append(pd.Series(talib.CMO(c_vals, timeperiod=14), index=close.index, name=f"{base}_cmo"))
+                    ta_features.append(pd.Series(talib.TRIX(c_vals, timeperiod=30), index=close.index, name=f"{base}_trix"))
+                    ta_features.append(pd.Series(talib.ULTOSC(h_vals, l_vals, c_vals, timeperiod1=7, timeperiod2=14, timeperiod3=28), index=close.index, name=f"{base}_ultosc"))
 
                     fastk, fastd = talib.STOCHRSI(c_vals, timeperiod=14, fastk_period=5, fastd_period=3, fastd_matype=0)
-                    ta_features.append(pd.Series(fastk, index=df.index, name=f"{base}_stochrsi_k"))
-                    ta_features.append(pd.Series(fastd, index=df.index, name=f"{base}_stochrsi_d"))
+                    ta_features.append(pd.Series(fastk, index=close.index, name=f"{base}_stochrsi_k"))
+                    ta_features.append(pd.Series(fastd, index=close.index, name=f"{base}_stochrsi_d"))
 
-                    v_vals = df[f"{base}_volume"].values.astype(float)
-                    obv_raw = pd.Series(talib.OBV(c_vals, v_vals), index=df.index)
-                    ad_raw = pd.Series(talib.AD(h_vals, l_vals, c_vals, v_vals), index=df.index)
+                    v_vals = sdf[f"{base}_volume"].values.astype(float)
+                    obv_raw = pd.Series(talib.OBV(c_vals, v_vals), index=close.index)
+                    ad_raw = pd.Series(talib.AD(h_vals, l_vals, c_vals, v_vals), index=close.index)
                     ta_features.append(obv_raw.diff(14).fillna(0.0).rename(f"{base}_obv"))
                     ta_features.append(ad_raw.diff(14).fillna(0.0).rename(f"{base}_ad"))
-                    ta_features.append(pd.Series(talib.MFI(h_vals, l_vals, c_vals, v_vals, timeperiod=14), index=df.index, name=f"{base}_mfi"))
-                    ta_features.append(pd.Series(talib.BOP(open_series.values.astype(float), h_vals, l_vals, c_vals), index=df.index, name=f"{base}_bop"))
+                    ta_features.append(pd.Series(talib.MFI(h_vals, l_vals, c_vals, v_vals, timeperiod=14), index=close.index, name=f"{base}_mfi"))
+                    ta_features.append(pd.Series(talib.BOP(open_series.values.astype(float), h_vals, l_vals, c_vals), index=close.index, name=f"{base}_bop"))
 
-                    ta_features.append(pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_atr"))
-                    ta_features.append(pd.Series(talib.NATR(h_vals, l_vals, c_vals, timeperiod=14), index=df.index, name=f"{base}_natr"))
+                    ta_features.append(pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_atr"))
+                    ta_features.append(pd.Series(talib.NATR(h_vals, l_vals, c_vals, timeperiod=14), index=close.index, name=f"{base}_natr"))
                     parkinson_vol = np.sqrt(
                         1.0 / (4.0 * np.log(2)) * (np.log(high_series / low_series) ** 2)
                     ).rolling(14).mean().rename(f"{base}_parkinson_vol")
                     ta_features.append(parkinson_vol)
                     upper, middle, lower = talib.BBANDS(c_vals, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-                    ta_features.append(pd.Series(upper, index=df.index, name=f"{base}_bb_upper"))
-                    ta_features.append(pd.Series(lower, index=df.index, name=f"{base}_bb_lower"))
+                    ta_features.append(pd.Series(upper, index=close.index, name=f"{base}_bb_upper"))
+                    ta_features.append(pd.Series(lower, index=close.index, name=f"{base}_bb_lower"))
 
-                    ta_features.append(pd.Series(talib.SAR(h_vals, l_vals, acceleration=0.02, maximum=0.2), index=df.index, name=f"{base}_sar"))
+                    ta_features.append(pd.Series(talib.SAR(h_vals, l_vals, acceleration=0.02, maximum=0.2), index=close.index, name=f"{base}_sar"))
                 except Exception as e:
                     logger.warning(f"TA-Lib error for {base}: {e}")
 
@@ -642,7 +686,7 @@ class AgamottoResearch:
                     .rename(f"{base}_acf_lag1")
                 )
 
-                engineered_frames.extend([
+                sym_frames.extend([
                     price_range,
                     price_range_pct,
                     price_range_pct_q50,
@@ -677,7 +721,7 @@ class AgamottoResearch:
                 # :213). They are kept out of the MODEL by
                 # gauntlet/rolling_predict_returns.select_feature_columns.
                 _ta_by_name = {s.name: s for s in ta_features}
-                _src = {f"{base}_close": close, f"{base}_volume": df[f"{base}_volume"]}
+                _src = {f"{base}_close": close, f"{base}_volume": sdf[f"{base}_volume"]}
                 for _n in ("sar", "bb_upper", "bb_lower", "macd", "macdhist", "obv", "ad"):
                     if f"{base}_{_n}" in _ta_by_name:
                         _src[f"{base}_{_n}"] = _ta_by_name[f"{base}_{_n}"]
@@ -685,7 +729,7 @@ class AgamottoResearch:
                          ("close", "sar", "bb_upper", "bb_lower", "macd",
                           "macdhist", "obv", "ad", "volume")]
                 if all(k in _src for k in _need):
-                    engineered_frames.extend([
+                    sym_frames.extend([
                         s for _, s in scale_free_levels(
                             pd.DataFrame(_src),
                             prefix=f"{base}_",
@@ -705,13 +749,17 @@ class AgamottoResearch:
                         base, [k for k in _need if k not in _src])
 
                 if dual_horizon:
-                    engineered_frames.extend([
+                    sym_frames.extend([
                         ret_2bar,
                         return_long_2bar,
                         return_short_2bar,
                         return_long_2bar_raw,
                         return_short_2bar_raw,
                     ])
+
+                # Back onto the wide grid. Rows this symbol has no bar for are
+                # NaN; every row it does have is exactly the own-bar value.
+                engineered_frames.extend(s.reindex(df.index) for s in sym_frames)
 
         feature_df = pd.concat(engineered_frames, axis=1)
 

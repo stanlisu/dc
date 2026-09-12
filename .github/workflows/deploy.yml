@@ -6,6 +6,16 @@ on:
     types: [completed]
     branches: [main]
 
+# One deploy at a time. Two Tests runs completing back to back (two merges
+# minutes apart) spawn two Deploy runs for the SAME head SHA; on 2026-09-10
+# runs 34483688052 and 34483718346 rsynced shield2 concurrently and the first
+# one's verify step saw the second one's bytes -> "FAILED VERIFICATION" on a
+# host that was in fact correctly deployed. Queue, never cancel: the later run
+# carries the newer tree and must still land.
+concurrency:
+  group: deploy-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
@@ -36,6 +46,12 @@ jobs:
             rm -rf "$build_dir"
             mkdir -p "$build_dir"
             pyarmor gen -O "$build_dir/src" -r "${algo}_pkg/src/$algo"
+            # Provenance stamp, same file build_distribution.sh writes
+            # (`src/<algo>/BUILD_SHA`). This step is an inline copy of that
+            # script's build, so #73's stamp never reached a CI deploy —
+            # measured on shield2 2026-09-10 after b053fdf: new PyArmor header,
+            # no BUILD_SHA. Never `-dirty` here: CI builds a clean checkout.
+            printf '%s\n' "${{ github.event.workflow_run.head_sha }}" > "$build_dir/src/$algo/BUILD_SHA"
             # map.json is DATA — pyarmor gen only processes .py and drops it;
             # codec.py loads it from next to itself.
             if [ -f "${algo}_pkg/src/$algo/_obf/map.json" ]; then
@@ -130,12 +146,20 @@ jobs:
       # host. It exits non-zero if the deployed bytes are not the imported
       # bytes, so a silent stale deploy fails the job.
       - name: Deploy to Hydra
+        id: hydra
+        # A live bot on hydra makes deploy_host.sh REFUSE (bot_guard) — that is the
+        # guard working, not a deploy failure, and it must not abort the job before
+        # Shield2 (a research host with no bots) is reached. Measured 2026-09-10: run
+        # 34432227738 built fine, Hydra refused, Shield and Shield2 were SKIPPED, and
+        # the merged per-symbol TA fix (#71) never reached the research host.
+        continue-on-error: true
         run: |
           bash scripts/deploy_host.sh \
             --host stan@13.115.134.141 \
             --python '$HOME/miniconda3/envs/py313/bin/python'
 
       - name: Deploy to Shield
+        id: shield
         # Shield is a LAN address (192.168.72.135) — unreachable from
         # GitHub-hosted runners. Fail fast + continue so Shield2 still runs;
         # deploy Shield manually via build_distribution.sh until a
@@ -149,7 +173,19 @@ jobs:
             --ssh-opts '-o ConnectTimeout=15'
 
       - name: Deploy to Shield2
+        id: shield2
         run: |
           bash scripts/deploy_host.sh \
             --host stan@3.112.232.77 \
             --python '$HOME/miniconda3/envs/py313/bin/python'
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          echo "hydra=${{ steps.hydra.outcome }}  shield=${{ steps.shield.outcome }}  shield2=${{ steps.shield2.outcome }}"
+          # hydra/shield may legitimately be refused (live bot) or unreachable; the
+          # outcomes above are the record. Shield2 is the research host every merge
+          # must reach — its failure is the job's failure.
+          if [ "${{ steps.shield2.outcome }}" != "success" ]; then
+            echo "::error::Deploy to Shield2 did not succeed (outcome: ${{ steps.shield2.outcome }})"; exit 1
+          fi
