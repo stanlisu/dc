@@ -619,3 +619,4 @@ STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
   this run had overwritten the tree at 13:36:49 — a two-deploys-one-host race, not a bad build. Also fixed
   here (workflow `concurrency` group, queue not cancel). Hydra and shield were refused by the live-process
   gate, as designed; hydra still runs dc=37129bf (see the 2026-09-08 entry).
+2026-09-12T05:24:04Z  deploy 9 algos -> hydra shield2  dc=0021b7ef1  (via scripts/sync_all_repos.sh)  skipped: shield(unknown)  failed: none
