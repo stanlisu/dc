@@ -969,6 +969,44 @@ int main()
               "a halted ladder arms nothing");
     }
 
+    // ---- [18] ONLY THE CROSSING EXIT MAY TAKE ------------------------------
+    // The sender lives on AgamottoStrategy and cannot be linked into a test
+    // binary, so the DECISION is pulled out here where it can be pinned. A
+    // ladder priced through the book and sent post-only is rejected by the
+    // venue by construction: measured 2026-09-09, EXIT_CROSSING placed 1689
+    // times and filled ONCE, while AIM/ENTRY/EXIT_PASSIVE filled 62-88%.
+    std::printf("[18] only the crossing exit may take\n");
+    {
+        check(ladderCrosses(LadderKind::EXIT_CROSSING),
+              "phase B is priced off the CONSUMING side, so it must be allowed "
+              "to take -- post-only there self-rejects");
+        check(!ladderCrosses(LadderKind::ENTRY),
+              "an entry rung walks AWAY from the touch and must stay post-only");
+        check(!ladderCrosses(LadderKind::AIM),
+              "the profit target rests on our own side and must stay post-only");
+        check(!ladderCrosses(LadderKind::EXIT_PASSIVE),
+              "phase A rests at the conservative anchor and must stay post-only");
+        check(!ladderCrosses(LadderKind::NONE),
+              "NONE rests nothing and must never be treated as crossing");
+
+        // The pairing that matters: whatever desiredLadder emits for phase B
+        // must be the kind that crosses, and the aim ladder must not be.
+        LadderState ex{};
+        ex.phase = Phase::EXITING; ex.side = +1; ex.filled_qty = 1.0;
+        ex.avg_cost = 100.0; ex.exit_started_at = NOW_S;
+        Target t{};
+        double asks[4] = {100.10, 100.20, 100.30, 100.40};
+        Desired b = desiredLadder(ex, t, book(100.0, 100.1), asks, 4, cfg(),
+                                  NOW_S + cfg().passive_sec + 1.0);
+        check(b.kind == LadderKind::EXIT_CROSSING, "past passive_sec -> phase B");
+        check(ladderCrosses(b.kind),
+              "and phase B's own kind reports that it crosses");
+        Desired a = desiredLadder(ex, t, book(100.0, 100.1), asks, 4, cfg(),
+                                  NOW_S + 1.0);
+        check(a.kind == LadderKind::EXIT_PASSIVE, "inside passive_sec -> phase A");
+        check(!ladderCrosses(a.kind), "phase A does not cross");
+    }
+
     std::printf("\n=== %s: %d checks, %d failures ===\n",
                 g_failures == 0 ? "MM LADDER PASS" : "MM LADDER FAIL",
                 g_checks, g_failures);
