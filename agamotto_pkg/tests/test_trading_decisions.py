@@ -69,6 +69,10 @@ def trading_instance():
 
         inst = AgamottoTrading(config=config, home_root="/tmp", period="window_test")
 
+    # make_decision() now opens with reload_regime_stack(), which stats
+    # REGIME_STACK_PATH ("/tmp/fake_regime_stack.csv", never actually written
+    # here) — not what these tests exercise.
+    inst.reload_regime_stack = MagicMock()
     inst.engineer_features = MagicMock()
 
     # Build a vertical_features DataFrame with settled timestamp
