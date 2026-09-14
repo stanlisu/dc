@@ -410,6 +410,49 @@ class AgamottoTrading(AgamottoResearch):
                 f"Loaded regime: {
                     strat_entry['id']} (Threshold: {threshold})")
 
+    def reload_regime_stack(self) -> None:
+        """Re-read ``REGIME_STACK_PATH`` if it changed on disk since the last load.
+
+        ``_load_regime_stack()`` used to run only once, in ``__init__`` — a live
+        process kept trading whatever stack it booted with even after
+        ``/gauntlet-rolling`` (``filter_regime_stacks.py``) overwrote the CSV with
+        a new leg list. tesseract, which reads the file fresh every time, would
+        then diverge from what the bot was actually trading with no restart and
+        no error (2026-03-22 agamotto1h_1 TvL mismatch,
+        ``tesseract/tests/test_agamotto1h_validate.py``).
+
+        Called at the top of every ``make_decision()`` cycle. Gated on mtime
+        rather than unconditional: ``_load_regime_stack()`` re-``joblib.load``s
+        every leg's model/scaler/metadata pickles, which is too costly to pay
+        every cycle when the file has not moved. ``__init__`` does not seed
+        ``_regime_stack_mtime``, so the first cycle after boot always reloads
+        once — harmless, it re-reads exactly what ``__init__`` just loaded;
+        keeps this method the ONLY place that touches the filesystem for this,
+        so a test that mocks ``_load_regime_stack`` without a real file on
+        disk (fine for ``__init__``, which no longer stats anything) only
+        needs to also mock this method once it starts calling
+        ``make_decision()``. Exceptions from a bad or mid-write read are NOT
+        swallowed here — they propagate exactly like every other per-cycle
+        failure in this bridge ("let it crash, watchdog restarts":
+        ``knull/orb_bridge.py::_run_one_cycle``), so a torn read during a roll
+        fails loudly instead of silently keeping (or discarding) a stack
+        nobody can see was used.
+        """
+        if not self.regime_stack_path:
+            return
+        mtime = os.path.getmtime(self.regime_stack_path)
+        if mtime == getattr(self, "_regime_stack_mtime", None):
+            return
+        logger.info(
+            f"Regime stack file changed (mtime {mtime} != "
+            f"{getattr(self, '_regime_stack_mtime', None)}) — reloading "
+            f"{self.regime_stack_path}")
+        self._load_regime_stack()
+        self._regime_stack_mtime = mtime
+        if not self.regime_stack:
+            logger.error(
+                f"Regime stack at {self.regime_stack_path} reloaded NO valid models!")
+
     def _load_latest_weights(self, base_dir: str) -> None:
         logger.info(f"Loading single-directory weights from {base_dir}")
         if not os.path.isdir(base_dir):
@@ -778,6 +821,10 @@ class AgamottoTrading(AgamottoResearch):
         """
         Orchestrator for generating decisions using regime stack.
         """
+        # Pick up a stack rolled since boot (or the previous cycle) before
+        # deciding anything this cycle — see reload_regime_stack().
+        self.reload_regime_stack()
+
         # 1. Initialize decisions
         self.decisions = {sym: [0.0, 0.0] for sym in self.config.get("SYMBOLS", [])}
         # Per-side regime counts, RAW (pre-REVERSE), for every symbol that had

@@ -77,6 +77,10 @@ def mock_agamotto(mock_config):
         agamotto.engineer_features = MagicMock()
         agamotto.verticalize = MagicMock()
         agamotto.filter_signals = MagicMock()
+        # make_decision() now opens with reload_regime_stack(), which stats
+        # REGIME_STACK_PATH ("/tmp/fake_regime_stack.csv", never actually
+        # written here) — not what these tests exercise.
+        agamotto.reload_regime_stack = MagicMock()
 
         return agamotto
 
