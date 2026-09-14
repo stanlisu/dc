@@ -621,3 +621,6 @@ STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
   gate, as designed; hydra still runs dc=37129bf (see the 2026-09-08 entry).
 2026-09-12T05:24:04Z  deploy 9 algos -> hydra shield2  dc=0021b7ef1  (via scripts/sync_all_repos.sh)  skipped: shield(unknown)  failed: none
 2026-09-12T06:09:07Z  deploy 9 algos -> hydra shield shield2  dc=cef509327-dirty  (via scripts/sync_all_repos.sh)  skipped: none  failed: none
+2026-09-13T14:49:15Z  deploy 9 algos -> shield shield2  dc=3bfef8384  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
+2026-09-14T09:20:37Z  deploy 9 algos -> shield shield2  dc=9b2b72b61-dirty  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
+2026-09-14T09:25:36Z  deploy 9 algos -> hydra  dc=9b2b72b61-dirty  (via scripts/deploy_host.sh, same build as 09:20:37Z shield/shield2; hydra infra (OMS/feed/refresher/reconciler) stopped first to clear the guard; dirty file = deploy.log only)  skipped: none  failed: none
