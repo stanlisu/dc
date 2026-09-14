@@ -378,8 +378,12 @@ int main()
         LadderState st{};
         check(st.phase == Phase::FLAT, "starts FLAT");
         // Placing the first entry rung is what moves us, not the signal.
-        LadderState s1 = onPlaced(st, /*uid*/1, 100.0, 0.001, +1, 1000.0);
+        LadderState s1 = onPlaced(st, /*uid*/1, 100.0, 0.001, +1, 1000.0,
+                                  /*unit_qty*/0.001);
         check(s1.phase == Phase::ENTERING, "first placed rung -> ENTERING");
+        checkClose(s1.unit_qty, 0.001, 1e-15,
+                   "the entry placement latches the target's unit qty");
+        check(!s1.halted, "an entry rung WITH a unit does not halt");
         check(s1.side == +1, "side is latched on the first placement");
         checkClose(s1.entered_at, 1000.0, 1e-9, "entry clock starts");
         checkClose(s1.tier_capacity, 0.001, 1e-12,
@@ -481,14 +485,25 @@ int main()
         // every size-up would raise the cap it is measured against and the
         // position cap would never bind.
         LadderState st{};
-        LadderState s1 = onPlaced(st, 1, 100.0, 0.001, +1, 1000.0);
-        LadderState s2 = onPlaced(s1, 2, 99.9, 0.001, +1, 1000.0);
+        LadderState s1 = onPlaced(st, 1, 100.0, 0.001, +1, 1000.0, 0.001);
+        LadderState s2 = onPlaced(s1, 2, 99.9, 0.001, +1, 1000.0, 0.001);
         checkClose(s2.tier_capacity, 0.002, 1e-12,
                    "capacity accrues across the FIRST ladder's rungs");
         s2.level = 2;                     // a size-up tier has fired
-        LadderState s3 = onPlaced(s2, 3, 99.0, 0.005, +1, 1100.0);
+        // Past level 1 the unit is not read: passing none must not halt.
+        LadderState s3 = onPlaced(s2, 3, 99.0, 0.005, +1, 1100.0, 0.0);
         checkClose(s3.tier_capacity, 0.002, 1e-12,
                    "capacity does NOT grow once past level 1");
+        check(!s3.halted && s3.unit_qty == 0.001,
+              "a size-up placement neither halts nor rewrites the latched unit");
+    }
+    {
+        // An entry rung that reached the venue with NO unit: desiredLadder never
+        // emits one (a target without units rests nothing), so the model is
+        // already wrong. Counting OPEN's aim/exit rungs in a unit of zero would
+        // rest nothing on a live position -- halt instead.
+        LadderState s = onPlaced(LadderState{}, 1, 100.0, 0.001, +1, 1000.0, 0.0);
+        check(s.halted, "an entry rung placed with no unit HALTS the ladder");
     }
 
     // ---- [12] EXIT PHASE FORK --------------------------------------------
@@ -667,6 +682,7 @@ int main()
         LadderState st{};
         Target t{};
         t.fired = true; t.side = +1; t.qty = 3.3; t.signal_close = 100.5;
+        t.units = 3;                       // |net| = 3 x CAPITAL 110 at ~100
         Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4, cfg(), NOW_S);
         check(d.kind == LadderKind::ENTRY, "a fired signal from FLAT builds an ENTRY ladder");
         check(d.side == +1, "long signal buys");
@@ -675,6 +691,20 @@ int main()
         // anchor = min(bid 100.0, close 100.5) = 100.0, walking DOWN
         checkClose(d.px[0], 100.0, 1e-9, "rung 0 at the clamped anchor");
         check(d.px[1] < d.px[0], "rungs walk away from the market");
+        check(d.n == 3, "|net| = 3 rests exactly 3 rungs");
+    }
+    {   // THE COUNT IS CARRIED, NOT RECOVERED. The same target without its
+        // |net| rests nothing: there is no unit to count rungs in, and taking one
+        // back out of the lot-floored qty is what rested |net|+1 rungs on every
+        // symbol (sentinel tests/mm_rung_count_driver.cpp).
+        LadderState st{};
+        Target t{};
+        t.fired = true; t.side = +1; t.qty = 3.3; t.signal_close = 100.5;
+        t.units = 0;
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4, cfg(), NOW_S);
+        check(d.kind == LadderKind::NONE && d.n == 0,
+              "a fired target with no units rests nothing");
+        check(unitQty(t) == 0.0, "and has no unit qty");
     }
     {   // ENTERING with part of the target already filled -> the ladder sizes
         // the REMAINDER. Re-laddering the full target on every reprice would
@@ -686,19 +716,36 @@ int main()
         st.filled_qty = 1.1;               // one rung's worth already done
         Target t{};
         t.fired = true; t.side = +1; t.qty = 3.3; t.signal_close = 100.5;
+        t.units = 3;
         Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4,
                                   cfg(), NOW_S);
         check(d.kind == LadderKind::ENTRY, "ENTERING keeps repricing the entry");
-        // slice = capital/anchor = 110/100 = 1.1; remaining 2.2 -> 2 rungs, not 3
+        // unit = 3.3 / 3 = 1.1; remaining 2.2 -> 2 rungs, not 3
         check(d.n == 2, "sizes the REMAINDER (2 rungs), not the whole target (3)");
+    }
+    {   // ROUND, not ceil. A lot-floored target leaves each filled rung a hair
+        // under one unit, so the remainder is a hair OVER a whole number of
+        // units: 3.299 / 3 = 1.09967 a unit, the first rung filled 1.099, and
+        // 2.200 / 1.09967 = 2.0006. ceil reads that as 3 rungs.
+        LadderState st{};
+        st.phase = Phase::ENTERING;
+        st.side = +1;
+        st.filled_qty = 1.099;
+        Target t{};
+        t.fired = true; t.side = +1; t.qty = 3.299; t.signal_close = 100.5;
+        t.units = 3;
+        Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4,
+                                  cfg(), NOW_S);
+        check(d.n == 2, "a lot-floored remainder of two units is 2 rungs, not 3");
     }
     {   // The rung count is capped at MAX_RUNGS_PER_LADDER, whatever the size.
         LadderState st{};
         Target t{};
         t.fired = true; t.side = +1; t.qty = 11.0; t.signal_close = 100.5;
+        t.units = 10;
         Desired d = desiredLadder(st, t, book(100.0, 100.1), bid_depth, 4,
                                   cfg(), NOW_S);
-        // 11.0 / 1.1 = 10 rungs uncapped; MAX_RUNGS_PER_LADDER is 5
+        // 10 units = 10 rungs uncapped; MAX_RUNGS_PER_LADDER is 5
         check(d.n == 5, "10 rungs of intent is capped to MAX_RUNGS_PER_LADDER");
     }
     {   // OPEN -> the AIM ladder: opposite side, reduce_only, priced off cost
@@ -707,6 +754,7 @@ int main()
         st.side = +1;
         st.filled_qty = 2.2;
         st.avg_cost = 100.0;
+        st.unit_qty = 1.1;                 // 2 units, latched at entry
         Desired d = desiredLadder(st, Target{}, book(100.0, 100.1), bid_depth, 4,
                                   cfg(), NOW_S);
         check(d.kind == LadderKind::AIM, "OPEN rests the aim ladder");
@@ -730,6 +778,7 @@ int main()
         st.side = +1;
         st.filled_qty = 2.2;
         st.avg_cost = 100.0;
+        st.unit_qty = 1.1;                 // 2 units, latched at entry
         st.exit_started_at = NOW_S;
         // `last` must sit ON the tick grid or this measures rounding rather
         // than the min(). 100.05 against a 0.1 tick snapped to 100.0 and the
@@ -753,6 +802,7 @@ int main()
         st.side = +1;
         st.filled_qty = 2.2;
         st.avg_cost = 100.0;
+        st.unit_qty = 1.1;                 // 2 units, latched at entry
         st.exit_started_at = NOW_S;
         // 60s passive elapsed, 0s into phase B -> depth 1 -> bid_depth[0]
         Desired d = desiredLadder(st, Target{}, book(100.0, 100.2, 100.05),
@@ -772,6 +822,7 @@ int main()
         st.side = +1;
         st.filled_qty = 2.2;
         st.avg_cost = 100.0;
+        st.unit_qty = 1.1;                 // 2 units, latched at entry
         st.halted = true;
         Desired d = desiredLadder(st, Target{}, book(100.0, 100.1), bid_depth, 4,
                                   cfg(), NOW_S);
@@ -783,6 +834,7 @@ int main()
         st.side = +1;
         st.filled_qty = 2.2;
         st.avg_cost = 100.0;
+        st.unit_qty = 1.1;                 // 2 units, latched at entry
         Book b = book(0.0, 100.1);        // one-sided
         Desired d = desiredLadder(st, Target{}, b, bid_depth, 4, cfg(), NOW_S);
         check(d.kind == LadderKind::NONE, "a one-sided book rests nothing");
@@ -814,6 +866,7 @@ int main()
         t.fired = true;
         t.side = -1;
         t.qty = 0.8;
+        t.units = 1;
         t.signal_close = 123.60;
 
         Desired first = desiredLadder(st, t, book(123.73, 123.74), bid_depth, 4,
@@ -854,6 +907,7 @@ int main()
         st.filled_qty = 0.005;
         st.avg_cost = 100.0;
         st.tier_capacity = 0.005;
+        st.unit_qty = 0.001;              // a 5-unit tier, latched at entry
         st.level = 1;
         Target t{};                       // no live target: OPEN does not need one
 
@@ -880,6 +934,7 @@ int main()
         for (int i = 0; i < d.n; ++i) total += d.qty[i];
         checkClose(total, 0.005, 1e-9,
                    "the tier is one capacity, taking the position to 2x");
+        check(d.n == 5, "a whole 5-unit tier rests 5 rungs");
 
         // -- unarmed and unmoved, OPEN still aims. The new branch must not
         //    steal the aim ladder.
@@ -951,6 +1006,7 @@ int main()
         sh.filled_qty = 0.005;
         sh.avg_cost = 100.0;
         sh.tier_capacity = 0.005;
+        sh.unit_qty = 0.001;
         sh.level = 1;
         check(!armTier(sh, book(99.9, 100.0), cfg()).tier_triggered[1],
               "a short does not arm when the ask falls");
@@ -994,6 +1050,7 @@ int main()
         LadderState ex{};
         ex.phase = Phase::EXITING; ex.side = +1; ex.filled_qty = 1.0;
         ex.avg_cost = 100.0; ex.exit_started_at = NOW_S;
+        ex.unit_qty = 1.0;
         Target t{};
         double asks[4] = {100.10, 100.20, 100.30, 100.40};
         Desired b = desiredLadder(ex, t, book(100.0, 100.1), asks, 4, cfg(),
