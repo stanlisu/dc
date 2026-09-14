@@ -276,6 +276,16 @@ mutate "entry ignores what is already filled (re-buys the whole target)" \
     "        const double remaining_ = aTarget.qty - aState.filled_qty;" \
     "        const double remaining_ = aTarget.qty;"
 
+mutate "rung count uses ceil (a lot-floored remainder reads one rung high)" \
+    "        long n_ = std::lround(aTotal / aUnitQty);" \
+    "        long n_ = static_cast<long>(std::ceil(aTotal / aUnitQty - 1e-9));"
+
+# No mutant for desiredLadder's `if (aTarget.units <= 0) return d_;`: it is
+# EQUIVALENT. Without it unitQty() is 0, rungs_for returns 0 and fill() turns
+# the ladder into NONE anyway -- measured 2026-09-14, the mutant survives for
+# exactly that reason. The [15] "no units rests nothing" check pins the
+# behaviour; the guard only states it at the top of the branch.
+
 mutate "rung count ignores MAX_RUNGS_PER_LADDER" \
     "        if (n_ > aCfg.max_rungs_per_ladder) n_ = aCfg.max_rungs_per_ladder;" \
     "        if (false) n_ = aCfg.max_rungs_per_ladder;"
@@ -284,6 +294,16 @@ echo
 # THE RUNAWAY (hydra 2026-08-28). If an unrecordable placement does not halt,
 # the ladder keeps re-emitting the same ENTRY every reprice tick -- four live
 # AAVE sells in 31 seconds. Neutering the halt must be caught.
+mutate "an entry rung placed with no unit does not halt" \
+    "        if (aUnitQty > 0.0) {
+            s_.unit_qty = aUnitQty;
+        } else {
+            s_.halted = true;
+        }" \
+    "        if (aUnitQty > 0.0) {
+            s_.unit_qty = aUnitQty;
+        }"
+
 mutate "unrecordable placement does not halt" \
     "inline LadderState onPlaceUnrecordable(const LadderState& aState)
 {
