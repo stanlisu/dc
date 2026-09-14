@@ -21,17 +21,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from mjolnir.core.ladder import compute_ladder_multiplier, compute_ladder_return
 from mjolnir.core.research import MjolnirResearch
 
+STEP_BPS = 1.0
 STEP = 0.0001  # 1 bp
 FEE = 1.75     # taker bps; fee_cost = FEE/1e4 * 2 = 3.5 bps round trip
 FEE_COST = FEE / 10000.0 * 2.0
 LADDER = 3
 
 
-def _call(df, mode, horizon_bars=1, ladder=LADDER, fee=FEE):
+def _call(df, mode, horizon_bars=1, ladder=LADDER, fee=FEE, step_bps=STEP_BPS):
     fake = types.SimpleNamespace(
-        config={"LADDER": ladder, "FEE": fee, "LADDER_FILL_MODE": mode})
+        config={"LADDER": ladder, "LADDER_BPS": step_bps, "FEE": fee,
+               "LADDER_FILL_MODE": mode})
     return MjolnirResearch._compute_ladder_returns(
         fake, df, "close", "low", "high", horizon_bars=horizon_bars)
 
@@ -57,32 +60,50 @@ def df():
 
 
 def test_entry_sizing_unchanged(df):
-    """n_long/n_short still equal the entry-side penetration layers (raw/return
-    scale linearly with size, so size = return_long_raw / per-unit gross)."""
+    """n_long/n_short still equal the entry-side penetration layers: idx0's
+    3.5bp dip/rise both cap at LADDER=3 rungs, same as before 2026-09-14 (the
+    SIZE is unaffected by the per-rung-pricing fix — only the PRICING is).
+    raw is now the compute_ladder_return AGGREGATE, not price_return * 3 —
+    rewritten from independent price arithmetic per TODO.md P4, not
+    re-derived from compute_ladder_returns itself."""
     out = _call(df, "limit_then_taker")
-    # idx0: dip & rise both 3.5bp -> 3 layers each, capped at LADDER=3.
-    # per-unit gross long at idx0 = +0.0002 -> raw = 0.0002 * 3.
-    assert out["return_long_raw"].iloc[0] == pytest.approx(0.0002 * 3, rel=1e-6)
-    # UNSIGNED (2026-07-29): the short's own exit path moved +0.0002. It is NOT
-    # negated here — marvel's engine applies signal = -1. Matches agamotto.
-    assert out["return_short_raw"].iloc[0] == pytest.approx(0.0002 * 3, rel=1e-6)
+    exit_ret = 0.0002  # exit at close_h=100.02, gross vs anchor 100.00
+    expected = compute_ladder_return(
+        pd.Series([exit_ret]), pd.Series([3]), step_bps=STEP_BPS, side="long").iloc[0]
+    assert out["return_long_raw"].iloc[0] == pytest.approx(expected, abs=1e-12)
+    assert expected != pytest.approx(exit_ret * 3, abs=1e-9), (
+        "fixture no longer exercises the per-rung-pricing correction")
+    # UNSIGNED (2026-07-29): the short's own exit path also moved +0.0002. It
+    # is NOT negated here — marvel's engine applies signal = -1.
+    expected_short = compute_ladder_return(
+        pd.Series([exit_ret]), pd.Series([3]), step_bps=STEP_BPS, side="short").iloc[0]
+    assert out["return_short_raw"].iloc[0] == pytest.approx(expected_short, abs=1e-12)
 
 
 def test_limit_then_taker_penetrated_long(df):
     out = _call(df, "limit_then_taker")
-    # exit at close_h=100.02 -> gross +0.0002, fee 0.00035, size 3.
-    assert out["return_long"].iloc[0] == pytest.approx((0.0002 - FEE_COST) * 3, rel=1e-6)
+    exit_ret = 0.0002
+    raw_long = compute_ladder_return(
+        pd.Series([exit_ret]), pd.Series([3]), step_bps=STEP_BPS, side="long").iloc[0]
+    raw_short = compute_ladder_return(
+        pd.Series([exit_ret]), pd.Series([3]), step_bps=STEP_BPS, side="short").iloc[0]
+    assert out["return_long"].iloc[0] == pytest.approx(raw_long - FEE_COST * 3, abs=1e-12)
     # Fee is ADDED on the short (unsigned target): it must fall below -fee to pay.
-    assert out["return_short"].iloc[0] == pytest.approx((0.0002 + FEE_COST) * 3, rel=1e-6)
+    assert out["return_short"].iloc[0] == pytest.approx(raw_short + FEE_COST * 3, abs=1e-12)
 
 
 def test_limit_then_taker_leftover_long(df):
     out = _call(df, "limit_then_taker")
-    # NOT penetrated -> taker exit at close_2h=99.95 -> gross -0.0005.
-    assert out["return_long"].iloc[3] == pytest.approx((-0.0005 - FEE_COST) * 3, rel=1e-6)
+    # NOT penetrated -> taker exit at close_2h=99.95 -> gross -0.0005, size 3.
+    exit_ret = -0.0005
+    raw = compute_ladder_return(
+        pd.Series([exit_ret]), pd.Series([3]), step_bps=STEP_BPS, side="long").iloc[0]
+    assert out["return_long"].iloc[3] == pytest.approx(raw - FEE_COST * 3, abs=1e-12)
     # The leftover (taker-at-t+2) exit is strictly worse than the would-be maker
     # exit at close_h (gross -0.0002) — leftover honestly eats the later move.
-    maker_hypothetical = (-0.0002 - FEE_COST) * 3
+    maker_raw = compute_ladder_return(
+        pd.Series([-0.0002]), pd.Series([3]), step_bps=STEP_BPS, side="long").iloc[0]
+    maker_hypothetical = maker_raw - FEE_COST * 3
     assert out["return_long"].iloc[3] < maker_hypothetical
 
 
@@ -103,16 +124,27 @@ def test_horizon_2_window(df):
 
 
 def test_ladder_mode_is_close_to_close(df):
-    """Regression guard: 'ladder' == (price_return - fee) * entry_layers."""
+    """Regression guard, rewritten 2026-09-14 for per-rung pricing.
+
+    Was a TAUTOLOGY (TODO.md P4): it re-derived the OLD `(price_return - fee)
+    * entry_layers` formula from the same 0-indexed floor/clip arithmetic
+    compute_ladder_returns used internally, so it would pass for ANY
+    self-consistent implementation, buggy or not. Rewritten to build its
+    expectation from compute_ladder_multiplier (base-rung sizing) and
+    compute_ladder_return (per-rung pricing) — two independently-tested
+    building blocks, not a copy of compute_ladder_returns's own body.
+    """
     out = _call(df, "ladder")
     price_return = df["close"].pct_change(1, fill_method=None).shift(-1)
-    # entry layers from the next-bar excursion (horizon_bars=1).
     low_next = df["low"].shift(-1)
     high_next = df["high"].shift(-1)
-    n_long = np.floor(((df["close"] - low_next) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
-    n_short = np.floor(((high_next - df["close"]) / df["close"]) / STEP).clip(0, LADDER).fillna(0)
-    exp_long = (price_return - FEE_COST) * n_long
-    exp_short = (price_return + FEE_COST) * n_short
+    close = df["close"]
+    n_long = compute_ladder_multiplier(close, low_next, LADDER, STEP_BPS)
+    n_short = compute_ladder_multiplier(close, 2.0 * close - high_next, LADDER, STEP_BPS)
+    raw_long = compute_ladder_return(price_return, n_long, step_bps=STEP_BPS, side="long")
+    raw_short = compute_ladder_return(price_return, n_short, step_bps=STEP_BPS, side="short")
+    exp_long = raw_long - FEE_COST * n_long
+    exp_short = raw_short + FEE_COST * n_short
     pd.testing.assert_series_equal(
         out["return_long"], exp_long.rename("return_long"), check_names=True)
     pd.testing.assert_series_equal(
@@ -161,9 +193,19 @@ def test_ladder_non_whole_or_negative_raises(df, bad):
         _call(df, "ladder", ladder=bad)
 
 
-def test_ladder_zero_is_accepted_and_not_collapsed(df):
-    """`LADDER: 0` is a legitimate value (entry rung only -> size 0) and must
-    survive as 0, not be re-read as the old default of 1."""
-    out = _call(df, "ladder", ladder=0)
-    assert (out["return_long_raw"].fillna(0.0) == 0.0).all()
-    assert (out["return_short_raw"].fillna(0.0) == 0.0).all()
+@pytest.mark.parametrize("ladder", [0, 1])
+def test_ladder_zero_or_one_is_entry_rung_only_not_no_position(df, ladder):
+    """REVERSED 2026-09-14 (was `test_ladder_zero_is_accepted_and_not_collapsed`,
+    asserting the target was 0.0 — that modelled a position that never
+    opened). `LADDER: 0` and `LADDER: 1` both mean "entry rung only" (size 1):
+    with no laddered rungs the entry rung is still the entry rung, so the
+    target is the plain close-to-close return at size 1. 8 of the 10 live
+    tick arms set LADDER=1, matching EXECUTORS.ltp.MAX_RUNGS_PER_LADDER=1."""
+    out = _call(df, "ladder", ladder=ladder)
+    price_return = df["close"].pct_change(1, fill_method=None).shift(-1)
+    expected_raw = price_return.rename("return_long_raw")
+    pd.testing.assert_series_equal(
+        out["return_long_raw"].iloc[:-1], expected_raw.iloc[:-1], check_exact=False)
+    pd.testing.assert_series_equal(
+        out["return_short_raw"].iloc[:-1],
+        price_return.rename("return_short_raw").iloc[:-1], check_exact=False)
