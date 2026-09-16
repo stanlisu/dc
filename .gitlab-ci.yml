@@ -1,0 +1,39 @@
+# GitLab CI for dc -- the SAME job GitHub's `.github/workflows/tests.yml` calls `test`, run as
+# a real pipeline on the dev105 runner.
+#
+# WHY THIS EXISTS (user decision 2026-09-16). GitHub Actions is refused for billing, so dc's
+# `Tests` workflow never runs and nothing gates a dc merge. dc now mirrors to a PRIVATE project
+# `mirror/dc` on the self-hosted GitLab CE on dev105 (LAN-bound,
+# http://192.168.72.105:8929, git over ssh://git@192.168.72.105:2224). GitHub stays the repo of
+# record: PRs, review, branch protection and every host's fetch are unchanged. The mirror is
+# maintained by marvel's scripts/mirror_to_local_gitlab.sh --repo dc.
+#
+# NOTHING HERE DEPLOYS. dev105 cannot reach hydra, and dc's deploy.yml is not reproduced here.
+# Deploys stay manual from the Mac.
+#
+# HOW THIS CANNOT DRIFT FROM tests.yml. Nothing from tests.yml is copied into this file. The
+# job body is `scripts/ci_gitlab_run.sh`, which reads tests.yml OF THE TESTED COMMIT through
+# `scripts/ci_gitlab_plan.py` and executes its four `run:` steps verbatim. A structural change
+# to tests.yml (a new step, a changed `uses:`) trips `scripts/ci_gitlab_skeleton.json` and
+# stops the pipeline with a diff. The TA-Lib pin, the pandas pin and the pytest invocation are
+# therefore in ONE place -- tests.yml -- exactly as before.
+#
+# THE ONE THING GITLAB CANNOT COPY: `actions/setup-python`. The job runs in the official
+# `python:3.13-bookworm` image, which (being buildpack-deps based) already carries git, wget,
+# gcc and make for the TA-Lib source build. `sudo` is NOT in that image and IS in tests.yml's
+# TA-Lib step, so ci_gitlab_run.sh apt-installs it rather than editing the step.
+
+stages:
+  - test
+
+test:
+  stage: test
+  image: python:3.13-bookworm
+  variables:
+    GIT_STRATEGY: clone
+    PIP_ROOT_USER_ACTION: ignore
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  script:
+    - bash scripts/ci_gitlab_run.sh

@@ -1,0 +1,32 @@
+{
+  "test": {
+    "runs-on": "ubuntu-latest",
+    "steps": [
+      {
+        "uses": "actions/checkout@v4"
+      },
+      {
+        "uses": "actions/setup-python@v5",
+        "with": {
+          "python-version": "3.13"
+        }
+      },
+      {
+        "name": "Generate vendored obfuscation codec",
+        "run": "<executed verbatim by scripts/ci_gitlab_run.sh>"
+      },
+      {
+        "name": "Install TA-Lib (C library + python bindings)",
+        "run": "<executed verbatim by scripts/ci_gitlab_run.sh>"
+      },
+      {
+        "name": "Install dependencies",
+        "run": "<executed verbatim by scripts/ci_gitlab_run.sh>"
+      },
+      {
+        "name": "Run tests",
+        "run": "<executed verbatim by scripts/ci_gitlab_run.sh>"
+      }
+    ]
+  }
+}
