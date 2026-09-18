@@ -455,7 +455,9 @@ class PairsBacktest:
         pnl_all = pd.concat(all_pnl)
         pnl_all = pnl_all[~pnl_all.index.duplicated(keep="first")]
         daily = pnl_all.resample("D").sum()
-        daily = daily[daily != 0]
+        # Days with NO BARS, not days that netted zero. See break_recover.py for
+        # the measured 1/sqrt(f) Sharpe inflation the old filter caused.
+        daily = daily[pnl_all.resample("D").count() > 0]
 
         std = daily.std()
         sharpe = (float(daily.mean() / std * np.sqrt(365))
