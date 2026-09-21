@@ -162,7 +162,9 @@ def run_backtest(prices: pd.DataFrame, config: BacktestConfig) -> BacktestResult
 
     # Aggregate to daily
     daily_pnl = bar_pnl_all.resample("D").sum()
-    daily_pnl = daily_pnl[daily_pnl != 0]  # drop days with no data
+    # Days with no data means days with NO BARS. `daily_pnl != 0` also dropped
+    # every held-risk day that netted zero, inflating the Sharpe by 1/sqrt(f).
+    daily_pnl = daily_pnl[bar_pnl_all.resample("D").count() > 0]
 
     # Metrics
     std = daily_pnl.std()

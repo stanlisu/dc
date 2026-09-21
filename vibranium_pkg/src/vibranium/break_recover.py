@@ -320,27 +320,42 @@ class BreakRecoverBacktest:
                             signals, z_vals, self.confirm_bars
                         )
 
-                    # Update Kalman filter on forward window if enabled
-                    if kalman is not None:
-                        for j in range(len(fwd_prices)):
-                            la = np.log(fwd_prices[sym_a].iloc[j])
-                            lb = np.log(fwd_prices[sym_b].iloc[j])
-                            if np.isfinite(la) and np.isfinite(lb):
-                                kalman.update(la, lb)
-
                     # PnL in USDT with asymmetric sizing
                     log_ret_a = (np.log(fwd_prices[sym_a])
                                  .diff().fillna(0).values)
                     log_ret_b = (np.log(fwd_prices[sym_b])
                                  .diff().fillna(0).values)
-                    h = (abs(kalman.hedge_ratio)
-                         if kalman is not None and kalman.n_updates > 100
-                         else abs(engine.hedge_ratio))
+
+                    if kalman is not None:
+                        # CAUSAL. The previous version advanced the filter over
+                        # EVERY bar of this forward window and then priced the
+                        # same window from bar 1 with the resulting hedge ratio —
+                        # bar 1 was traded on a number fitted to bars 1..N. Here
+                        # h_seq[j] is the filter state BEFORE bar j is observed,
+                        # so each bar trades on information available at its open.
+                        h = np.empty(len(fwd_prices), dtype=float)
+                        for j in range(len(fwd_prices)):
+                            h[j] = (kalman.hedge_ratio
+                                    if kalman.n_updates > 100
+                                    else engine.hedge_ratio)
+                            la = np.log(fwd_prices[sym_a].iloc[j])
+                            lb = np.log(fwd_prices[sym_b].iloc[j])
+                            if np.isfinite(la) and np.isfinite(lb):
+                                kalman.update(la, lb)
+                    else:
+                        h = float(engine.hedge_ratio)
+
+                    # SIGNED h in the return; |h| only for notional. The signal
+                    # came from a spread built on the signed hedge ratio
+                    # (pairs.py: self.hedge_ratio = float(beta[1])), so taking
+                    # abs() here traded the OPPOSITE of the z-score whenever h
+                    # was negative — exactly the case for a long/inverse ETF
+                    # pair. Fees are sign-agnostic: notional is |capital*h|.
                     port_ret_usdt = (self.capital * log_ret_a
                                      - self.capital * h * log_ret_b)
 
                     # Fee on total notional
-                    total_notional = self.capital + self.capital * h
+                    total_notional = self.capital + self.capital * np.abs(h)
                     fee_per_trade = self.fee_rate * total_notional
 
                     prev_sig = np.concatenate([[0.0], signals[:-1]])
@@ -360,7 +375,9 @@ class BreakRecoverBacktest:
                     # Score this window for the rolling scorecard
                     window_pnl = pd.Series(pnl, index=fwd_prices.index)
                     daily_w = window_pnl.resample("D").sum()
-                    daily_w = daily_w[daily_w != 0]
+                    # Drop calendar days with NO BARS, never days that merely
+                    # netted zero — see the note on the run-level Sharpe below.
+                    daily_w = daily_w[window_pnl.resample("D").count() > 0]
                     if len(daily_w) > 1:
                         w_std = daily_w.std()
                         w_sharpe = (float(daily_w.mean() / w_std)
@@ -393,7 +410,14 @@ class BreakRecoverBacktest:
         pnl_all = pd.concat(all_pnl)
         pnl_all = pnl_all[~pnl_all.index.duplicated(keep="first")]
         daily = pnl_all.resample("D").sum()
-        daily = daily[daily != 0]
+        # Drop calendar days with NO BARS. The previous `daily[daily != 0]` also
+        # deleted every day the book HELD RISK and happened to net zero, which is
+        # most days for a pairs book. That is not a no-data filter, it is a
+        # survivorship one: it shortens the series and shrinks the denominator,
+        # inflating the Sharpe by exactly 1/sqrt(fraction kept) — measured x1.42
+        # at 50% non-flat days and x3.21 at 10%. CLAUDE.md requires the RAW daily
+        # series: mean/std*sqrt(periods), no filtering.
+        daily = daily[pnl_all.resample("D").count() > 0]
 
         std = daily.std()
         sharpe = (float(daily.mean() / std * np.sqrt(365))
@@ -473,7 +497,12 @@ class BreakRecoverSweep:
             }
 
         combined = pd.concat(all_daily, axis=1).fillna(0).sum(axis=1)
-        daily = combined[combined != 0]
+        # PORTFOLIO level, and the worst place for the old `!= 0` filter: the
+        # per-pair frames are already .fillna(0)-aligned, so a zero here means
+        # "every pair was flat that day", which is a real risk-bearing day for a
+        # portfolio that was in the market. Dropping it inflated the aggregate
+        # Sharpe by 1/sqrt(fraction kept), on top of the per-pair inflation.
+        daily = combined[combined.notna()]
         std = daily.std()
         sharpe = float(daily.mean() / std * np.sqrt(365)) if std > 0 else 0.0
         cum = daily.cumsum()
