@@ -39,8 +39,10 @@ from .ladder import compute_ladder_multiplier, compute_ladder_return, ladder_par
 from .mm_target import (
     MINUTE_TIMEFRAME,
     TARGET_MODE_MM,
+    TARGET_RETURN_TYPICAL_OVER_OPEN,
     compute_mm_target,
     target_mode,
+    target_return_mode,
 )
 from .utils import _symbol_to_native, _timeframe_to_seconds
 
@@ -401,6 +403,16 @@ class AgamottoResearch:
         # two copies of the same arithmetic, and the design's whole reason for a
         # shared module is to stop them diverging. Both must switch together.
         mm_mode = target_mode(self.config) == TARGET_MODE_MM
+        ret_mode = target_return_mode(self.config)
+        if dual_horizon and ret_mode == TARGET_RETURN_TYPICAL_OVER_OPEN:
+            # The 2-bar target below is close-to-close by construction. Honouring
+            # the mode on the 1-bar leg and not the 2-bar one would put two
+            # different return conventions in one arm's agreement gate, and the
+            # resulting number would not mean anything. Refuse rather than mix.
+            raise ValueError(
+                f"DUAL_HORIZON with TARGET_RETURN_MODE={ret_mode!r} is not supported: the 2-bar "
+                f"target is close-to-close, so the two horizons would carry different return "
+                f"conventions. Pick one.")
 
         for col in df.columns:
             if col.endswith("_close"):
@@ -473,7 +485,25 @@ class AgamottoResearch:
                 low_open_pct = ((low_series - open_series) / (open_series + 1e-8)).rename(f"{base}_low_open_pct")
                 
                 hist_return = close.pct_change(fill_method=None)
-                price_return = hist_return.shift(-1)
+                if ret_mode == TARGET_RETURN_TYPICAL_OVER_OPEN:
+                    # Enter at bar t+1's OPEN, measure to its TYPICAL price.
+                    # `sdf.get(col, close)` above substitutes `close` when an OHL
+                    # column is absent; under this mode that would silently make the
+                    # target ((C+C+C)/3)/C-1 == 0 for every row -- a target of
+                    # exactly zero, which trains a model that predicts nothing and
+                    # raises nowhere. Refuse instead (CLAUDE.md: no silent fallback).
+                    missing = [c for c in (open_col, high_col, low_col) if c not in sdf.columns]
+                    if missing:
+                        raise ValueError(
+                            f"TARGET_RETURN_MODE={TARGET_RETURN_TYPICAL_OVER_OPEN!r} needs real "
+                            f"OHL columns, and {missing} are absent for {base!r}. Without them the "
+                            f"target collapses to a constant 0. Rebuild this symbol's bars with "
+                            f"open/high/low, or use the close_to_close mode.")
+                    open_next = open_series.shift(-1)
+                    typical_next = ((high_series + low_series + close) / 3.0).shift(-1)
+                    price_return = typical_next / open_next.replace(0, np.nan) - 1.0
+                else:
+                    price_return = hist_return.shift(-1)
 
                 ret_lag1 = hist_return.shift(1).rename(f"{base}_ret_lag1")
                 ret_lag2 = hist_return.shift(2).rename(f"{base}_ret_lag2")

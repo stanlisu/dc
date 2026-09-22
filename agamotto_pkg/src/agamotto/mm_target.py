@@ -99,6 +99,44 @@ def target_mode(config: Dict) -> str:
     return str(mode)
 
 
+TARGET_RETURN_CLOSE_TO_CLOSE = "close_to_close"
+TARGET_RETURN_TYPICAL_OVER_OPEN = "typical_over_open"
+_TARGET_RETURN_MODES = (TARGET_RETURN_CLOSE_TO_CLOSE, TARGET_RETURN_TYPICAL_OVER_OPEN)
+
+
+def target_return_mode(config: Dict) -> str:
+    """Which forward return the LADDER target is built from.
+
+    ``"close_to_close"`` (the historical behaviour) is ``close[t+1]/close[t] - 1``:
+    decide at the close of bar t, measure to the close of bar t+1.
+
+    ``"typical_over_open"`` is ``((H+L+C)/3)[t+1] / open[t+1] - 1``: decide at the
+    close of bar t, enter at the OPEN of bar t+1, measure to that bar's typical
+    price. It is a deliberately DENOISED label -- the typical price averages three
+    levels instead of reading one instant -- which is what makes a short training
+    window viable. It is NOT a fillable exit: ``(H+L+C)/3`` is an average of levels,
+    and H and L are known only once the bar has closed. Train on it if you want a
+    quieter target; do NOT read a Step-5 Sharpe computed against it as realizable
+    PnL. The realistic-fill answer is Step 8, which walks real 1m bars and never
+    reads this column.
+
+    # DEPRECATED: drop the absent->close_to_close branch after 2027-01-01. Every
+    # committed kline setting predates this key; breaking them all at once would
+    # strand every experiment. Same precedent and shape as `target_mode` above, and
+    # as `ladder_params`' LADDER_LONG -> LADDER chain. An UNKNOWN value always
+    # raises, so the chain still ends in a fail-fast.
+    """
+    mode = config.get("TARGET_RETURN_MODE")
+    if mode is None:
+        return TARGET_RETURN_CLOSE_TO_CLOSE
+    if mode not in _TARGET_RETURN_MODES:
+        raise ValueError(
+            f"TARGET_RETURN_MODE={mode!r} is not one of {_TARGET_RETURN_MODES}. "
+            f"'{TARGET_RETURN_CLOSE_TO_CLOSE}' is close[t+1]/close[t]-1; "
+            f"'{TARGET_RETURN_TYPICAL_OVER_OPEN}' is ((H+L+C)/3)[t+1]/open[t+1]-1.")
+    return str(mode)
+
+
 def assert_supported_timeframe(config: Dict) -> None:
     """Refuse any signal grid other than 15m. See SUPPORTED_TIMEFRAME."""
     tf = config.get("TIME_UNIT")
