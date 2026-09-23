@@ -21,34 +21,50 @@ def _obf():
 
 
 # Regime definitions moved out of the public marvel generator (real names live
-# only here). Scepter regime = own-state × BTC-state, "{own}_and_{btc}".
+# only here). Scepter regime = own-state × anchor-state, "{own}_and_{anchor}".
 _SCEPTER_OWN_STATE = [
     "above_all_mas", "high_volume", "low_volume", "adx_trend", "vol_breakout",
     "low_vol", "high_vol", "strong_trend", "ma_momentum",
     "rsi_oversold", "rsi_overbought", "macd_bullish", "macd_bearish",
-    "stoch_bullish", "bb_rebound", "mom_positive",
+    "stoch_bullish", "bb_rebound", "mom_positive", "convergence_tight",
 ]
-_SCEPTER_BTC_STATE = [
-    "btc_trending_up", "btc_trending_down", "btc_high_vol", "btc_low_vol",
+# Anchor-state names are templated on the anchor's column prefix (`btc` for
+# crypto, `qqq` for the adamantium equities anchor, ...) — see
+# generate_regime_stack(anchor_prefix=...) and
+# ScepterResearch._attach_anchor_features (pfx = anchor_native[:3].lower()).
+# Onboarding a NEW anchor prefix also needs its 4 atoms added to
+# obfuscation/extract_inventory.py::_MARVEL_ATOMS (dc is the obfuscation
+# source of truth; the codec fails loud on an unmapped atom, by design).
+_ANCHOR_STATE_TEMPLATE = [
+    "{p}_trending_up", "{p}_trending_down", "{p}_high_vol", "{p}_low_vol",
 ]
+_SCEPTER_BTC_STATE = [t.format(p="btc") for t in _ANCHOR_STATE_TEMPLATE]
 
 
 class ScepterResearch(OrbResearch):
     """OrbResearch + BTC/ETH cross-symbol anchor features."""
 
     @classmethod
-    def generate_regime_stack(cls) -> list[dict]:
-        """Coded [{regime, position}] for own-state × BTC-state crossed regimes.
+    def generate_regime_stack(cls, anchor_prefix: str = "btc") -> list[dict]:
+        """Coded [{regime, position}] for own-state × anchor-state crossed regimes.
 
-        Position is determined by own-state alone (anchors are directionally
-        neutral). Regime names returned OBFUSCATED (structure preserved).
+        `anchor_prefix` selects which anchor's state atoms to cross against
+        (`"btc"` default — byte-identical to the pre-generalisation output;
+        `"qqq"` for the adamantium equities anchor, etc — see
+        ScepterResearch._attach_anchor_features for how a symbol maps to its
+        prefix). Position is determined by own-state alone (anchors are
+        directionally neutral). Regime names returned OBFUSCATED (structure
+        preserved); encoding an anchor prefix with no map entry raises
+        (obfuscation/extract_inventory.py::_MARVEL_ATOMS must be onboarded
+        first — see that module's comment).
         """
         c = _obf()
+        anchor_states = [t.format(p=anchor_prefix) for t in _ANCHOR_STATE_TEMPLATE]
         seen, out = set(), []
         for own in _SCEPTER_OWN_STATE:
             positions = cls.allowed_positions(own)
-            for btc in _SCEPTER_BTC_STATE:
-                name = f"{own}_and_{btc}"
+            for anchor in anchor_states:
+                name = f"{own}_and_{anchor}"
                 for pos in positions:
                     key = (name, pos)
                     if key in seen:

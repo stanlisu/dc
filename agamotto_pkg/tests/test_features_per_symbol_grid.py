@@ -223,6 +223,23 @@ def _reference_old_path(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         ta.append(pd.Series(lower, index=ix, name=f"{base}_bb_lower"))
         ta.append(pd.Series(talib.SAR(h_vals, l_vals, acceleration=0.02, maximum=0.2), index=ix, name=f"{base}_sar"))
 
+        # convergence_tight (2026-09-22 design, thresholds LOOSENED 2026-09-23
+        # in two calibration passes) — transcribed verbatim from
+        # research.py::engineer_features so this parity oracle covers it too.
+        atr10 = pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=10), index=ix)
+        atr60 = pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=60), index=ix)
+        atr_ratio_10_60 = atr10 / atr60.replace(0, np.nan)
+        atr_ratio_q40 = atr_ratio_10_60.rolling(60, min_periods=60).quantile(0.40)
+        compression = atr_ratio_10_60 <= atr_ratio_q40
+        level20_lag1 = high_series.rolling(20, min_periods=20).max().shift(1)
+        proximity_pct = (close - level20_lag1) / level20_lag1
+        proximity = (proximity_pct >= -0.045) & (proximity_pct <= 0.0)
+        tight_streak = (compression & proximity).rolling(3, min_periods=3).sum() >= 3
+        ma9 = close.rolling(9, min_periods=9).mean()
+        ma21 = close.rolling(21, min_periods=21).mean()
+        ma_converge = ((ma9 - ma21).rolling(10, min_periods=10).std() / close_safe) < 0.0080
+        ta.append((compression & proximity & tight_streak & ma_converge).rename(f"{base}_convergence_tight"))
+
         w = int(config["STATS_WINDOW"])
         rolling_stats = [
             hist_return.rolling(window=w).std().rename(f"{base}_std"),

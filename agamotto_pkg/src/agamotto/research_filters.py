@@ -17,10 +17,21 @@ def _obf():
     return default()
 
 
+class MissingFilterColumnError(ValueError):
+    """A regime's required source column was never built for this dataset.
+
+    Distinct from a plain ValueError so a caller can distinguish "this regime is
+    structurally unevaluable for this data family" (e.g. buy_pressure/
+    trade_intensity need quote_volume/taker_buy/number_of_trades columns that
+    equities OHLCV data never carries) from any other bug. Still a ValueError
+    subclass, so existing `except ValueError` call sites are unaffected.
+    """
+
+
 def _require_col(df: pd.DataFrame, filter_name: str, col: str) -> None:
     """Fail loud when a known filter's source column is absent."""
     if col not in df.columns:
-        raise ValueError(
+        raise MissingFilterColumnError(
             f"Filter {filter_name!r} requires column {col!r}; frame is missing "
             f"it ({len(df.columns)} columns present). An all-True fallback "
             "here fires on every bar — a `baseline` regime under another "
@@ -297,6 +308,28 @@ def apply_filter_mask(
         _require_col(df, filter_name, "price_range_pct")
         _require_col(df, filter_name, cutoff_col)
         return df["price_range_pct"] > df[cutoff_col]
+
+    # convergence_tight: range-compression-near-a-level ("coiling before a
+    # breakout"), position-invariant like the vol-quantile atoms above — a
+    # breakout out of the coil can go either direction. The mask is a fully
+    # resolved per-symbol boolean computed by research.engineer_features
+    # (rolling-252 percentile, 5-bar streak, rolling-10 MA std — all rolling
+    # windows that must never cross a symbol boundary, see the q50 comment
+    # above); this just reads it. No rolling recomputation here.
+    if isinstance(filter_name, str) and filter_name == "convergence_tight":
+        _require_col(df, filter_name, "convergence_tight")
+        # WHY fillna(False) is required, not cosmetic: engineer_features computes
+        # this per-symbol on a SHORT index (that symbol's own real bars only),
+        # then `.reindex(df.index)` back onto the wide multi-symbol grid — which
+        # introduces NaN for any row the symbol has no bar for (e.g. before its
+        # listing date) and silently upcasts bool->object dtype to hold it.
+        # `.astype(bool)` on that object column turns those NaNs into Python
+        # `True` (NaN is truthy), so every symbol's pre-listing gap fired as a
+        # false positive — measured 2026-09-22: ARM/TEM/NNE/ARKB (all later-
+        # listed tickers) supplied ~2,260 of 2,272 pooled "fires" across the
+        # adamantium sweep, every single one dated before that symbol's own
+        # first real bar. fillna(False) BEFORE astype(bool) is the fix.
+        return df["convergence_tight"].fillna(False).infer_objects(copy=False).astype(bool)
 
     if position == "long":
         if filter_name == "low_vol":
