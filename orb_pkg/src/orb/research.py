@@ -69,6 +69,11 @@ _RAW_COLUMNS = [
     "quote_volume", "number_of_trades",
     "taker_buy_base_volume", "taker_buy_quote_volume",
     "mvg1", "mvg2", "mvg3",
+    # Precomputed own-state filter atom (agamotto/research.py::engineer_features),
+    # not a plain raw column, but same bucket: filter-only, excluded from ML,
+    # same failure shape as the two incidents documented above this list if left
+    # out — verticalize() iterates this list, not the engineered frame.
+    "convergence_tight",
 ]
 
 # FILTER-ONLY trailing vol-quantile CUTOFFS. agamotto's `high_vol_q80/q90/q95`

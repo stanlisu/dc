@@ -127,10 +127,17 @@ class Visitor(ast.NodeVisitor):
         return out
 
 
-# Regime atoms defined MARVEL-side (not in dc) — scepter BTC anchor states.
-# These are composed into "{own}_and_{btc}" regimes in marvel's generator, so
-# they must be in the map even though dc never compares against them directly.
-_MARVEL_ATOMS = ("btc_trending_up", "btc_trending_down", "btc_high_vol", "btc_low_vol")
+# Regime atoms defined MARVEL-side (not in dc) — scepter anchor states. These
+# are composed into "{own}_and_{anchor}" regimes in marvel's generator (see
+# ScepterResearch.generate_regime_stack(anchor_prefix=...)), so they must be
+# in the map even though dc never compares against them directly. One
+# quadruple (trending_up/trending_down/high_vol/low_vol) per onboarded anchor
+# prefix — btc (crypto, default) and qqq (adamantium equities anchor,
+# 2026-09-22). Onboarding a new anchor prefix means adding its quadruple here.
+_MARVEL_ATOMS = (
+    "btc_trending_up", "btc_trending_down", "btc_high_vol", "btc_low_vol",
+    "qqq_trending_up", "qqq_trending_down", "qqq_high_vol", "qqq_low_vol",
+)
 
 # Hard passthrough: exchange-standard / time / metadata columns that are never IP.
 # Subtracted in addition to any code-declared *_RAW_COLUMNS / *_META_COLS lists.

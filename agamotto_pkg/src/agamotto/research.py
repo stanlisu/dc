@@ -138,6 +138,7 @@ from .research_filters import (
     comprehensive_sweep_regimes,
     generate_regime_stack,
     apply_filter_mask,
+    MissingFilterColumnError,
 )
 
 
@@ -675,6 +676,69 @@ class AgamottoResearch:
                     ta_features.append(pd.Series(lower, index=close.index, name=f"{base}_bb_lower"))
 
                     ta_features.append(pd.Series(talib.SAR(h_vals, l_vals, acceleration=0.02, maximum=0.2), index=close.index, name=f"{base}_sar"))
+
+                    # convergence_tight (2026-09-22 design; thresholds LOOSENED
+                    # 2026-09-23): range-compression near a trailing high,
+                    # "coiling before a breakout". All windows are rolling on
+                    # THIS symbol's own `close`/`high_series` (computed above
+                    # the wide-frame join, like price_range_pct_q50 / the
+                    # vol-quantile cutoffs), so none crosses a symbol boundary
+                    # once this is reindexed onto the multi-symbol grid.
+                    #
+                    # The strict 2026-09-22 formula (252-bar lookback / bottom
+                    # 20th pct / 1.5% proximity band / 5-bar streak / 0.15%
+                    # MA-converge) fired only 5 times total across 9 real
+                    # adamantium categories (~150 symbols, ~3.5yr daily each) —
+                    # too rare to be walk-forward-trainable.
+                    #
+                    # Two-pass calibration (user directive 2026-09-23), both
+                    # passes measured on the same 9 real adamantium categories
+                    # (75 distinct traded symbols, ~870 trading days each):
+                    #   pass 1 (lookback 252->60, compression 20th->35th pct,
+                    #   proximity 1.5%->3.0%, streak 5->3, MA-converge
+                    #   0.15%->0.30%) still only reached ~0.48% of bars
+                    #   aggregate (310 fires / 65,250 bars; 36/75 symbols never
+                    #   fired at all). A per-leg breakdown on a real 19-symbol
+                    #   panel showed why: compression and proximity alone are
+                    #   already loose (~33% / ~26% marginal, ~10% joint), but
+                    #   the streak and MA-converge legs are ANDed on TOP of
+                    #   that joint and independently cut it roughly 10x more
+                    #   each — a 4-way AND multiplies, so loosening every knob
+                    #   "one notch" barely moved the joint rate.
+                    #   pass 2 pushed the two legs actually doing the
+                    #   cutting: compression 35th->40th pct, proximity
+                    #   3.0%->4.5%, MA-converge 0.30%->0.80% (streak stays at
+                    #   3 — already the loosest defensible read of "a
+                    #   pattern", not a single bar). Measured: 1,499 fires /
+                    #   65,250 bars = 2.27% aggregate, per-symbol median 1.6%
+                    #   / mean 2.9%, top-5-symbol share of fires 29% (broad,
+                    #   not 1-2 names), 57/75 symbols fire at least once.
+                    atr10 = pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=10), index=close.index)
+                    atr60 = pd.Series(talib.ATR(h_vals, l_vals, c_vals, timeperiod=60), index=close.index)
+                    atr_ratio_10_60 = atr10 / atr60.replace(0, np.nan)
+                    # Bottom-40th-percentile-of-its-OWN-trailing-60-bar-window
+                    # compression flag. rolling(60) at row t uses only rows
+                    # [t-59, t] (causal); comparing the same-window value to the
+                    # same-window quantile at t reads no future bar.
+                    atr_ratio_q40 = atr_ratio_10_60.rolling(60, min_periods=60).quantile(0.40)
+                    compression = atr_ratio_10_60 <= atr_ratio_q40
+
+                    # Rolling 20-bar high, LAGGED 1 bar, so "proximity" at t never
+                    # reads bar t's own high.
+                    level20_lag1 = high_series.rolling(20, min_periods=20).max().shift(1)
+                    proximity_pct = (close - level20_lag1) / level20_lag1
+                    proximity = (proximity_pct >= -0.045) & (proximity_pct <= 0.0)
+
+                    tight_streak = (compression & proximity).rolling(3, min_periods=3).sum() >= 3
+
+                    ma9 = close.rolling(9, min_periods=9).mean()
+                    ma21 = close.rolling(21, min_periods=21).mean()
+                    ma_converge = ((ma9 - ma21).rolling(10, min_periods=10).std() / close_safe) < 0.0080
+
+                    ta_features.append(
+                        (compression & proximity & tight_streak & ma_converge)
+                        .rename(f"{base}_convergence_tight")
+                    )
                 except Exception as e:
                     logger.warning(f"TA-Lib error for {base}: {e}")
 
@@ -891,8 +955,28 @@ class AgamottoResearch:
 
         regime_stack = [r for r in regime_stack if not str(r.get("regime", "")).startswith("__")]
         logger.info(f"Loaded {len(regime_stack)} regimes from {stack_path}")
+        skipped_missing_column: list[str] = []
         for regime in regime_stack:
-            self.filter_signals(regime, save=True, out_dir=out_dir)
+            # WHY: MissingFilterColumnError means the regime's source column was
+            # never built for THIS dataset (e.g. buy_pressure/trade_intensity
+            # need quote_volume/taker_buy/number_of_trades columns that equities
+            # OHLCV data structurally never carries, unlike Binance klines) —
+            # _require_col's own message says the remedy is to drop the regime
+            # from the stack, not crash the whole run on the first one. Logged
+            # loudly and collected below, not silently swallowed; any OTHER
+            # exception type still propagates and fails the run as before.
+            try:
+                self.filter_signals(regime, save=True, out_dir=out_dir)
+            except MissingFilterColumnError as e:
+                logger.warning(
+                    f"Skipping regime {regime.get('regime')!r}: {e}")
+                skipped_missing_column.append(str(regime.get("regime")))
+
+        if skipped_missing_column:
+            logger.warning(
+                f"{len(skipped_missing_column)}/{len(regime_stack)} regimes "
+                f"skipped for missing source columns (data family "
+                f"{self.config.get('DATA')!r}): {skipped_missing_column}")
 
         return out_dir
 
@@ -959,6 +1043,7 @@ class AgamottoResearch:
                 f"{prefix}_bop": "bop",
                 f"{prefix}_atr": "atr",
                 f"{prefix}_natr": "natr",
+                f"{prefix}_convergence_tight": "convergence_tight",
                 f"{prefix}_parkinson_vol": "parkinson_vol",
                 f"{prefix}_bb_upper": "bb_upper",
                 f"{prefix}_bb_lower": "bb_lower",
