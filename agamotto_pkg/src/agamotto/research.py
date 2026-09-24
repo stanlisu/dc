@@ -124,6 +124,104 @@ VOL_QUANTILE_FEATURES = [
     "price_range_pct_q95",
 ]
 
+# ── Filter-parquet column narrowing (opt-in) ─────────────────────────────────
+#
+# A cross-TF (orb) vertical panel is mostly context: measured on
+# pred_orb.base.15m_1, 305 columns of which 1h_ = 70, 4h_ = 70, 1d_ = 70 — 210
+# columns, 69% of the width, replicated into EVERY filter parquet. An arm that
+# does not want the coarse context in its model (or its storage bill) can say so
+# with FILTER_PARQUET_FEATURE_TFS.
+#
+# The key is an EXPLICIT ALLOW-LIST of timeframes to KEEP, not a boolean and not
+# "the base TF" derived behind the caller's back: BASE_TF varies per orb arm
+# (15m/1h/4h/1d on disk) and the right thing to keep is a decision, not an
+# inference. Absent key -> no narrowing at all, byte-identical to today.
+# `[]` is legal and explicit: drop every TF-prefixed column.
+#
+# It narrows the WRITTEN parquet only. filter_signals still RETURNS the full
+# frame, so nothing that consumes the return value in-process changes.
+#
+# SAFETY — why a prefix regex is the right cut, verified against the consumers
+# in marvel (2026-09-24):
+#   * `ret`, `ret_raw`, `return*`, `position`, `regime`, `symbol`, `timestamp`,
+#     `year`, `month` and every BARE raw/MA/vol-quantile column carry no TF
+#     prefix, so `^\d+[smhd]_` cannot match them. That is structural, not a
+#     maintained exclusion list — and `_PROTECTED_PARQUET_COLUMNS` below asserts
+#     it anyway rather than trusting the regex.
+#   * The regime mask is baked in at WRITE time. No consumer re-evaluates a
+#     filter predicate on the parquet (rolling_predict_returns.py reads the
+#     regime from the FILENAME; generate_daily_pnl.py opens no columns), so the
+#     non-base-TF raw/MA/`price_range_pct_q*` columns are dead weight once the
+#     mask has been applied here.
+#   * Model features are selected as all-columns-MINUS-an-exclusion-list
+#     (gauntlet/rolling_predict_returns.py:1177 select_feature_columns), off the
+#     parquet's own schema, so a narrower schema is simply a narrower feature
+#     universe — not an error. Re-run gauntlet/compute_ic.py: a stale
+#     ic_sweep.csv still naming dropped `1h_*` features would silently select
+#     fewer than --top-n-ic columns.
+#   * gauntlet/check_feature_parity.py is the ONE consumer that reads the TF
+#     prefix SET (it asserts it equals setting.json's MULTI_TF_BARS). Narrowing
+#     changes what it reports; keep MULTI_TF_BARS in step with this key.
+_TF_PREFIXED_COLUMN = re.compile(r"^(\d+[smhd])_")
+
+# Columns the narrowing must never remove, whatever the allow-list says. These
+# are unprefixed by construction, so this is a tripwire for a future change that
+# starts TF-prefixing a target or metadata column — not a live exclusion.
+_PROTECTED_PARQUET_COLUMNS = (
+    "ret", "ret_raw", "position", "regime", "symbol", "timestamp",
+    "year", "month",
+    "return", "return_long", "return_short",
+    "return_long_raw", "return_short_raw",
+)
+
+
+def narrow_filter_parquet_timeframes(df: pd.DataFrame, keep_tfs) -> pd.DataFrame:
+    """Drop `<tf>_`-prefixed columns whose timeframe is not in `keep_tfs`.
+
+    `keep_tfs` is the explicit allow-list from FILTER_PARQUET_FEATURE_TFS.
+    Unprefixed columns are always kept. Raises if the allow-list names a
+    timeframe the panel does not carry (a typo would otherwise silently drop
+    everything) or if a protected column would be removed.
+    """
+    keep = list(keep_tfs)
+    for tf in keep:
+        if not _TF_PREFIXED_COLUMN.match(f"{tf}_"):
+            raise ValueError(
+                f"FILTER_PARQUET_FEATURE_TFS entry {tf!r} is not a timeframe "
+                "token of the form <int><s|m|h|d>, e.g. '15m'"
+            )
+    keep_set = set(keep)
+
+    present = set()
+    dropped = []
+    for col in df.columns:
+        m = _TF_PREFIXED_COLUMN.match(col)
+        if m is None:
+            continue
+        present.add(m.group(1))
+        if m.group(1) not in keep_set:
+            dropped.append(col)
+
+    unknown = sorted(keep_set - present)
+    if unknown:
+        raise KeyError(
+            f"FILTER_PARQUET_FEATURE_TFS names {unknown} but the panel carries "
+            f"TF-prefixed columns for {sorted(present)} only. Refusing to write "
+            "a parquet narrowed on a timeframe that is not there."
+        )
+
+    clashes = sorted(set(dropped) & set(_PROTECTED_PARQUET_COLUMNS))
+    if clashes:
+        raise RuntimeError(
+            f"FILTER_PARQUET_FEATURE_TFS would drop protected column(s) "
+            f"{clashes}. The narrowing may only remove TF-prefixed FEATURE "
+            "columns; a target/metadata column must never be TF-prefixed."
+        )
+
+    if not dropped:
+        return df
+    return df.drop(columns=dropped)
+
 # Import filter definitions and evaluation logic from sub-module
 from .research_filters import (
     _require_col,
@@ -1202,9 +1300,28 @@ class AgamottoResearch:
                 os.makedirs(save_dir, exist_ok=True)
 
                 save_path = os.path.join(save_dir, f"filter_{safe_name}.parquet")
+
+            # OPT-IN column narrowing, applied AFTER the mask (the frame is
+            # already `features_df[mask]`) and BEFORE the write, on the REAL
+            # column names — the TF prefix survives encode_columns
+            # (obfuscation/codec.py:162-173 re-emits `tf + code + suffix`), but
+            # cutting pre-encode keeps the rule readable. Absent key = untouched
+            # frame; `filtered_subset` itself is never narrowed, so the RETURNED
+            # frame is unchanged either way.
+            #
+            # DELIBERATELY OUTSIDE the try below: that handler still log-and-
+            # continues on the LOCAL route, which would turn a bad allow-list
+            # into a silently skipped parquet. A misconfigured key is a config
+            # error, not a write error, and must stop the run.
+            _for_save = filtered_subset
+            if "FILTER_PARQUET_FEATURE_TFS" in self.config:
+                _for_save = narrow_filter_parquet_timeframes(
+                    filtered_subset,
+                    self.config["FILTER_PARQUET_FEATURE_TFS"],
+                )
             try:
-                _to_save = filtered_subset.rename(
-                    columns=_obf().encode_columns(filtered_subset.columns))
+                _to_save = _for_save.rename(
+                    columns=_obf().encode_columns(_for_save.columns))
                 _f64_to_f32 = {
                     c: "float32" for c in _to_save.columns
                     if _to_save[c].dtype == "float64"

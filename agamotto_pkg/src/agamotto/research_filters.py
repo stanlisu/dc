@@ -10,6 +10,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# A leading timeframe token on a regime atom ("15m" in "15m_rsi_oversold").
+# Same shape as `^(\d+[smhd])_` in obfuscation/codec.py:28 and
+# gauntlet/check_feature_parity.py:36 — one definition of "this is a TF".
+_TF_PREFIX_TOKEN = re.compile(r"^\d+[smhd]$")
+
 
 def _obf():
     """Lazy accessor for the vendored obfuscation codec (see _obf/codec.py)."""
@@ -158,7 +163,20 @@ def allowed_positions(filter_name: str) -> list:
     for part in parts:
         base = part.strip()
         tokens = base.split("_")
-        if len(tokens) > 1 and tokens[0] in ("15m", "1h", "4h", "1d"):
+        # A GENERIC TF prefix, not the four literals ("15m", "1h", "4h", "1d")
+        # this tested until 2026-09-24. orb's ladder is configurable now, and an
+        # unrecognised prefix does not fail here — it falls through with the
+        # prefix still attached, misses LONG_ONLY_FILTERS/SHORT_ONLY_FILTERS and
+        # returns the DEFAULT ["long", "short"]. On a 1m/5m/15m/1h ladder that
+        # silently gave `1m_rsi_oversold` a SHORT leg and inflated the orb stack
+        # from 332 rows to 470.
+        #
+        # Provably inert for everything that exists today: no atom in
+        # LONG_ONLY_FILTERS, SHORT_ONLY_FILTERS, MVG_DEPENDENT_FILTERS,
+        # BASE_REGIMES or obfuscation/map.json's 254 regime names has a first
+        # token of this shape, so the only names newly stripped are TF prefixes
+        # that were never in the tuple (5s/15s/30s/1m/5m).
+        if len(tokens) > 1 and _TF_PREFIX_TOKEN.match(tokens[0]):
             base = "_".join(tokens[1:])
         if base in LONG_ONLY_FILTERS:
             needs_long = True
