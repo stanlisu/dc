@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 import gc
 import logging
+import re
 
 import numpy as np
 import pandas as pd
@@ -106,7 +107,80 @@ _RETURN_COLUMNS = [
     "return_long_raw", "return_short_raw",
 ]
 
-_TF_PREFIXES = ("15m_", "1h_", "4h_", "1d_")
+# ── The timeframe ladder ─────────────────────────────────────────────────────
+#
+# ORDERING CONTRACT: `TIMEFRAMES` is the ladder ordered FINEST FIRST, and RANK
+# is counted from the COARSE end — rank 0 = coarsest = the CONTEXT leg, the
+# last rank = finest = the DECISION leg. Every cross-TF regime template below
+# names ranks, never literal timeframes, so the same table generates today's
+# 15m/1h/4h/1d stack and a 1m/5m/15m/1h one.
+#
+# LEGACY LADDER. Every orb arm on disk states TIMEFRAMES explicitly and states
+# exactly this list, but `generate_regime_stack()` is also called with NO config
+# at all (marvel gauntlet/generate_orb_regimes.py:33), so the zero-arg call has
+# to keep reproducing the shipped 332-row stack byte for byte.
+# DEPRECATED: drop after 2026-12-01 — by then the marvel generator passes the
+# arm's setting.json and this constant becomes a test fixture only. The chain
+# ends in a raise inside `_resolve_ladder`, never in a second silent default.
+_DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+_TF_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_TF_RE = re.compile(r"^(\d+)([smhd])$")
+# A leading TF prefix on a regime atom, e.g. "4h_" in "4h_rsi_oversold".
+_TF_PREFIX_ON_ATOM = re.compile(r"^(\d+[smhd])_")
+
+
+def _tf_seconds(tf: str) -> int:
+    """Duration of a timeframe token in seconds. Raises on anything unparseable.
+
+    The obfuscation codec's TF-prefix regex is `^(\\d+[smhd])_` (obfuscation/
+    codec.py:28), so a TF token that does not match this shape would silently
+    stop being recognised as a TF prefix at write time. Refuse it here instead.
+    """
+    m = _TF_RE.match(tf)
+    if m is None:
+        raise ValueError(
+            f"unparseable timeframe {tf!r}: expected <int><s|m|h|d>, e.g. '15m'"
+        )
+    return int(m.group(1)) * _TF_UNIT_SECONDS[m.group(2)]
+
+
+def _resolve_ladder(config: Optional[Dict[str, object]]) -> List[str]:
+    """The ordered (finest-first) TF ladder for a config.
+
+    No `config.get("TIMEFRAMES", <magic list>)`: a config that CARRIES the key
+    must state a usable ladder or this raises. A config that does not carry it
+    at all — and `config is None`, the zero-arg classmethod call — falls back to
+    the legacy ladder, which is the documented back-compat path above.
+    """
+    if config is None or "TIMEFRAMES" not in config:
+        ladder = list(_DEFAULT_TIMEFRAMES)
+    else:
+        ladder = list(config["TIMEFRAMES"])
+
+    if not ladder:
+        raise ValueError("TIMEFRAMES must be a non-empty list of timeframes")
+    if len(set(ladder)) != len(ladder):
+        raise ValueError(f"TIMEFRAMES has duplicate entries: {ladder}")
+
+    seconds = [_tf_seconds(tf) for tf in ladder]
+    if any(b <= a for a, b in zip(seconds, seconds[1:])):
+        raise ValueError(
+            f"TIMEFRAMES must be ordered finest-first by duration, got {ladder} "
+            f"({seconds} seconds). Rank 0 (the context leg) is the LAST entry; "
+            "a mis-ordered ladder would build every cross-TF regime backwards."
+        )
+    return ladder
+
+
+def _tf_at_rank(ladder: Sequence[str], rank: int) -> str:
+    """Rank 0 = coarsest (context); the last rank = finest (decision)."""
+    if rank < 0 or rank >= len(ladder):
+        raise IndexError(
+            f"cross-TF regime template needs rank {rank} but the ladder "
+            f"{list(ladder)} has only {len(ladder)} timeframes"
+        )
+    return ladder[len(ladder) - 1 - rank]
 
 
 def _obf():
@@ -136,7 +210,116 @@ _ORB_SAME_TF_VOL_DIR = [
     ("high_volume", "bop_bullish"), ("high_volume", "bop_bearish"),
     ("low_volume", "roc_positive"), ("low_volume", "roc_negative"),
 ]
-_ORB_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+# ── Cross-TF regime templates, keyed by RANK rather than by timeframe ────────
+#
+# Until 2026-09-24 sections 2, 4 and 5 of generate_regime_stack() were ~137
+# hand-written tuples naming '1d_', '4h_' and '1h_' as literals, so the ONLY
+# ladder they could ever describe was 15m/1h/4h/1d. The tuples are unchanged in
+# content — every one of them is a (context filter at rank R, directional
+# filter at rank R') pair, and the tables below are that pair table with the
+# timeframe replaced by its rank. `test_regime_stack_default_ladder.py` pins
+# the pre-refactor output so the rewrite cannot quietly change the stack.
+#
+# Rank 0 = coarsest = CONTEXT; larger rank = finer = DIRECTION (see the ladder
+# contract above). The legacy ladder maps rank 0 -> 1d, 1 -> 4h, 2 -> 1h,
+# 3 -> 15m. NOTE rank 3 (the finest TF) appears in NO cross-TF template: on the
+# legacy ladder 15m is a cross-TF leg nowhere, only a single-TF (§1) and
+# same-TF (§3) one. That asymmetry is preserved, not "tidied".
+#
+# The directional-filter groups are strict prefixes of one another, and the
+# differences between them are REAL, not oversights — e.g. `high_vol` context
+# crosses 4 directional filters at rank 1 but 6 at rank 2, and never mfi.
+_DIR_MACD_RSI = [
+    "macd_bullish", "macd_bearish", "rsi_oversold", "rsi_overbought",
+]
+_DIR_MACD_RSI_BOP = _DIR_MACD_RSI + ["bop_bullish", "bop_bearish"]
+_DIR_MACD_RSI_BOP_MFI = _DIR_MACD_RSI_BOP + ["mfi_oversold", "mfi_overbought"]
+_DIR_MACD_RSI_BOP_MFI_STOCH = _DIR_MACD_RSI_BOP_MFI + ["stoch_bullish"]
+_DIR_MACD = ["macd_bullish", "macd_bearish"]
+_DIR_RSI = ["rsi_oversold", "rsi_overbought"]
+_DIR_BOP = ["bop_bullish", "bop_bearish"]
+_DIR_MFI = ["mfi_oversold", "mfi_overbought"]
+
+# §2 — trend/breakout context + directional signal.
+# (context_rank, [context filters], signal_rank, [signal filters])
+_CROSS_TF_COMBO_TEMPLATES = [
+    (0, ["strong_trend", "ma_momentum", "above_all_mas"], 2, _DIR_MACD_RSI),
+    (1, ["strong_trend", "adx_trend"], 2, _DIR_MACD_RSI),
+    (1, ["macd_bullish"], 2, _DIR_RSI),
+    (0, ["strong_trend"], 1, _DIR_MACD_RSI),
+    (0, ["ma_momentum"], 1, _DIR_MACD),
+    (0, ["vol_breakout"], 1, _DIR_MACD_RSI),
+    (0, ["vol_breakout"], 2, _DIR_MACD_RSI),
+    (1, ["vol_breakout"], 2, _DIR_MACD_RSI),
+]
+# §2b — the two three-leg regimes: coarse context, mid breakout, fine signal.
+# (rank0, [filters], rank1, [filters], rank2, [filters])
+_CROSS_TF_TRIPLE_TEMPLATES = [
+    (0, ["strong_trend", "vol_breakout"], 1, ["vol_breakout"], 2, _DIR_MACD),
+]
+# §4 — volume / volatility context + directional signal.
+_CROSS_TF_VOL_DIR_TEMPLATES = [
+    (0, ["low_volume"], 1, _DIR_MACD_RSI_BOP),
+    (0, ["low_volume"], 2, _DIR_MACD_RSI_BOP_MFI),
+    (0, ["high_volume"], 1, _DIR_MACD_RSI_BOP),
+    (0, ["high_volume"], 2, _DIR_MACD_RSI_BOP_MFI),
+    (1, ["low_volume"], 2, _DIR_MACD_RSI_BOP_MFI_STOCH),
+    (1, ["high_volume"], 2, _DIR_MACD_RSI_BOP_MFI),
+    (0, ["low_vol"], 1, _DIR_MACD_RSI_BOP),
+    (0, ["low_vol"], 2, _DIR_MACD_RSI_BOP_MFI_STOCH),
+    (0, ["high_vol"], 1, _DIR_MACD_RSI),
+    (0, ["high_vol"], 2, _DIR_MACD_RSI_BOP),
+    (1, ["low_vol"], 2, _DIR_MACD_RSI_BOP_MFI_STOCH),
+    (1, ["high_vol"], 2, _DIR_MACD_RSI_BOP),
+]
+# §5 — TA-lab context + directional signal.
+_CROSS_TF_TALAB_TEMPLATES = [
+    (0, ["strong_trend"], 2, _DIR_BOP),
+    (0, ["vol_breakout"], 2, _DIR_MFI),
+    (1, ["vol_breakout"], 2, _DIR_BOP),
+    (1, ["vol_breakout"], 2, _DIR_MFI),
+]
+
+
+def _expand_pair_templates(ladder: Sequence[str], templates) -> list[tuple]:
+    """(ctx_rank, ctx_filters, sig_rank, sig_filters) -> concrete 2-leg tuples.
+
+    Order is context-filter-major, signal-filter-minor, templates in listed
+    order — the order the hand-written tables used, which the dedup in
+    generate_regime_stack() then makes observable in the emitted stack.
+    """
+    out: list[tuple] = []
+    for ctx_rank, ctx_filters, sig_rank, sig_filters in templates:
+        if ctx_rank >= sig_rank:
+            raise ValueError(
+                f"cross-TF template has context rank {ctx_rank} at or below "
+                f"signal rank {sig_rank}: the context leg must be COARSER "
+                "(lower rank) than the directional leg"
+            )
+        ctx_tf = _tf_at_rank(ladder, ctx_rank)
+        sig_tf = _tf_at_rank(ladder, sig_rank)
+        for cf in ctx_filters:
+            for sf in sig_filters:
+                out.append((f"{ctx_tf}_{cf}", f"{sig_tf}_{sf}"))
+    return out
+
+
+def _expand_triple_templates(ladder: Sequence[str], templates) -> list[tuple]:
+    """(r0, f0, r1, f1, r2, f2) -> concrete 3-leg tuples, coarsest leg first."""
+    out: list[tuple] = []
+    for r0, f0, r1, f1, r2, f2 in templates:
+        if not (r0 < r1 < r2):
+            raise ValueError(
+                f"three-leg template ranks must be strictly coarse-to-fine, "
+                f"got ({r0}, {r1}, {r2})"
+            )
+        tf0, tf1, tf2 = (_tf_at_rank(ladder, r) for r in (r0, r1, r2))
+        for a in f0:
+            for b in f1:
+                for c in f2:
+                    out.append((f"{tf0}_{a}", f"{tf1}_{b}", f"{tf2}_{c}"))
+    return out
 
 
 def _orb_has_baseline(regime_name: str) -> bool:
@@ -151,109 +334,47 @@ class OrbResearch(AgamottoResearch):
     """Cross-timeframe research: merges 4 TF features into one wide matrix."""
 
     @classmethod
-    def generate_regime_stack(cls) -> list[dict]:
+    def generate_regime_stack(cls, config: Optional[Dict[str, object]] = None) -> list[dict]:
         """Coded [{regime, position}] for all Orb cross-TF regimes.
 
         Builds regimes internally with real atom names (reusing allowed_positions
         for directionality), drops any baseline conjunct, dedups, then returns
         OBFUSCATED, structure-preserving regime names so the public marvel
         generator never handles real names.
+
+        `config` supplies the TF ladder through TIMEFRAMES. Omitted (the
+        zero-arg call marvel's generate_orb_regimes.py still makes) it is the
+        legacy 15m/1h/4h/1d ladder and the output is byte-identical to the
+        shipped 332-row stack — pinned by
+        orb_pkg/tests/test_regime_stack_default_ladder.py.
         """
+        ladder = _resolve_ladder(config)
+
         def allowed(filters):
             return cls.allowed_positions("_and_".join(filters))
 
         regimes: list[dict] = []
 
         # 1. Single-TF filters on cross-TF data
-        for tf in _ORB_TIMEFRAMES:
+        for tf in ladder:
             for filt in _ORB_BASE_FILTERS:
                 for pos in allowed((f"{tf}_{filt}",)):
                     regimes.append({"regime": f"{tf}_{filt}", "position": pos})
 
         # 2. Cross-TF compounds (>=1 unidirectional leg)
-        cross_tf_combos = [
-            ("1d_strong_trend", "1h_macd_bullish"), ("1d_strong_trend", "1h_macd_bearish"),
-            ("1d_strong_trend", "1h_rsi_oversold"), ("1d_strong_trend", "1h_rsi_overbought"),
-            ("1d_ma_momentum", "1h_macd_bullish"), ("1d_ma_momentum", "1h_macd_bearish"),
-            ("1d_ma_momentum", "1h_rsi_oversold"), ("1d_ma_momentum", "1h_rsi_overbought"),
-            ("1d_above_all_mas", "1h_macd_bullish"), ("1d_above_all_mas", "1h_macd_bearish"),
-            ("1d_above_all_mas", "1h_rsi_oversold"), ("1d_above_all_mas", "1h_rsi_overbought"),
-            ("4h_strong_trend", "1h_macd_bullish"), ("4h_strong_trend", "1h_macd_bearish"),
-            ("4h_strong_trend", "1h_rsi_oversold"), ("4h_strong_trend", "1h_rsi_overbought"),
-            ("4h_adx_trend", "1h_macd_bullish"), ("4h_adx_trend", "1h_macd_bearish"),
-            ("4h_adx_trend", "1h_rsi_oversold"), ("4h_adx_trend", "1h_rsi_overbought"),
-            ("4h_macd_bullish", "1h_rsi_oversold"), ("4h_macd_bullish", "1h_rsi_overbought"),
-            ("1d_strong_trend", "4h_macd_bullish"), ("1d_strong_trend", "4h_macd_bearish"),
-            ("1d_strong_trend", "4h_rsi_oversold"), ("1d_strong_trend", "4h_rsi_overbought"),
-            ("1d_ma_momentum", "4h_macd_bullish"), ("1d_ma_momentum", "4h_macd_bearish"),
-            ("1d_vol_breakout", "4h_macd_bullish"), ("1d_vol_breakout", "4h_macd_bearish"),
-            ("1d_vol_breakout", "4h_rsi_oversold"), ("1d_vol_breakout", "4h_rsi_overbought"),
-            ("1d_vol_breakout", "1h_macd_bullish"), ("1d_vol_breakout", "1h_macd_bearish"),
-            ("1d_vol_breakout", "1h_rsi_oversold"), ("1d_vol_breakout", "1h_rsi_overbought"),
-            ("4h_vol_breakout", "1h_macd_bullish"), ("4h_vol_breakout", "1h_macd_bearish"),
-            ("4h_vol_breakout", "1h_rsi_oversold"), ("4h_vol_breakout", "1h_rsi_overbought"),
-            ("1d_strong_trend", "4h_vol_breakout", "1h_macd_bullish"),
-            ("1d_strong_trend", "4h_vol_breakout", "1h_macd_bearish"),
-            ("1d_vol_breakout", "4h_vol_breakout", "1h_macd_bullish"),
-            ("1d_vol_breakout", "4h_vol_breakout", "1h_macd_bearish"),
-        ]
-        # 3. Same-TF volume × directional cross products
-        same_tf = [(f"{tf}_{v}", f"{tf}_{d}") for tf in _ORB_TIMEFRAMES
+        cross_tf_combos = (
+            _expand_pair_templates(ladder, _CROSS_TF_COMBO_TEMPLATES)
+            + _expand_triple_templates(ladder, _CROSS_TF_TRIPLE_TEMPLATES)
+        )
+        # 3. Same-TF volume x directional cross products
+        same_tf = [(f"{tf}_{v}", f"{tf}_{d}") for tf in ladder
                    for (v, d) in _ORB_SAME_TF_VOL_DIR]
         # 4. Cross-TF vol/volatility context + directional signal
-        cross_tf_vol_directional = [
-            ("1d_low_volume", "4h_macd_bullish"), ("1d_low_volume", "4h_macd_bearish"),
-            ("1d_low_volume", "4h_rsi_oversold"), ("1d_low_volume", "4h_rsi_overbought"),
-            ("1d_low_volume", "4h_bop_bullish"), ("1d_low_volume", "4h_bop_bearish"),
-            ("1d_low_volume", "1h_macd_bullish"), ("1d_low_volume", "1h_macd_bearish"),
-            ("1d_low_volume", "1h_rsi_oversold"), ("1d_low_volume", "1h_rsi_overbought"),
-            ("1d_low_volume", "1h_bop_bullish"), ("1d_low_volume", "1h_bop_bearish"),
-            ("1d_low_volume", "1h_mfi_oversold"), ("1d_low_volume", "1h_mfi_overbought"),
-            ("1d_high_volume", "4h_macd_bullish"), ("1d_high_volume", "4h_macd_bearish"),
-            ("1d_high_volume", "4h_rsi_oversold"), ("1d_high_volume", "4h_rsi_overbought"),
-            ("1d_high_volume", "4h_bop_bullish"), ("1d_high_volume", "4h_bop_bearish"),
-            ("1d_high_volume", "1h_macd_bullish"), ("1d_high_volume", "1h_macd_bearish"),
-            ("1d_high_volume", "1h_rsi_oversold"), ("1d_high_volume", "1h_rsi_overbought"),
-            ("1d_high_volume", "1h_bop_bullish"), ("1d_high_volume", "1h_bop_bearish"),
-            ("1d_high_volume", "1h_mfi_oversold"), ("1d_high_volume", "1h_mfi_overbought"),
-            ("4h_low_volume", "1h_macd_bullish"), ("4h_low_volume", "1h_macd_bearish"),
-            ("4h_low_volume", "1h_rsi_oversold"), ("4h_low_volume", "1h_rsi_overbought"),
-            ("4h_low_volume", "1h_bop_bullish"), ("4h_low_volume", "1h_bop_bearish"),
-            ("4h_low_volume", "1h_mfi_oversold"), ("4h_low_volume", "1h_mfi_overbought"),
-            ("4h_low_volume", "1h_stoch_bullish"),
-            ("4h_high_volume", "1h_macd_bullish"), ("4h_high_volume", "1h_macd_bearish"),
-            ("4h_high_volume", "1h_rsi_oversold"), ("4h_high_volume", "1h_rsi_overbought"),
-            ("4h_high_volume", "1h_bop_bullish"), ("4h_high_volume", "1h_bop_bearish"),
-            ("4h_high_volume", "1h_mfi_oversold"), ("4h_high_volume", "1h_mfi_overbought"),
-            ("1d_low_vol", "4h_macd_bullish"), ("1d_low_vol", "4h_macd_bearish"),
-            ("1d_low_vol", "4h_rsi_oversold"), ("1d_low_vol", "4h_rsi_overbought"),
-            ("1d_low_vol", "4h_bop_bullish"), ("1d_low_vol", "4h_bop_bearish"),
-            ("1d_low_vol", "1h_macd_bullish"), ("1d_low_vol", "1h_macd_bearish"),
-            ("1d_low_vol", "1h_rsi_oversold"), ("1d_low_vol", "1h_rsi_overbought"),
-            ("1d_low_vol", "1h_bop_bullish"), ("1d_low_vol", "1h_bop_bearish"),
-            ("1d_low_vol", "1h_mfi_oversold"), ("1d_low_vol", "1h_mfi_overbought"),
-            ("1d_low_vol", "1h_stoch_bullish"),
-            ("1d_high_vol", "4h_macd_bullish"), ("1d_high_vol", "4h_macd_bearish"),
-            ("1d_high_vol", "4h_rsi_oversold"), ("1d_high_vol", "4h_rsi_overbought"),
-            ("1d_high_vol", "1h_macd_bullish"), ("1d_high_vol", "1h_macd_bearish"),
-            ("1d_high_vol", "1h_rsi_oversold"), ("1d_high_vol", "1h_rsi_overbought"),
-            ("1d_high_vol", "1h_bop_bullish"), ("1d_high_vol", "1h_bop_bearish"),
-            ("4h_low_vol", "1h_macd_bullish"), ("4h_low_vol", "1h_macd_bearish"),
-            ("4h_low_vol", "1h_rsi_oversold"), ("4h_low_vol", "1h_rsi_overbought"),
-            ("4h_low_vol", "1h_bop_bullish"), ("4h_low_vol", "1h_bop_bearish"),
-            ("4h_low_vol", "1h_mfi_oversold"), ("4h_low_vol", "1h_mfi_overbought"),
-            ("4h_low_vol", "1h_stoch_bullish"),
-            ("4h_high_vol", "1h_macd_bullish"), ("4h_high_vol", "1h_macd_bearish"),
-            ("4h_high_vol", "1h_rsi_oversold"), ("4h_high_vol", "1h_rsi_overbought"),
-            ("4h_high_vol", "1h_bop_bullish"), ("4h_high_vol", "1h_bop_bearish"),
-        ]
+        cross_tf_vol_directional = _expand_pair_templates(
+            ladder, _CROSS_TF_VOL_DIR_TEMPLATES)
         # 5. Cross-TF TA-lab combos
-        cross_tf_talab = [
-            ("1d_strong_trend", "1h_bop_bullish"), ("1d_strong_trend", "1h_bop_bearish"),
-            ("1d_vol_breakout", "1h_mfi_oversold"), ("1d_vol_breakout", "1h_mfi_overbought"),
-            ("4h_vol_breakout", "1h_bop_bullish"), ("4h_vol_breakout", "1h_bop_bearish"),
-            ("4h_vol_breakout", "1h_mfi_oversold"), ("4h_vol_breakout", "1h_mfi_overbought"),
-        ]
+        cross_tf_talab = _expand_pair_templates(ladder, _CROSS_TF_TALAB_TEMPLATES)
+
         for combo in cross_tf_combos + same_tf + cross_tf_vol_directional + cross_tf_talab:
             name = "_and_".join(combo)
             for pos in allowed(combo):
@@ -274,8 +395,25 @@ class OrbResearch(AgamottoResearch):
 
     def __init__(self, config: Dict[str, object], home_root: str) -> None:
         super().__init__(config, home_root)
-        self.timeframes: List[str] = config.get(
-            "TIMEFRAMES", ["15m", "1h", "4h", "1d"])
+        self.timeframes: List[str] = _resolve_ladder(config)
+        # BASE_TF / TARGET_TF keep their legacy reads ONLY while the ladder is
+        # the legacy one: "15m"/"1h" are meaningless on any other ladder, and
+        # silently picking a timeframe the arm never named is the failure this
+        # parametrization exists to prevent. Every orb arm on disk states both
+        # keys, so nothing deployed reaches either branch's fallback.
+        if self.timeframes != _DEFAULT_TIMEFRAMES:
+            missing = [k for k in ("BASE_TF", "TARGET_TF") if k not in config]
+            if missing:
+                raise KeyError(
+                    f"TIMEFRAMES={self.timeframes} is not the legacy ladder "
+                    f"{_DEFAULT_TIMEFRAMES}, so {missing} must be stated "
+                    "explicitly in setting.json (no implicit '15m'/'1h')."
+                )
+        # DEPRECATED: drop after 2026-12-01 together with _DEFAULT_TIMEFRAMES.
+        # NOT validated against `self.timeframes`: a TARGET_TF outside the
+        # ladder is a supported shape, exercised by
+        # orb_pkg/tests/test_orb_verticalize_dedup.py:164 (step 1 then skips
+        # nothing and step 3b finds nothing).
         self.base_tf: str = config.get("BASE_TF", "15m")
         self.target_tf: str = config.get("TARGET_TF", "1h")
         self._tf_instances: dict[str, AgamottoResearch] = {}
@@ -555,21 +693,36 @@ class OrbResearch(AgamottoResearch):
         # orb research artefact built before this date measures a different
         # regime than its name says.
         #
-        # Splitting FIRST (before the _TF_PREFIXES loop below) is load-bearing:
+        # Splitting FIRST (before the TF-prefix loop below) is load-bearing:
         # `15m_a_and_1h_b` starts with `15m_`, so the loop would otherwise
         # remap 15m for the whole compound and leave the 1h leg to be evaluated
         # on a frame that has already been overwritten.
         if "_and_" in filter_name or "_or_" in filter_name:
             return super()._apply_filter_mask(df, filter_name, position)
 
-        # Check for TF prefix on the (atomic) filter name
-        for prefix in _TF_PREFIXES:
-            if filter_name.startswith(prefix):
-                tf = prefix.rstrip("_")
-                base_filter = filter_name[len(prefix):]
-                remapped = self._remap_tf_columns(df, tf)
-                return super()._apply_filter_mask(
-                    remapped, base_filter, position)
+        # Check for a TF prefix on the (atomic) filter name.
+        #
+        # ANY TF-shaped prefix, not the hardcoded ("15m_", "1h_", "4h_", "1d_")
+        # this matched until 2026-09-24 and NOT `self.timeframes` either. Both
+        # of those are wrong, in opposite directions:
+        #   * a hardcoded tuple leaves every atom of a 1m/5m/15m/1h arm looking
+        #     unprefixed, so it falls through to the bare TARGET_TF columns and
+        #     `1m_rsi_oversold` silently reads the target timeframe;
+        #   * restricting it to THIS arm's ladder reintroduces the second route
+        #     to that same wrong answer — `4h_rsi_oversold` on a 15m+1h panel
+        #     would fall through to the bare columns instead of being remapped
+        #     to a timeframe that has none and raising in `_require_col`
+        #     (orb_pkg/tests/test_cross_tf_compound_dispatch.py:256).
+        # Matching the shape and letting `_remap_tf_columns` + `_require_col`
+        # adjudicate keeps the loud failure and works on any ladder. Same
+        # `^(\d+[smhd])_` shape as obfuscation/codec.py:28.
+        _tf_m = _TF_PREFIX_ON_ATOM.match(filter_name)
+        if _tf_m is not None:
+            tf = _tf_m.group(1)
+            base_filter = filter_name[len(tf) + 1:]
+            remapped = self._remap_tf_columns(df, tf)
+            return super()._apply_filter_mask(
+                remapped, base_filter, position)
 
         # No TF prefix → uses unprefixed TARGET_TF columns directly
         return super()._apply_filter_mask(df, filter_name, position)
