@@ -1088,31 +1088,41 @@ and nothing else:
 Column keys are the obfuscation codes, except `close` and `mvg1/2/3`, for which
 `dc/obfuscation/map.json` **has no entry** — see "The mvg gap" below.
 
-### PANEL_BARS = 699 is a correctness parameter, not a buffer size
+### PANEL_BARS = 799 is a correctness parameter, not a buffer size
 
-`trading.py:443` `load_data(limit=700)` → `:480` `tail(limit)` → `:485`
-`iloc[:-1]` (drop the incomplete bar) = **699 closed bars**, always.
+`trading.py` `DEFAULT_KLINE_LOOKBACK = 800` → `tail(limit)` → `iloc[:-1]`
+(drop the incomplete bar) = **799 closed bars**, always. (It was 699 until
+2026-09-11 — dc PR #76 moved python, dc `0a1c4c2` mirrored it here.)
 
 `price_range_pct_q50` is `rolling(700, min_periods=1)`, so below 700 rows it is
 an **expanding** median: the value at row *i* is the median of rows 0..*i*.
-Feed 700 rows instead of 699 and the numbers change; feed 1000 and they all do.
-`engineerFeatures` therefore *rejects* any other width rather than producing
-plausible numbers live would never see, and the harness reads `PANEL_BARS` out
-of the header rather than retyping it.
+Feed a different width and the numbers change. `engineerFeatures` therefore
+*rejects* any other width rather than producing plausible numbers live would
+never see, and the harness reads `PANEL_BARS` out of the header rather than
+retyping it.
 
-### q80/q90/q95 are ALL-NaN, deliberately, and the gate pins it
+### q80/q90/q95 warm rows are DERIVED per scenario, and the gate pins them
 
-They are `rolling(VOL_Q_WINDOW=700, min_periods=VOL_Q_WINDOW)`
-(research.py:371-376). At 699 rows the min_periods is never met, so all three
-columns are NaN on every row. That is **live behaviour under an open production
-finding** — marvel PR #532,
-`docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md`, which measures
-that **53 of 62 deployed regimes cannot fire live** because `x > NaN` is False.
-The port reproduces it and must not "fix" it: lowering min_periods or widening
-the panel would start those regimes firing against models never trained on a
-firing regime, and the port would look like the cause. `feature_parity.py`
-asserts the all-NaN property on **both** sides, so it is pinned rather than
-incidental.
+They are `rolling(VOL_Q_WINDOW=700, min_periods=VOL_Q_WINDOW)`. `min_periods`
+counts non-NaN **observations**, not rows, so a row is warm only when its
+trailing 700 `price_range_pct` values are all valid (`price_range_pct` is NaN
+wherever high, low or open is). On a hole-free 799-row panel that is the last
+100 rows, including the latest — the only row the gate reads. On the holes and
+leading-NaN scenarios every trailing window holds a NaN (rows 797 and 600), so
+the correct answer there is **zero** warm rows on both sides.
+
+`feature_parity.py` `vol_q_warm_mask` derives the expected rows from each raw
+panel (numpy cumsum, not pandas `rolling`), cross-checks its validity mask
+against the reference's own `price_range_pct` NaN mask, and requires the finite
+mask of all three columns to match it **row for row on both sides**. `main`
+separately fails if `PANEL_BARS < 700` — marvel PR #532, where these columns
+were NaN on every row and **53 of 62 deployed regimes could not fire live**
+(`docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md`).
+
+History: until 2026-09-26 the assertion expected a flat `PANEL_BARS - 700 + 1`
+finite cells in every scenario. That is right only on hole-free panels; after
+the 799 move it failed both sides of the two NaN scenarios (12 failure groups,
+both toolchains) while engine and reference agreed on every cell.
 
 ### Two things this file does NOT do
 
@@ -1192,7 +1202,13 @@ turning the gate red:
 |---|---|
 | `1e-8` → `1e-10` (mjolnir's epsilon) | PEPE scenario, 7 columns, max rel 2.212e-06 (**BTC scenario still passes**) |
 | non-finite → 0.0 (mjolnir's sanitiser) | 9 columns on the NaN/inf classification + the all-NaN q80/q90/q95 assertion |
-| `min_periods` 700 → 1 on the vol quantiles | the all-NaN assertion + 3 columns on classification |
+| `min_periods` 700 → 1 on the vol quantiles | the all-NaN assertion + 3 columns on classification (re-run 2026-09-26 at 799 bars: the derived warm-row mask fires on all 5 scenarios, both sides' counts shown) |
+
+`--negative` now builds and runs the **unmutated** driver first and refuses to
+continue unless it passes. Before 2026-09-26 it did not: with origin/main's gate
+red on the vol-quantile assertion it still printed "5 mutants, all caught",
+because a mutant is credited as caught whenever the gate goes red for any
+reason. Each mutant's `=== FAIL` lines are now printed so the reason is visible.
 
 ### Reference quirks reproduced, and one declared divergence
 
