@@ -31,10 +31,14 @@ agamotto differs from mjolnir in a way that a copied harness would hide:
    must equal the live width or this harness compares numbers live never
    computes. PANEL_BARS is READ FROM THE HEADER, never duplicated.
 
-3. **q80/q90/q95 must be populated on exactly the last
-   `PANEL_BARS - 700 + 1` rows, and that is asserted.** They are
-   `rolling(700, min_periods=700)` (research.py:371-376). At 799 rows that is
+3. **q80/q90/q95 must be populated on exactly the rows whose trailing 700
+   bars are all valid, and that is asserted.** They are
+   `rolling(700, min_periods=700)` (research.py:371-376), and min_periods
+   counts non-NaN observations, not rows. On a hole-free 799-row panel that is
    the trailing 100 rows -- including the LATEST, the only row the gate reads.
+   On the holes and leading-NaN scenarios every trailing window contains a NaN
+   `price_range_pct`, so the correct count there is ZERO; the expectation is
+   derived per scenario (`vol_q_warm_mask`), not assumed.
    Until 2026-09-11 PANEL_BARS was 699 and these were NaN everywhere, which is
    the production finding marvel PR #532 /
    docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md (53 of 62
@@ -318,10 +322,39 @@ _REAL_NAMES_CODED += _STATS_NAMES + _SCALE_FREE_NAMES
 # for the `close` passthrough, so both sides carry the real name.
 _REAL_NAMES_UNCODED = ["close", "mvg1", "mvg2", "mvg3"]
 
-# The three q* columns whose warm-row COUNT is the pinned production property.
+# The three q* columns whose warm-row MASK is the pinned production property.
 VOL_Q_COLS = ["price_range_pct_q80", "price_range_pct_q90", "price_range_pct_q95"]
 # research.py:371-376 / feature_engine.hpp VOL_Q_WINDOW -- window AND min_periods.
 VOL_Q_MIN_PERIODS = 700
+
+
+def vol_q_warm_mask(raw: pd.DataFrame) -> np.ndarray:
+    """Rows on which q80/q90/q95 MUST be finite, derived from the raw panel.
+
+    `min_periods` counts non-NaN OBSERVATIONS, not rows. `price_range_pct` is
+    `(high - low) / (open + 1e-8)` (research.py:566), so it is NaN wherever any
+    of high/low/open is, and a row is warm only when its trailing
+    VOL_Q_MIN_PERIODS-row window holds VOL_Q_MIN_PERIODS valid observations.
+    On a hole-free panel that is the last `PANEL_BARS - 700 + 1` rows; on the
+    holes / leading-NaN scenarios every window contains a NaN (rows 797 and
+    600 respectively), so the correct answer there is ZERO warm rows. A flat
+    `PANEL_BARS - 700 + 1` expectation fails both sides on those scenarios
+    while the engine is right.
+
+    Computed with a numpy cumsum, deliberately NOT pandas `rolling`, so the
+    expectation does not share code with the reference it grades. `compare`
+    cross-checks the validity mask against the reference's own
+    `price_range_pct` NaN mask, so a formula change in research.py fails loudly
+    here instead of drifting.
+    """
+    valid = raw[["high", "low", "open"]].notna().all(axis=1).to_numpy()
+    warm = np.zeros(len(valid), dtype=bool)
+    k = VOL_Q_MIN_PERIODS
+    if len(valid) >= k:
+        csum = np.concatenate([[0], np.cumsum(valid)])
+        warm[k - 1:] = (csum[k:] - csum[:-k]) == k
+    return warm
+
 
 # ---------------------------------------------------------------------------
 # LOOKAHEAD. Every one of these reads shift(-1) or shift(-2) on close/high/low:
@@ -792,32 +825,38 @@ def compare(name: str, ref: pd.DataFrame, cpp: pd.DataFrame, enc, tol: float,
 
     # (3) the pinned production property: the vol-quantile cutoffs are
     # populated on exactly the rows where min_periods is satisfied, and NOWHERE
-    # else. Derived from PANEL_BARS (read from the header), never a literal --
-    # a hardcoded count here is how this silently stops matching the engine.
-    _expected_finite = max(0, PANEL_BARS - VOL_Q_MIN_PERIODS + 1)
+    # else. The expected rows are DERIVED from this scenario's raw NaN layout
+    # (`vol_q_warm_mask`), never a literal count -- the old flat
+    # `PANEL_BARS - 700 + 1` was right only on hole-free panels and failed
+    # both sides of the two NaN scenarios while the engine was correct.
+    # `main` separately asserts PANEL_BARS >= min_periods, which is what keeps
+    # the hole-free scenarios' LAST row warm (marvel PR #532).
+    warm = vol_q_warm_mask(raw)
+    prp_valid_ref = ~np.isnan(ref[enc("price_range_pct")].to_numpy(float))
+    prp_valid_raw = raw[["high", "low", "open"]].notna().all(axis=1).to_numpy()
+    if not np.array_equal(prp_valid_ref, prp_valid_raw):
+        print("=== FAIL: the reference's price_range_pct NaN mask differs from "
+              "the high/low/open validity `vol_q_warm_mask` derives from — "
+              "research.py's formula moved; re-derive the expectation. ===")
+        failures += 1
     for col in VOL_Q_COLS:
         code = enc(col)
         for side, frame in (("reference", ref), ("C++", cpp)):
             if code not in frame.columns:
                 continue
-            v = frame[code].to_numpy(float)
-            n_finite = int((~np.isnan(v)).sum())
-            if n_finite != _expected_finite:
-                print(f"=== FAIL: {col} has {n_finite} finite cells on the "
-                      f"{side} side, expected {_expected_finite} "
-                      f"(PANEL_BARS={PANEL_BARS}, "
-                      f"min_periods={VOL_Q_MIN_PERIODS}). If this reads 0 the "
-                      "panel narrowed below min_periods and 48 of the 58 "
-                      "deployed legs are inert again — marvel PR #532. ===")
-                failures += 1
-            # the warm rows must be the TRAILING ones: a leading block would
-            # mean the window ran the wrong way round.
-            if n_finite and not np.isnan(v[-1]):
-                pass
-            elif n_finite:
-                print(f"=== FAIL: {col} is populated but its LAST row is NaN "
-                      f"on the {side} side — the gate reads that row. ===")
-                failures += 1
+            finite = ~np.isnan(frame[code].to_numpy(float))
+            if np.array_equal(finite, warm):
+                continue
+            bad = np.flatnonzero(finite != warm)
+            print(f"=== FAIL: {col} has {int(finite.sum())} finite cells on the "
+                  f"{side} side, expected {int(warm.sum())} on the rows whose "
+                  f"trailing {VOL_Q_MIN_PERIODS} bars are all valid "
+                  f"(PANEL_BARS={PANEL_BARS}); {bad.size} rows differ, first "
+                  f"{bad[:5].tolist()}. ===")
+            if warm[-1] and not finite[-1]:
+                print("    ... including the LAST row, the only one the gate "
+                      "reads: the r07x legs are inert again — marvel PR #532.")
+            failures += 1
 
     # The TA-Lib NATR defect (ta_NATR.c:334-338). Derived from the defect AND
     # independently proven non-deterministic; anything unexplained fails here
@@ -975,6 +1014,14 @@ def main() -> int:
     enc = encoder()
     scenarios = SCENARIOS
     failures = 0
+    # The PR #532 guard, stated directly. The per-scenario mask check follows
+    # PANEL_BARS from the header, so a header narrowed back below min_periods
+    # would make "zero warm rows" the EXPECTED answer and pass on both sides.
+    if PANEL_BARS < VOL_Q_MIN_PERIODS:
+        print(f"=== FAIL: PANEL_BARS={PANEL_BARS} < min_periods="
+              f"{VOL_Q_MIN_PERIODS}: q80/q90/q95 are NaN on every row, so the "
+              "r07x legs cannot fire — marvel PR #532 is back. ===")
+        failures += 1
     for name, price, seed, holes, leads, safe_branch in scenarios:
         raw = make_panel(PANEL_BARS, price, seed, holes, leads, safe_branch)
         ref = reference_panel(raw)
