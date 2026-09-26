@@ -48,7 +48,9 @@ agamotto differs from mjolnir in a way that a copied harness would hide:
    sixth-significant-figure move in `price_range_pct`, which is a top-5
    IC-selected feature. A BTC-only harness cannot tell `+1e-8` from `+0`.
    A third scenario injects NaN holes and a zero-volume bar so the NaN masks
-   and the +/-inf cells are exercised rather than merely permitted.
+   and the +/-inf cells are exercised rather than merely permitted. (Since
+   2026-09-26 the zero-volume bar gives NaN, not +inf, in `vol_ret_lag*` —
+   `zero_volume_vol_ret_check` pins that on both sides.)
 
 Stage 2.3 adds two checks that only the TA-Lib block needs:
 
@@ -386,8 +388,10 @@ def make_panel(n: int, price: float, seed: int, holes: bool,
             df.iloc[n - 2, df.columns.get_loc(col)] = np.nan
         df.iloc[50:53, df.columns.get_loc("volume")] = np.nan
         df.iloc[200, df.columns.get_loc("quote_volume")] = np.nan
-        # Zero denominators, so +/-inf really appears on both sides:
-        #   volume == 0    -> vol_ret = pct_change over 0  -> +inf on the next bar
+        # Zero denominators:
+        #   volume == 0    -> vol_ret over a zero previous volume -> NaN on the
+        #                     next bar (was pct_change's +inf until 2026-09-26;
+        #                     zero_volume_vol_ret_check pins the NaN)
         #   quote_volume 0 -> buy_pressure divides by (0 + 1e-8), a huge finite
         # A harness that only ever sees finite cells cannot tell an engine that
         # propagates inf from one that swallows it.
@@ -643,6 +647,41 @@ def safe_branch_coverage(ref: pd.DataFrame, raw: pd.DataFrame, cpp: pd.DataFrame
                   "(replace([inf,-inf], nan)) is unexercised ===")
             failures += 1
     return failures
+
+
+def zero_volume_vol_ret_check(ref: pd.DataFrame, raw: pd.DataFrame,
+                              cpp: pd.DataFrame, enc) -> tuple[int, int]:
+    """Pin `vol_ret` over a zero previous volume to NaN, on BOTH sides.
+
+    research.py computes `vol / vol.shift(1).where(vol.shift(1) != 0) - 1`
+    (2026-09-26; `pct_change` gave +inf there). The classification diff already
+    forces ref == cpp; this pins that what they agree on is NaN, and that no
+    `vol_ret_lag*` cell anywhere is +/-inf. Returns (failures, n_discriminating),
+    where a DISCRIMINATING cell is one pct_change would have made +inf (previous
+    volume 0, current volume finite and non-zero) — the only cells on which the
+    old rule and the new one disagree. main() requires the total to be non-zero.
+    """
+    v = raw["volume"].to_numpy(float)
+    prev = np.r_[np.nan, v[:-1]]
+    disc = (prev == 0.0) & np.isfinite(v) & (v != 0.0)
+    failures = 0
+    for lag in (1, 2, 3):
+        name = f"vol_ret_lag{lag}"
+        rows = np.flatnonzero(disc) + lag
+        rows = rows[rows < len(v)]
+        for side, frame, col in (("ref", ref, name), ("cpp", cpp, enc(name))):
+            if col not in frame.columns:
+                print(f"=== FAIL: {side} panel has no {name} ({col}) ===")
+                failures += 1
+                continue
+            a = frame[col].to_numpy(float)
+            n_inf = int(np.isinf(a).sum())
+            n_not_nan = int((~np.isnan(a[rows])).sum())
+            if n_inf or n_not_nan:
+                print(f"=== FAIL: {side} {name}: {n_inf} +/-inf cell(s); {n_not_nan} of "
+                      f"{rows.size} cell(s) after a zero-volume bar are not NaN ===")
+                failures += 1
+    return failures, int(disc.sum())
 
 
 def reference_panel(raw: pd.DataFrame) -> pd.DataFrame:
@@ -975,6 +1014,7 @@ def main() -> int:
     enc = encoder()
     scenarios = SCENARIOS
     failures = 0
+    n_zero_vol = 0
     for name, price, seed, holes, leads, safe_branch in scenarios:
         raw = make_panel(PANEL_BARS, price, seed, holes, leads, safe_branch)
         ref = reference_panel(raw)
@@ -983,6 +1023,16 @@ def main() -> int:
             f"the reference panel for scenario {name!r}")
         cpp = run_driver(args.driver, raw)
         failures += compare(name, ref, cpp, enc, args.tol, raw, safe_branch)
+        f_zv, n_zv = zero_volume_vol_ret_check(ref, raw, cpp, enc)
+        failures += f_zv
+        n_zero_vol += n_zv
+
+    print(f"[feat_parity] vol_ret after a zero-volume bar: {n_zero_vol} "
+          "discriminating bar(s) across all scenarios, each NaN on both sides")
+    if n_zero_vol == 0:
+        print("=== FAIL: no bar follows a zero-volume bar with non-zero volume — "
+              "the vol_ret zero-denominator rule is unexercised ===")
+        failures += 1
 
     print()
     if failures:
