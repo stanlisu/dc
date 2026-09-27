@@ -12,7 +12,7 @@
 // would compare five decisions per scenario — and a decision is a BOOLEAN, so
 // five samples is nowhere near enough to catch a rule that is right in the
 // middle of the distribution and wrong at the edges. The rule is row-
-// independent, so all 699 rows are graded and the newest one is reported
+// independent, so all PANEL_BARS rows are graded and the newest one is reported
 // separately.
 //
 //   --weights <dir>       the export_agamotto_sentinel_weights.py output dir

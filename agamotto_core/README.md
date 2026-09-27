@@ -17,18 +17,18 @@ reasoning, as [`../sentinel_core`](../sentinel_core/README.md).
 | Parity vs Binance's own klines | ⚠️ **7/9 columns exact; the two taker_buy_\* miss** (below) |
 | 2.0 `Table` + `pdops` scaffolding, ta-lib linked | ✅ |
 | 2.1 numeric primitives vs pandas 2.3.3 | ✅ 70 gated + 6 negative + 19 probe specs; byte-identical report on clang/arm64 and gcc 8.5/x86-64 |
-| 2.2 OHLC / returns / MA / volume columns (24) | ✅ vs the REAL `research.py`; 4 scenarios x 699 rows, clang/arm64 and gcc 8.5/x86-64 |
-| 2.3 TA-Lib indicator block (25 calls -> 29 columns) + `parkinson_vol` | ✅ vs the REAL `research.py`; 54 columns x 4 scenarios x 699 rows, both toolchains |
+| 2.2 OHLC / returns / MA / volume columns (24) | ✅ vs the REAL `research.py`; 4 scenarios x 699 rows, clang/arm64 and gcc 8.5/x86-64 (re-verified 2026-09-27: 5 scenarios x 799 rows, both toolchains) |
+| 2.3 TA-Lib indicator block (25 calls -> 29 columns) + `parkinson_vol` | ✅ vs the REAL `research.py`; 54 columns x 4 scenarios x 699 rows, both toolchains (re-verified 2026-09-27 at 799 rows) |
 | 2.4 rolling stats (`std`/`skew`/`kurt`/`acf_lag1`) | ✅ vs the REAL `research.py`; on `hist_return`, not close. `std` **is** `f085` — see below |
-| 2.5 scale-free levels (7 columns) | ✅ vs the REAL `research.py`; **65 columns x 5 scenarios x 699 rows, both toolchains, 5/5 negative controls** |
+| 2.5 scale-free levels (7 columns) | ✅ vs the REAL `research.py`; **65 columns x 5 scenarios x 699 rows, both toolchains, 5/5 negative controls** (re-verified 2026-09-27: 799 rows, both toolchains, 5/5 negatives against a green baseline) |
 | 2.6 the engine WIRED into `RealCore` | ✅ 42/42 integration assertions; panel computed per live bar; cost + shape cross the ABI |
 | 2.7 live reconciliation vs the Python bot | ✅ `tests/live_reconcile.py` — feed -> builder -> engine vs knull, attributed |
 | Rule 7: the DROPPED-TRADE detector | ✅ 102 kline self-test assertions (was 84); per-bar + per-run, across the ABI |
-| 3.0 the regime gate (30 atom predicates, codes only) | ✅ **62 deployed regimes + 25 probes x 699 rows x 5 scenarios, EXACT, both toolchains, 5/5 negative controls** |
+| 3.0 the regime gate (30 atom predicates, codes only) | ✅ **62 deployed regimes + 25 probes x 699 rows x 5 scenarios, EXACT, both toolchains, 5/5 negative controls** (re-verified 2026-09-27: 799 rows, both toolchains, 5/5 negatives against a green baseline) |
 | 3.1 the gate WIRED into `RealCore` + the strategy | ✅ 75/75 integration assertions (was 42); `[AGGATE]` per bar and at shutdown |
-| 4.0 the linear model runner (per regime, N from the artifact) | ✅ **62 deployed regimes x 699 rows x 5 scenarios x 2 price scales, both toolchains, max rel dev 6.7e-14 against the DEPLOYED sklearn pipeline; 6/6 negative controls; 12 refuse-to-load cases** |
+| 4.0 the linear model runner (per regime, N from the artifact) | ✅ **62 deployed regimes x 699 rows x 5 scenarios x 2 price scales, both toolchains, max rel dev 6.7e-14 against the DEPLOYED sklearn pipeline; 6/6 negative controls; 12 refuse-to-load cases** (re-verified 2026-09-27: 799 rows, host clang only) |
 | 4.1 the runner WIRED into `RealCore` + the strategy | ✅ 119/119 integration assertions (was 75); `[AGMODEL]` at boot, `[AGDEC]`/`[AGPRED]` per bar |
-| 5.0 the centred per-leg threshold gate + the vote | ✅ **62 deployed regimes x 699 rows x 5 scenarios x 2 price scales, both toolchains, `fired`/`side` EXACT against the imported reference; 8 negative controls; 12 gate refuse-to-load cases** |
+| 5.0 the centred per-leg threshold gate + the vote | ⚠️ **RED on the host 2026-09-27**: marvel `main`'s `pred_agamotto.base.15m_1/setting.json` gate no longer equals `tests/regime_stack_deployed.csv`'s `optimal_threshold` column (long 0.00067043 vs 0.00057641, short −0.00115605 vs −0.00104534) — fixture/config drift, not a port defect; unresolved. Previously ✅ **62 deployed regimes x 699 rows x 5 scenarios x 2 price scales, both toolchains, `fired`/`side` EXACT against the imported reference; 8 negative controls; 12 gate refuse-to-load cases** |
 | 5.1 the decision WIRED into `RealCore` + the strategy | ✅ 153/153 integration assertions (was 119); `[AGDEC]` gate at boot, decision + votes per bar, `bar_to_signal_us` at shutdown |
 | 5.2 live decision reconciliation vs the Python bot | ✅ `tests/live_reconcile.py` STEP 6 — 3 shared 15m bars on hydra, FOUR sources per bar, PORT 0 / FEED 0 / TRANSCRIPTION 0 |
 | an order path | ❌ **and deliberately never** — see below |
@@ -126,7 +126,7 @@ lines of vote arithmetic are transcribed — and (d) is what grades them.
 
 **The gate must run in (b) and (c).** A first draft omitted it and reported 23
 voters on a bar where the bot reported none: without the filter, all 62 regimes
-vote, including the 53 that cannot fire live. The one-row mask evaluation is
+vote, including the 53 r07x-gated ones (which could not fire live while PANEL_BARS was 699). The one-row mask evaluation is
 exact *only* while `price_range_pct_q50` is a column of the row —
 `research_filters` otherwise falls back to a rolling quantile that, on one row,
 returns the value itself and makes every vol regime read as "did not hold". The
@@ -265,6 +265,11 @@ matters:
 > **All 53 vol-quantile-gated (inert) regimes carry 5-feature models.**
 > **All 9 FIRABLE regimes carry 16-feature models.**
 
+("Inert" and "firable" describe this stack while PANEL_BARS was 699 and the
+r07x cutoffs were NaN on every row, marvel PR #532. Since 2026-09-11 the 53 fire
+on warm rows too, so a hardcoded width would now be wrong on regimes that
+trade either way.)
+
 So a runner that hardcoded `TOPN_ICS = 5` would not fail on a corner case — it
 would be **wrong on every regime that can actually trade and right on every
 regime that cannot**, which is the worst possible arrangement for noticing.
@@ -289,7 +294,7 @@ exported regimes, and all six are the same column, `f089`:
 
 | regime | centre | in the deployed stack? |
 |---|---|---|
-| `r029_and_r019_and_r074_long` | 100 | yes (inert) |
+| `r029_and_r019_and_r074_long` | 100 | yes (r07x-gated; inert until 2026-09-11) |
 | **`r069_and_r001_long`** | 100 | **yes, and it is FIRABLE** |
 | `r069_and_r019_long` | 100 | no |
 | `r069_and_r045_long` | 100 | no |
@@ -409,9 +414,11 @@ Per-regime predictions are available individually via
 that did not fire. 0.0 is a legitimate prediction and would read as a confident
 flat call.
 
-**Expect at most 9 predictions per bar on live data.** 53 of the 62 deployed
-regimes cannot fire (PR #532, above), and a regime that does not fire is never
-scored — the reference predicts only on rows its filter let through
+**Expect fewer predictions than regimes.** While PANEL_BARS was 699 it was at
+most 9 per bar: the 53 r07x-gated regimes could not fire (PR #532, above). Since
+2026-09-11 they fire on warm bars too — on the hole-free parity scenarios 37, 24
+and 25 of the 53 fired at least once on the warm tail (2026-09-27). A regime
+that does not fire is never scored — the reference predicts only on rows its filter let through
 (`predict(filtered_signals)`), and scoring a gated-out bar spends the time to
 produce a number nothing may act on.
 
@@ -448,8 +455,8 @@ about the dot product alone.
 only that row would compare five numbers per regime across the whole suite —
 nowhere near enough to separate a correct prediction from one that is right near
 the mean and wrong in the tails, or that has a coefficient's sign wrong on a
-feature that is rarely large. `predictRow` is row-independent, so all 699 rows
-are graded and the newest row is reported separately.
+feature that is rarely large. `predictRow` is row-independent, so all PANEL_BARS
+rows are graded and the newest row is reported separately.
 
 **The tolerance denominator is the regime's own signal scale**
 (`max(|a|, |b|, rms(reference))`), not the individual cell. These predictions are
@@ -558,22 +565,26 @@ stack that is RUNNING rather than one somebody retyped:
 * the busiest are r069 and r029 (20 regimes each), then r075 (19), r074 (17),
   r073 (17), r008 (13).
 
-### *** 53 of the 62 CANNOT FIRE, AND THE PORT KEEPS IT THAT WAY ***
+### 53 of the 62 are r07x-gated: inert until 2026-09-11, live on warm bars since
 
 r073 / r074 / r075 compare `price_range_pct` against
-`price_range_pct_q80 / q90 / q95`, which research.py:371-376 builds as
-`rolling(VOL_Q_WINDOW=700, min_periods=700)`. The live panel is 699 rows, so
-min_periods is never met, all three cutoff columns are NaN on every row, and
-`x > NaN` is False. Every regime carrying one of those atoms is **inert live**.
+`price_range_pct_q80 / q90 / q95`, which research.py builds as
+`rolling(VOL_Q_WINDOW=700, min_periods=700)`. `x > NaN` is False, so each of
+these regimes can fire only on a row whose cutoff exists — one whose trailing
+700 `price_range_pct` values are all valid.
 
-That is today's production behaviour under an open finding — marvel PR #532,
-`docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md` — and reproducing
-it is the point. A port that "fixed" the min_periods, or widened the panel to
-700, would start 53 regimes firing against Ridge weights never trained on a
-firing regime, and the port would look like the cause of whatever followed. When
-the finding is resolved it is resolved in research.py FIRST and mirrored here.
+**History.** The live panel used to be 699 rows, so min_periods was never met,
+the three cutoffs were NaN on every row, and every regime carrying one of those
+atoms was **inert live** — marvel PR #532,
+`docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md`. The port
+reproduced that on purpose rather than "fixing" it unilaterally, and the finding
+was resolved in the prescribed order: research.py first (dc PR #76,
+`DEFAULT_KLINE_LOOKBACK` 700 -> 800), then this mirror (dc `0a1c4c2`,
+PANEL_BARS 699 -> 799). On a 799-row panel the cutoffs are populated on the last
+100 rows, including the latest — the only row the gate reads.
 
-**The 9 that CAN fire**, all of them 2-atom and none carrying an r07x gate:
+**The 9 that fired even at 699 rows**, all of them 2-atom and none carrying an
+r07x gate:
 
 | regime | position |
 |---|---|
@@ -657,12 +668,17 @@ through `decode_regime_tolerant`, exactly as production does. Neither side is
 ever shown a real name.
 
 **Four assertions, because mask equality alone is vacuous here.** A gate
-hardwired to all-False agrees with the reference on 53 of 62 regimes:
+hardwired to all-False agrees with the reference on the 53 r07x-gated regimes
+on every row whose cutoff is NaN:
 
 1. exact equality, per regime, per row;
-2. the 53 r07x-gated regimes are ALL-FALSE **on both sides** — and the q80/q90/
-   q95 columns of the panel the gate actually read are asserted all-NaN, so the
-   inertness is pinned at its CAUSE and not only at its effect;
+2. the 53 r07x-gated regimes are FALSE **on both sides** on every row whose
+   cutoff is NaN — and the q80/q90/q95 columns of the panel the gate actually
+   read must be finite on exactly the rows `feature_parity.vol_q_warm_mask`
+   derives from the scenario's raw NaNs, so the cold rows are pinned at their
+   CAUSE and not only at their effect. (Until 2026-09-27 this asserted the
+   cutoffs ALL-NaN, which went stale with PANEL_BARS 799 and failed every
+   hole-free scenario; `main` now also fails outright if PANEL_BARS < 700);
 3. **the causal control**: each of the 53 is also evaluated with its
    vol-quantile atom STRIPPED (25 distinct "probe" regimes, not deployed), and
    those must fire. This separates "inert because the cutoff is NaN" from
@@ -676,13 +692,15 @@ hardwired to all-False agrees with the reference on 53 of 62 regimes:
 
 Verified 2026-08-20 — **87 regimes (62 deployed + 25 probes) x 699 rows x 5
 scenarios, 0 differing cells, on macOS/clang and rocky8/gcc 8.5**, with
-identical fire rates on both.
+identical fire rates on both. Re-verified 2026-09-27 at **799 rows**, both
+toolchains, and `--negative` now requires a green unmutated baseline first
+(before that, a red baseline would have credited every mutant).
 
 | mutant | caught by |
 |---|---|
 | `mom > 0` -> `mom >= 0` (the boundary) | scenario 5's 26-bar FLAT run, where `mom` is exactly 0.0 |
 | `mom_positive` short: `mom < 0` -> `mom > 0` (believing the name) | mask diff on every scenario |
-| `high_vol_q95` reads the q50 cutoff (the tempting "fix") | the inert-regime assertion — 53 regimes start firing |
+| `high_vol_q95` reads the q50 cutoff (the tempting "fix") | mask diff + the cold-row assertion — at 799 rows, 19 regimes fire on rows whose cutoff is NaN (12 on the holes scenario) |
 | volume ratio prefers `vol_ratio` over `quote_vol_ratio` | mask diff; r029/r039/r069 appear in 45 of the 62 |
 | `near_ma` signed -> `\|signed\|` (believing the name) | mask diff |
 
@@ -711,7 +729,7 @@ and still not a precedent for `mjolnir_core.hpp`, which has one.
 
 ### Measured gate cost
 
-Per bar, 6 regimes over a 699-row panel, from `core_integration_driver`:
+Per bar, 6 regimes over a 699-row panel (the width at the time), from `core_integration_driver`:
 
 | host / toolchain | last | worst |
 |---|---|---|
@@ -728,16 +746,16 @@ two orders under the panel.
 distance is SIGNED, so every bar trading *below* its 7-bar MA satisfies it
 automatically, and the predicate only excludes bars more than 2% ABOVE the MA.
 Measured on the parity panels: `r048_long` alone is **all-True on 699/699 rows**
-on the BTC and PEPE scenarios — i.e. the unconditional fire-on-every-bar gate
+(799/799 at the current width, 2026-09-27) on the BTC and PEPE scenarios — i.e. the unconditional fire-on-every-bar gate
 CLAUDE.md removed forever on 2026-06-18, arriving under another name.
 
 The C++ reproduces it exactly (that is what the cell-for-cell equality shows),
-so this is a statement about the reference, not about the port. It is not
-currently reachable in production: all three deployed regimes containing r048
-(`r048_and_r075_long`, `r048_and_r074_long`, `r069_and_r048_and_r074_long`) also
-carry an r07x atom and are inert. **It becomes reachable the day PR #532 is
-resolved**, at which point `r048_and_r07x` degenerates to the vol-quantile atom
-alone. `tests/regime_parity.py` prints it as a FINDING on every run rather than
+so this is a statement about the reference, not about the port. All three
+deployed regimes containing r048 (`r048_and_r075_long`, `r048_and_r074_long`,
+`r069_and_r048_and_r074_long`) also carry an r07x atom, which kept it
+unreachable while those were inert. **PR #532 was resolved on 2026-09-11, so it
+is now reachable:** on warm bars `r048_and_r07x` is, on these panels, the
+vol-quantile atom alone. `tests/regime_parity.py` prints it as a FINDING on every run rather than
 allowlisting it into silence. Reported, not fixed.
 
 ### A FINDING in the tooling: the "artifact leak audit" was not reading the artifact
@@ -769,13 +787,15 @@ emits into a queue and the caller drains it, so "a bar completed" and "a bar was
 handed over" are different moments; the panel must describe the one the caller
 is about to look at.
 
-**The 699 / 700 split is deliberate and is not an off-by-one.** `PANEL_BARS` is
-699 because that is what live engineers (`trading.py:443` fetches 700,
-`:485` drops the incomplete one), and `engineerFeatures` throws on any other
-width — `price_range_pct_q50` is `rolling(700, min_periods=1)` and is therefore
-EXPANDING on a shorter frame, so a 700-row panel moves every cell of it.
-`warmup_bars` stays at the contract's **700**, one bar more conservative, so the
-retained ring is always strictly longer than the slice and there is no width to
+**The 799 / 800 split is deliberate and is not an off-by-one.** `PANEL_BARS` is
+799 because that is what live engineers (`trading.py` fetches
+`DEFAULT_KLINE_LOOKBACK = 800` and drops the incomplete one; 699 / 700 until
+2026-09-11), and `engineerFeatures` throws on any other width —
+`price_range_pct_q50` is `rolling(700, min_periods=1)` and therefore EXPANDING
+over a panel's first 699 rows, so any other width moves cells of it.
+`warmup_bars` is **800** (marvel `gauntlet/make_sentinel_config.py` reads it from
+`DEFAULT_KLINE_LOOKBACK`), one bar more than the slice, so the retained ring is
+always strictly longer than the slice and there is no width to
 get wrong at the boundary. `createCore` now **throws** if `warmup_bars <=
 PANEL_BARS`: a core that could never slice a panel would look exactly like a
 quiet market.
@@ -836,10 +856,12 @@ engine on the wrong window, at the wrong moment, or not at all.
 
 It drives synthetic ticks through `createCore()` -> `KlineBuilder` ->
 `engineerFeatures`, reproducing the REAL boot path including the structural
-seam: 699 backfilled bars, attach mid-bucket, the discarded partial, the
-quarantine, the one-bucket fill, the splice. It asserts no panel before warm,
-exactly 699 x 65 on the first warm bar, the panel stamped with the bar that was
-popped, one panel per burst, and that the q80/q90/q95 columns are NaN. It runs
+seam: PANEL_BARS (799) backfilled bars, attach mid-bucket, the discarded
+partial, the quarantine, the one-bucket fill, the splice. It asserts no panel
+before warm, exactly PANEL_BARS x 65 on the first warm bar, the panel stamped
+with the bar that was popped, one panel per burst, and that the q80/q90/q95
+cutoffs are POPULATED on the latest row (they were asserted NaN while
+PANEL_BARS was 699). It runs
 inside `build_linux.sh`, so a core that computes no panel cannot ship.
 
 ## Phase 2.7 — live reconciliation against the Python bot
@@ -898,7 +920,7 @@ A per-bar cleanliness test would have called that a port bug. So the script adds
 * **STEP 1b** — checks EVERY live-built bar against Binance and names the dirty
   ones, because a rolling column reads many bars, not one.
 * **STEP 5, the counterfactual** — runs the SAME engine binary over the PURE
-  BINANCE 699-bar window ending at each bar and diffs THAT against the bot's row.
+  BINANCE PANEL_BARS-bar window (799; 699 before 2026-09-11) ending at each bar and diffs THAT against the bot's row.
   Agreement there plus disagreement live means the ENGINE is right and the BARS
   differ; disagreement there is a real port bug on inputs nothing can be blamed
   for. It is the authoritative verdict and it drives the exit code.
@@ -908,7 +930,7 @@ the engine against `research.py` run OFFLINE by the harness on synthetic panels.
 STEP 5 diffs the engine against what the PRODUCTION BOT actually emitted, in
 production, for that bar.
 
-### Measured, 2026-08-19, BINANCE_PERP_BTC_USDT, 3 shared 15m bars
+### Measured, 2026-08-19, BINANCE_PERP_BTC_USDT, 3 shared 15m bars (PANEL_BARS was 699)
 
 | step | result |
 |---|---|
@@ -1168,10 +1190,11 @@ directly (bypassing `load()`, which only reads CSVs off disk) and calls
 harness**, so a change in research.py is visible to the gate. It then pipes the
 same raw panel to `tests/feature_parity_driver` and compares.
 
-Three scenarios, 699 rows each: BTC-like (~64000), 1000PEPE-like (~0.0045), and
-BTC-like with injected NaN holes (singleton, sub-window run, super-window run,
-trailing), a zero-volume bar (→ `+inf` in `vol_ret_lag*`), a zero
-`quote_volume` bar and a flat bar.
+Five scenarios, PANEL_BARS (799) rows each: BTC-like (~64000), 1000PEPE-like
+(~0.0045), BTC-like with injected NaN holes (singleton, sub-window run,
+super-window run, trailing), a zero-volume bar (→ `+inf` in `vol_ret_lag*`), a
+zero `quote_volume` bar and a flat bar; BTC-like with staggered LEADING NaNs
+(stage 2.3); and BTC-like with the `_safe` branch constructions (stage 2.5).
 
 **Cells are classified `finite / NaN / +inf / -inf` and the classifications
 must match EXACTLY before a single value is diffed.** This is the one place the
@@ -1329,19 +1352,20 @@ column a **different** leading-NaN count (o5 h3 l7 c4 v9), which pins every
 max() independently. Without it every `begidx` is 0 and a port that ignored the
 skip entirely would pass.
 
-### PANEL_BARS = 699 is what makes the unstable period match
+### PANEL_BARS (799) is what makes the unstable period match
 
 RSI's Wilder smoothing, ADX, TRIX's triple EMA and SAR are **recursive** — they
 never forget their start, so their values depend on where the input begins. The
 port makes **no convergence correction**, and none is needed *for the gate*:
-`engineerFeatures` refuses any panel that is not 699 rows and the harness drives
-the reference over the *same* 699 rows, so the unstable period is identical by
-construction. Matching the window **is** the mechanism.
+`engineerFeatures` refuses any panel that is not PANEL_BARS rows and the harness
+drives the reference over the *same* rows, so the unstable period is identical
+by construction. Matching the window **is** the mechanism.
 
 What convergence does and does not buy is worth stating precisely, because the
 figure that was circulating ("0.000e+00 on SAR/ADX/TRIX, <= 1.5e-11 on the
 rest") holds only at the LAST row. Measured 2026-08-19, ta-lib 0.6.4, on a
-5000-bar synthetic BTC-scale series, full history vs its trailing 699 rows:
+5000-bar synthetic BTC-scale series, full history vs its trailing 699 rows
+(the width at the time; not re-measured at 799):
 
 - **At the last row** — the only row live ever scores — `rsi`, `adx`, `dx`,
   `trix`, `sar`, `macd`, `cmo`, `atr` and `natr` agree **exactly (0.0)**.
@@ -1465,8 +1489,8 @@ would raise.
 a whole-array centring constant makes skew/kurt depend on where the panel
 *starts*, and that pandas disagrees with **itself** by up to 5.6e-8 on a
 price-scale 14-bar kurt when the frame start moves. That is a statement about
-comparing a 699-row frame against a multi-year one. This gate does not do that
-— both sides see the same 699 rows — so all four columns clear the ordinary
+comparing a panel-width frame against a multi-year one. This gate does not do
+that — both sides see the same PANEL_BARS rows — so all four columns clear the ordinary
 **1e-9 relative** gate on every scenario and both toolchains, with **no probe
 tier and no widened tolerance**. The 1e-12/PROBE treatment in
 `tests/pdops_golden.py` grades a different comparison and stays where it is.
@@ -1760,7 +1784,7 @@ tests/run_decision_parity.sh --negative                       # 8 controls (3 ga
 ./build/talib_bench 2000                                      # ta-lib link proof + budget
 python tests/live_reconcile.py --ssh-host hydra --bars 3      # live C++ chain vs the live bot
 
-python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
+python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 800 \
     --out <bundle>/config/backfill_BTCUSDT_15m.csv
 python tests/compare_agbar_vs_binance.py --log <strategy.log> --symbol BTCUSDT --interval 1m
 ```
@@ -1774,8 +1798,10 @@ in the last ULP.
 
 ## Warmup
 
-Agamotto needs **700 bars** (`VOL_Q_WINDOW=700`, `min_periods=700` fails closed;
-the live bot fetches `limit=700`). At 15m that is **7.3 days** of live bars, so
+Agamotto needs **`warmup_bars` = 800 closed bars** (`DEFAULT_KLINE_LOOKBACK`;
+the live bot fetches 800 and slices a 799-row panel, which the
+`VOL_Q_WINDOW=700`, `min_periods=700` cutoffs need). At 15m that is **8.3 days**
+of live bars, so
 backfill is not optional in practice. Network I/O stays out of the core — as it
 does for mjolnir, whose weights also come from an external tool — so the seam is
 a CSV written by `fetch_binance_klines.py` and loaded by the strategy before it
@@ -1806,16 +1832,17 @@ contiguous across the seam.
 fetcher alongside the strategy:
 
 ```bash
-python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
+python tests/fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 800 \
     --out <bundle>/config/backfill_BTCUSDT_15m.csv --repeat-sec 60 &
 ```
 
 Without it the run does not lie — it is cold and says so on every bar
-(`[AGSEAM] ... is outstanding`, `[AGBAR] warm=0 bars=1/700`) — but it also never
-becomes warm, while holding 699 quarantined bars that would fix it.
+(`[AGSEAM] ... is outstanding`, `[AGBAR] warm=0 bars=1/800`) — but it also never
+becomes warm, while holding the whole quarantined backfill that would fix it.
 
 Before this, a discontinuity **cleared** history, so every start threw the whole
-backfill away and fell back to 700 live bars. Observed in production:
+backfill away and fell back to a full warmup of live bars. Observed in
+production (at the old warmup of 700):
 
 ```
 [AGDIAG] bars_seen=713 contiguous=14/700 backfilled=699 seam_gaps=1

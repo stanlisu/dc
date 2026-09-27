@@ -153,17 +153,40 @@ run_mutant() {
         "$tmp/regime_gate_mutant.cpp"
     rm -rf "$tmp"
 
-    if "$PY" "$HERE/tests/regime_parity.py" --stack "$STACK" \
-            --driver "$HERE/build/regime_parity_driver_mutant" >/dev/null 2>&1; then
+    local out
+    if out="$("$PY" "$HERE/tests/regime_parity.py" --stack "$STACK" \
+            --driver "$HERE/build/regime_parity_driver_mutant" 2>&1)"; then
         echo "=== NEGATIVE CONTROL FAILED: the mutant PASSED the gate ===" >&2
         echo "    $why" >&2
         exit 1
+    fi
+    # Show WHAT went red, so a mutant caught by an unrelated failure is visible.
+    local shown
+    shown="$(grep -E '^(--- scenario|=== FAIL)' <<<"$out" | grep -B1 '^=== FAIL' | head -12 || true)"
+    if [ -n "$shown" ]; then
+        echo "$shown"
+    else
+        echo "    (red by exit code with no '=== FAIL' line — last lines:)"
+        tail -5 <<<"$out"
     fi
     echo "--- caught (gate went red) ---"
 }
 
 run_negative() {
     check_host_talib
+
+    # BASELINE FIRST. A mutant "caught" by a gate that is already red proves
+    # nothing — through 2026-09-27 origin/main's gate was red on a stale
+    # all-NaN cutoff assertion and this mode still reported every mutant caught.
+    echo "=== BASELINE: the unmutated driver must PASS ==="
+    build_host_driver "$HERE/build/regime_parity_driver" "$HERE/src/regime_gate.cpp"
+    if ! "$PY" "$HERE/tests/regime_parity.py" --stack "$STACK" \
+            --driver "$HERE/build/regime_parity_driver" >/dev/null 2>&1; then
+        echo "FAIL: the UNMUTATED gate is red — every mutant would be 'caught'" >&2
+        echo "      for free. Fix the baseline (run without --negative) first." >&2
+        exit 1
+    fi
+    echo "--- baseline green ---"
 
     # (1) THE BOUNDARY MUTATION, placed where ties actually happen. `mom` is
     # `close - close[10]`, which is EXACTLY 0.0 across the 26-bar flat run in

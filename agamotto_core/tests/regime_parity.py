@@ -18,7 +18,7 @@ both sides read the same double, so:
 
     *** TOLERANCE IS ZERO. A MASK IS A DECISION, NOT A MEASUREMENT. ***
 
-One differing cell out of 62 x 699 x 5 x 2 is a failure. There is no
+One differing cell out of 87 x PANEL_BARS x 5 is a failure. There is no
 "close enough" for "does this bar trade".
 
 The regime NAMES fed to the reference are the CODED ones the live stack carries
@@ -36,7 +36,8 @@ everywhere and ``x > NaN`` is False (marvel PR #532,
 docs/findings/2026-08-19-vol-quantile-regimes-inert-live.md). That finding is
 now RESOLVED on both sides — python first (dc PR #76, limit 700 -> 800), then
 this port (PANEL_BARS 699 -> 799) — so the cutoff is NaN only on the first 699
-rows and those regimes are live on the warm tail.
+rows of a hole-free panel (and on every row of the two NaN scenarios, whose
+trailing windows all hold a NaN) and those regimes are live on the warm tail.
 
 Which means a gate that returned all-False for EVERYTHING would agree with the
 reference on 53 of 62 regimes and would look like a strong pass. So the harness
@@ -44,8 +45,8 @@ asserts the SHAPE of the answer, not only its equality:
 
   * every regime's mask must be exactly equal, cell for cell;
   * the r073/r074/r075-gated regimes must be FALSE on every row whose cutoff
-    is NaN (the first min_periods - 1 of them) on both sides — asserted at the
-    cause, not only at the effect. Whether they fire on the warm tail is a
+    is NaN (derived per scenario by feature_parity.vol_q_warm_mask) on both
+    sides — asserted at the cause, not only at the effect. Whether they fire on the warm tail is a
     property of the data and is reported, not asserted;
   * each of the 53 is ALSO evaluated with its vol-quantile atom STRIPPED (a
     "probe" regime, not deployed), and those must fire. That is the causal
@@ -98,8 +99,9 @@ VOL_Q_MIN_PERIODS = fp.VOL_Q_MIN_PERIODS
 # ---------------------------------------------------------------------------
 DEFAULT_STACK = HERE / "regime_stack_deployed.csv"
 
-# The three trailing vol-quantile atoms. Every regime carrying one of them is
-# inert live. Named as CODES because that is what the stack carries; the names
+# The three trailing vol-quantile atoms. Every regime carrying one of them was
+# inert live while PANEL_BARS was 699 (marvel PR #532); it now fires only on
+# rows whose cutoff is warm. Named as CODES because that is what the stack carries; the names
 # are in research_filters._VOL_QUANTILE_ATOMS and are not needed here.
 VOL_Q_ATOM_CODES = {73, 74, 75}
 
@@ -244,10 +246,12 @@ def parent_of(coded_name: str, position: str) -> str | None:
 
 
 def compare(scenario: str, specs, cpp_masks: pd.DataFrame,
-            ref_masks: pd.DataFrame, allfalse_ever_broken: set) -> int:
+            ref_masks: pd.DataFrame, allfalse_ever_broken: set,
+            warm: np.ndarray) -> int:
     """Return the number of FAILURES for one scenario (0 == pass).
 
-    `allfalse_ever_broken` accumulates ACROSS scenarios: a regime is required to
+    `warm` is `fp.vol_q_warm_mask(raw)`: the rows whose q80/q90/q95 cutoff
+    exists. `allfalse_ever_broken` accumulates ACROSS scenarios: a regime is required to
     be non-trivial SOMEWHERE, not on every panel. Two of the five scenarios are
     deliberately degenerate (injected NaN runs, a 26-bar flat run, a close of
     1e-305), and demanding that `bb_rebound` fire on those would be demanding
@@ -292,8 +296,10 @@ def compare(scenario: str, specs, cpp_masks: pd.DataFrame,
     # Until 2026-09-11 PANEL_BARS was 699 < min_periods 700, so these were
     # all-NaN on EVERY row and this block asserted the regimes were ALL-FALSE
     # (marvel PR #532). PANEL_BARS is now 799, so the cutoff is NaN on exactly
-    # the first VOL_Q_MIN_PERIODS - 1 rows and real thereafter, and the regimes
-    # are live on the warm tail. Whether they actually fire there is a property
+    # the first VOL_Q_MIN_PERIODS - 1 rows of a hole-free panel and real
+    # thereafter -- and on EVERY row of the two NaN scenarios, whose trailing
+    # windows all hold a NaN -- so the cold rows are DERIVED per scenario
+    # (`warm`, from fp.vol_q_warm_mask), not assumed to be the first 699. Whether they actually fire there is a property
     # of the data, so it is NOT asserted.
     #
     # What IS asserted is the CAUSAL half, which is deterministic and is the
@@ -301,13 +307,15 @@ def compare(scenario: str, specs, cpp_masks: pd.DataFrame,
     # must be False, on BOTH sides. "Both agree" is satisfied by two engines
     # wrong the same way, so this is asserted at the cause, per this harness's
     # own philosophy. If PANEL_BARS ever narrows below min_periods again this
-    # block still holds while check (3) below and feature_parity's warm-row
-    # count both fail loudly — the deadness cannot come back quietly.
-    _cold = VOL_Q_MIN_PERIODS - 1     # rows whose cutoff is NaN by construction
+    # block still holds while main's PANEL_BARS guard, the per-scenario cutoff
+    # mask check in main, and feature_parity's warm-row mask all fail loudly —
+    # the deadness cannot come back quietly.
+    cold = ~warm                      # rows whose cutoff is NaN
+    _cold = int(cold.sum())
     bad_cold = []
     for i in inert:
         for side, frame in (("C++", cpp_masks), ("reference", ref_masks)):
-            head = frame.iloc[:_cold, i].to_numpy().astype(bool)
+            head = frame.iloc[:, i].to_numpy().astype(bool)[cold]
             if head.any():
                 bad_cold.append(f"{specs[i][0]}[{side}]")
                 break
@@ -315,12 +323,12 @@ def compare(scenario: str, specs, cpp_masks: pd.DataFrame,
         failures += 1
         print(f"=== FAIL: {len(bad_cold)} r07x-gated regime(s) fired on a row "
               f"whose cutoff is NaN: {bad_cold[:6]} ===")
-        print(f"    The first {_cold} rows cannot have a rolling("
+        print(f"    {_cold} rows cannot have a rolling("
               f"{VOL_Q_MIN_PERIODS}, min_periods={VOL_Q_MIN_PERIODS}) cutoff, "
               "so `price_range_pct > cutoff` must be False there. Firing means "
               "the gate is reading something other than the cutoff.")
     else:
-        n_warm = sum(int(cpp_masks.iloc[_cold:, i].to_numpy().astype(bool).any())
+        n_warm = sum(int(cpp_masks.iloc[:, i].to_numpy().astype(bool)[warm].any())
                      for i in inert)
         print(f"  volq:   {len(inert)} r07x-gated regime(s) cold on all "
               f"{_cold} NaN-cutoff rows on both sides; {n_warm} fire on the "
@@ -385,11 +393,12 @@ def main() -> int:
 
     # specs = (coded_name, position, kind). `kind` classifies what the row is
     # FOR, so the assertions below are about the right thing:
-    #   inert  a stack regime carrying r073/r074/r075 — must never fire
+    #   inert  a stack regime carrying r073/r074/r075 — must be False on every
+    #          row whose cutoff is NaN (the name predates PANEL_BARS 799)
     #   live   a stack regime that can fire — must not be trivial
     #   probe  an inert regime with its vol-quantile atom REMOVED — the causal
     #          control. It is not in the deployed stack; it exists to prove the
-    #          53 are inert BECAUSE of the NaN cutoff and not because the gate
+    #          53 are cold BECAUSE of the NaN cutoff and not because the gate
     #          is broken in some way that happens to look the same.
     specs = []
     for name, pos in stack:
@@ -419,30 +428,47 @@ def main() -> int:
           f"{['r%03d' % a for a in n_atoms]}")
     print("[regime_parity] arity: "
           + ", ".join(f"{k}-atom x{v}" for k, v in arity.items()))
-    print(f"[regime_parity] {n_inert} carry r073/r074/r075 and CANNOT fire live; "
-          f"{n_live} can")
+    print(f"[regime_parity] {n_inert} carry r073/r074/r075 and fire only where "
+          f"the cutoff is warm; {n_live} carry no vol-quantile atom")
     print(f"[regime_parity] + {n_probe} r07x-stripped PROBE regime(s) as the "
           f"causal control (not deployed)")
     print(f"[regime_parity] driver: {args.driver}")
 
     dec = decoder()
+    enc = fp.encoder()
     failures = 0
+    # The PR #532 guard, stated directly (same as feature_parity.main): the
+    # per-scenario cutoff check follows PANEL_BARS, so a header narrowed below
+    # min_periods would make "no warm rows" the expected answer and pass.
+    if PANEL_BARS < VOL_Q_MIN_PERIODS:
+        print(f"=== FAIL: PANEL_BARS={PANEL_BARS} < min_periods="
+              f"{VOL_Q_MIN_PERIODS}: the r07x regimes cannot fire on any row — "
+              "marvel PR #532 is back. ===")
+        failures += 1
     fired_somewhere: set = set()
     for name, price, seed, holes, leads, safe_branch in fp.SCENARIOS:
         raw = fp.make_panel(PANEL_BARS, price, seed, holes, leads, safe_branch)
         panel, cpp_masks = run_driver(args.driver, raw, regimes)
 
-        # THE ALL-NaN CUTOFFS, ASSERTED ON THE PANEL THE GATE ACTUALLY READ.
-        # Without this the inertness above could come from anywhere; with it,
-        # the input to the comparison is pinned too.
-        for code_col in ("f108", "f109", "f110"):
+        # THE CUTOFFS, ASSERTED ON THE PANEL THE GATE ACTUALLY READ: finite on
+        # exactly the rows fp.vol_q_warm_mask derives from this scenario's raw
+        # NaN layout. Until 2026-09-27 this asserted ALL-NaN ("min_periods=700
+        # on 699 rows must never be met"), stale since PANEL_BARS moved to 799
+        # and red on every hole-free scenario. Without this the cold rows in
+        # compare() could come from anywhere; with it, the input is pinned too.
+        warm = fp.vol_q_warm_mask(raw)
+        for col in fp.VOL_Q_COLS:
+            code_col = enc(col)
             if code_col not in panel.columns:
-                print(f"=== FAIL: the C++ panel has no {code_col} column ===")
+                print(f"=== FAIL: the C++ panel has no {code_col} ({col}) column ===")
                 failures += 1
-            elif not panel[code_col].isna().all():
-                print(f"=== FAIL: {code_col} is NOT all-NaN on the panel the gate "
-                      f"read ({int(panel[code_col].notna().sum())} finite cells). "
-                      "min_periods=700 on 699 rows must never be met — see "
+                continue
+            finite = panel[code_col].notna().to_numpy()
+            if not np.array_equal(finite, warm):
+                print(f"=== FAIL: {code_col} ({col}) has {int(finite.sum())} "
+                      f"finite cells on the panel the gate read, expected "
+                      f"{int(warm.sum())} (rows whose trailing "
+                      f"{VOL_Q_MIN_PERIODS} bars are all valid) — see "
                       "src/feature_engine.hpp VOL_Q_WINDOW. ===")
                 failures += 1
 
@@ -451,11 +477,12 @@ def main() -> int:
         # comparison EXACT rather than tolerant.
         panel_named = panel.rename(columns={c: dec(c) for c in panel.columns})
         ref_masks = reference_masks(panel_named, [(n, p) for n, p, _k in specs])
-        failures += compare(name, specs, cpp_masks, ref_masks, fired_somewhere)
+        failures += compare(name, specs, cpp_masks, ref_masks, fired_somewhere,
+                            warm)
 
     # ---- the cross-scenario non-triviality check --------------------------
-    # A gate hardwired to all-False agrees with the reference on the 53 inert
-    # regimes and would sail through everything above. This is what stops that:
+    # A gate hardwired to all-False agrees with the reference on the 53
+    # r07x-gated regimes wherever their cutoff is cold and would sail through everything above. This is what stops that:
     # every firable regime, and every causal probe, must have fired on at least
     # one of the five panels.
     never = [n for n, _p, k in specs if k in ("live", "probe") and n not in fired_somewhere]
