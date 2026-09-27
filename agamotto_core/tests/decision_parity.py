@@ -29,7 +29,7 @@ in this file and they are quoted in full at ``reference_decisions``.
 THE PREDICTIONS ARE THE C++'s OWN, AND THAT IS DELIBERATE
 ---------------------------------------------------------
 ``tests/model_parity.py`` already grades the C++ ``y_pred`` against the DEPLOYED
-sklearn pipeline at 1e-9 over 62 regimes x 699 rows x 5 scenarios. Re-grading it
+sklearn pipeline at 1e-9 over 62 regimes x PANEL_BARS rows x 5 scenarios. Re-grading it
 here would fold that tolerance into a comparison that is supposed to be about
 the GATE. So this gate takes the driver's per-regime predictions and asks one
 question: given these numbers, does the reference decide what the C++ decided?

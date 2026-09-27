@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Fetch closed Binance futures klines to the CSV the core ingests as backfill.
 
-Agamotto needs 700 bars of history before its rolling windows are valid
-(VOL_Q_WINDOW=700, min_periods=700 fails closed). The C++ core does no network
+Agamotto needs `warmup_bars` = 800 closed bars before it is warm
+(agamotto.trading.DEFAULT_KLINE_LOOKBACK: the live bot fetches 800 and slices a
+799-row panel, which the VOL_Q_WINDOW=700, min_periods=700 cutoffs need; it was
+700 until 2026-09-11). `--limit` counts CLOSED bars, so pass 800. The C++ core does no network
 I/O by design — same as the mjolnir core, whose weights are likewise produced by
 an external tool — so warmup arrives through this file.
 
-    python fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
+    python fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 800 \
         --out /home/stan/agamotto_test/config/backfill_BTCUSDT_15m.csv
 
 Only CLOSED bars are written: the most recent kline is still open and would be
@@ -20,9 +22,9 @@ happened before we connected), so the first bar the core builds is one bucket
 later than this file's newest, and the core reports the difference as an
 outstanding hole. It is repaired by RE-READING this same file once the bucket
 has closed -- so the file has to be refreshed after startup, or the run holds
-699 quarantined bars and never becomes warm.
+the whole backfill quarantined and never becomes warm.
 
-    python fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 700 \
+    python fetch_binance_klines.py --symbol BTCUSDT --interval 15m --limit 800 \
         --out <bundle>/config/backfill_BTCUSDT_15m.csv --repeat-sec 60 &
 
 --repeat-sec re-writes the file on an interval so the hole closes on its own

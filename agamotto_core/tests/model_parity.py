@@ -35,7 +35,7 @@ Live scores exactly one row per bar (the panel's newest). Grading only that row
 would compare FIVE numbers per regime across the whole suite — nowhere near
 enough to separate a correct prediction from one that is right near the mean and
 wrong in the tails, or that has a coefficient's sign wrong on a feature that is
-rarely large. ``predictRow`` is row-independent, so all 699 rows are graded and
+rarely large. ``predictRow`` is row-independent, so all PANEL_BARS rows are graded and
 the newest row is ALSO reported on its own.
 
 trading.py's NaN FILL IS APPLIED ON BOTH SIDES, AND ITS CLIP ON NEITHER
@@ -60,7 +60,7 @@ that passes trivially is. So:
 
   * every regime's predictions must be equal to 1e-9 relative, cell for cell;
   * the panel must actually MOVE the predictions — a regime whose predictions
-    are constant across 699 rows is reported as a failure, because a runner
+    are constant across PANEL_BARS rows is reported as a failure, because a runner
     that returned only its intercept would match a reference that did the same;
   * the MIXTURE is asserted: the driver reports each model's feature count, and
     the run fails if the deployed stack does not contain BOTH 5-feature and
@@ -339,7 +339,7 @@ def compare(scenario: str, stack, cpp: pd.DataFrame, ref: pd.DataFrame,
               f"{worst:.3e} (tol {tol:g}) — worst {worst_name}")
 
     # The row live actually scores, reported on its own so it is never only
-    # implied by an aggregate over 699.
+    # implied by an aggregate over PANEL_BARS rows.
     last_dev = 0.0
     for i in range(len(stack)):
         a = float(cpp.iloc[-1, i])

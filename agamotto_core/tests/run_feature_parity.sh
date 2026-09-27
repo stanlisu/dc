@@ -183,17 +183,41 @@ run_mutant() {
         "${units[@]}" "$TALIB_PREFIX/lib/libta-lib.a" -lm
     rm -rf "$tmp"
 
-    if "$PY" "$HERE/tests/feature_parity.py" \
-            --driver "$HERE/build/feature_parity_driver_mutant" >/dev/null 2>&1; then
+    local out
+    if out="$("$PY" "$HERE/tests/feature_parity.py" \
+            --driver "$HERE/build/feature_parity_driver_mutant" 2>&1)"; then
         echo "=== NEGATIVE CONTROL FAILED: the mutant PASSED the gate ===" >&2
         echo "    $why" >&2
         exit 1
+    fi
+    # Show WHAT went red, so a mutant caught by an unrelated failure is visible.
+    local shown
+    shown="$(grep -E '^(--- scenario|=== FAIL)' <<<"$out" | grep -B1 '^=== FAIL' | head -12 || true)"
+    if [ -n "$shown" ]; then
+        echo "$shown"
+    else
+        echo "    (red by exit code with no '=== FAIL' line — last lines:)"
+        tail -5 <<<"$out"
     fi
     echo "--- caught (gate went red) ---"
 }
 
 run_negative() {
     check_host_talib
+
+    # BASELINE FIRST. A mutant "caught" by a gate that is already red proves
+    # nothing — on 2026-09-26 origin/main's gate was red on the vol-quantile
+    # warm-row assertion and this mode still printed "5 mutants, all caught".
+    # The unmutated driver must pass before any red can be credited to a mutant.
+    echo "=== BASELINE: the unmutated driver must PASS ==="
+    build_host_driver "$HERE/build/feature_parity_driver"
+    if ! "$PY" "$HERE/tests/feature_parity.py" \
+            --driver "$HERE/build/feature_parity_driver" >/dev/null 2>&1; then
+        echo "FAIL: the UNMUTATED gate is red — every mutant would be 'caught'" >&2
+        echo "      for free. Fix the baseline (run without --negative) first." >&2
+        exit 1
+    fi
+    echo "--- baseline green ---"
 
     # STAGE 2.3. The single most plausible wrong answer: BBANDS at mjolnir's
     # timeperiod=5 instead of agamotto's 20 (research.py:549). Plausible

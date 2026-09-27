@@ -14,8 +14,8 @@
 // harness would compare FIVE numbers per regime — nowhere near enough to
 // separate a correct prediction from one that is right near the mean and wrong
 // in the tails, or that gets a coefficient's SIGN wrong on a rarely-large
-// feature. `predictRow` is row-independent, so grading all 699 rows costs one
-// extra pass and multiplies the evidence by 699. The last row is still what
+// feature. `predictRow` is row-independent, so grading all PANEL_BARS rows costs one
+// extra pass and multiplies the evidence by PANEL_BARS. The last row is still what
 // live uses and is reported separately.
 //
 //   --weights <dir>    the export_agamotto_sentinel_weights.py output dir
