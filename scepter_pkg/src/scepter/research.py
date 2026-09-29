@@ -77,7 +77,14 @@ class ScepterResearch(OrbResearch):
         if "ANCHOR_SYMBOLS" not in config:
             raise KeyError("ANCHOR_SYMBOLS is required in config but not set")
         self.anchor_symbols: list[str] = config["ANCHOR_SYMBOLS"]
-        self.anchor_windows: list[int] = config.get("ANCHOR_WINDOWS", [14, 28])
+        # No default: the windows size the corr/spread/rel_strength/atr_ratio
+        # features, so a missing key must not silently pick them.
+        if "ANCHOR_WINDOWS" not in config:
+            raise KeyError("ANCHOR_WINDOWS is required in config but not set "
+                           "(e.g. [14, 28]); no default (CLAUDE.md: no silent fallbacks)")
+        if not config["ANCHOR_WINDOWS"]:
+            raise ValueError("ANCHOR_WINDOWS is empty; min/max of it size the anchor features")
+        self.anchor_windows: list[int] = config["ANCHOR_WINDOWS"]
         # Anchor keys may be given as CODES or real names; normalise to real
         # (code->real, real->real) so _apply_filter_mask's real base_name lookup
         # works while committed configs can use obfuscated codes.

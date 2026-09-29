@@ -54,7 +54,7 @@ Scepter keys, in addition to the Orb/Agamotto `setting.json` keys:
 |-----|---------|-------------|
 | `STRATEGY` | `"scepter"` | |
 | `ANCHOR_SYMBOLS` | `["QQQ"]` | Required, and raises if absent. The first entry sets the regime-stack prefix in the runner. |
-| `ANCHOR_WINDOWS` | `[14, 28]` | Correlation windows. `min` sets the relative-strength window, `max` the spread and ATR window. |
+| `ANCHOR_WINDOWS` | `[14, 28]` | Required and non-empty; raises if absent (no default since 2026-09-29). Correlation windows. `min` sets the relative-strength window, `max` the spread and ATR window. |
 | `ANCHOR_REGIMES` | see below | Maps each anchor-state regime to a column condition. Keys may be codes or real names. |
 
 ```json
@@ -74,7 +74,6 @@ Scepter keys, in addition to the Orb/Agamotto `setting.json` keys:
 - **That error is a plain `ValueError` on purpose.** `create()` catches `MissingFilterColumnError` and skips the regime. Since every scepter regime has an anchor leg, that type would skip the whole stack and the run would still exit 0.
 - **Missing anchor klines surface at the mask, not at feature build.** `_attach_anchor_features` logs a warning and skips an anchor it cannot map, or one whose return column is absent. The first `ANCHOR_REGIMES` lookup then raises.
 - **Onboarding a new anchor prefix** requires adding its 4 atoms (`{p}_trending_up/_down`, `{p}_high_vol/_low_vol`) to `obfuscation/extract_inventory.py::_MARVEL_ATOMS`. Otherwise `generate_regime_stack(anchor_prefix=...)` raises on the unmapped atom.
-- **`ANCHOR_WINDOWS` silently defaults** to `[14, 28]` when absent (`config.get`). Every current arm sets it explicitly.
 
 ## Usage
 

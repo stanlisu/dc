@@ -26,6 +26,7 @@ def _research(anchor_symbols, anchor_regimes) -> ScepterResearch:
     return ScepterResearch({
         "SYMBOLS": ["BINANCE_PERP_SOL_USDT"],
         "ANCHOR_SYMBOLS": anchor_symbols,
+        "ANCHOR_WINDOWS": [14, 28],
         "ANCHOR_REGIMES": anchor_regimes,
         "EXCHANGE": "BINANCE",
         "DATA": "liquid",
