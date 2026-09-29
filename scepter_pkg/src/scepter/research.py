@@ -145,8 +145,25 @@ class ScepterResearch(OrbResearch):
                 op = cond["op"]
                 val = float(cond["val"])
                 if col not in df.columns:
-                    logger.warning(f"ANCHOR_REGIMES column '{col}' missing — defaulting to True")
-                    return pd.Series(True, index=df.index)
+                    # Same boundary as agamotto's apply_filter_mask `df.empty`
+                    # guard: a length-0 mask cannot make a regime fire.
+                    if df.empty:
+                        return pd.Series(dtype=bool)
+                    # An all-True mask here drops the anchor half of the regime
+                    # and trades it unconditioned. Plain ValueError, NOT
+                    # MissingFilterColumnError: create() skips regimes on that
+                    # one, and every scepter regime carries an anchor part, so
+                    # an arm-wide config mismatch (e.g. ANCHOR_REGIMES copied
+                    # from a BTC arm onto a QQQ arm) would skip the whole stack.
+                    raise ValueError(
+                        f"ANCHOR_REGIMES[{base_name!r}] needs column {col!r}, "
+                        f"which the frame does not carry. ANCHOR_SYMBOLS="
+                        f"{self.anchor_symbols} build columns with prefix(es) "
+                        f"{self._anchor_prefixes()}. Either ANCHOR_REGIMES was "
+                        "written for a different anchor, or the anchor's klines "
+                        "never loaded. Refusing to default the anchor leg to "
+                        "True (CLAUDE.md: no silent fallbacks)."
+                    )
                 ops = {">": df[col] > val, "<": df[col] < val,
                        ">=": df[col] >= val, "<=": df[col] <= val,
                        "==": df[col] == val}
@@ -155,6 +172,14 @@ class ScepterResearch(OrbResearch):
                 return ops[op].fillna(False)
 
         return super()._apply_filter_mask(df, filter_name, position)
+
+    def _anchor_prefixes(self) -> list[str]:
+        """Column prefixes _attach_anchor_features derives from ANCHOR_SYMBOLS."""
+        out = []
+        for sym in self.anchor_symbols:
+            native = _symbol_to_native(sym)
+            out.append(native[:3].lower() if native is not None else f"<unmappable {sym}>")
+        return out
 
     @staticmethod
     def _rolling_beta(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
