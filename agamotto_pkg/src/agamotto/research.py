@@ -697,7 +697,17 @@ class AgamottoResearch:
                     vol_ma = vol.rolling(7, min_periods=1).mean()
                     vol_ratio = (vol / (vol_ma + 1e-8)).rename(f"{base}_vol_ratio")
                     volume_features.append(vol_ratio)
-                    vol_ret = vol.pct_change(fill_method=None)
+                    # A zero-volume previous bar has no defined % change: NaN, not
+                    # pct_change's +inf. Measured 2026-09-26 on shield2: +inf in
+                    # ~0.7% of agamotto base+stock 15m rows (US stocks leave
+                    # zero-volume bars) and 712 cells across base 1m. Step 2 already
+                    # turned that inf into NaN before imputing; live knull handed it
+                    # to RobustScaler, which raises, dropping the whole regime for
+                    # the bar. Every other cell is bit-identical to pct_change
+                    # (pandas computes it as `x / x.shift(1) - 1`, the same
+                    # expression). agamotto_core feature_engine.cpp mirrors this.
+                    vol_prev = vol.shift(1)
+                    vol_ret = vol / vol_prev.where(vol_prev != 0) - 1
                     volume_features.append(vol_ret.shift(1).rename(f"{base}_vol_ret_lag1"))
                     volume_features.append(vol_ret.shift(2).rename(f"{base}_vol_ret_lag2"))
                     volume_features.append(vol_ret.shift(3).rename(f"{base}_vol_ret_lag3"))

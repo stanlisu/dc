@@ -921,7 +921,12 @@ Table engineerFeatures(const RawBars& bars)
     {
         const std::vector<double> vol_ma = pdops::rollMean(bars.volume, 7, 1);
         t.put(codes::F_VOL_RATIO, ratioEps(bars.volume, vol_ma, 1e-8));
-        const std::vector<double> vol_ret = pdops::pctChange(bars.volume, 1);
+        // research.py: `vol / vol.shift(1).where(vol.shift(1) != 0) - 1`. A
+        // zero-volume previous bar gives NaN, NOT pctChange's +inf; every other
+        // cell is pctChange exactly (the same `x / prev - 1.0` expression).
+        std::vector<double> vol_ret = pdops::pctChange(bars.volume, 1);
+        for (size_t i = 1; i < vol_ret.size(); ++i)
+            if (bars.volume[i - 1] == 0.0) vol_ret[i] = NA;
         t.put(codes::F_VOL_RET_LAG1, pdops::shift(vol_ret, 1));
         t.put(codes::F_VOL_RET_LAG2, pdops::shift(vol_ret, 2));
         t.put(codes::F_VOL_RET_LAG3, pdops::shift(vol_ret, 3));

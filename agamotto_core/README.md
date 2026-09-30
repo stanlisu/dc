@@ -1160,8 +1160,8 @@ same raw panel to `tests/feature_parity_driver` and compares.
 
 Three scenarios, 699 rows each: BTC-like (~64000), 1000PEPE-like (~0.0045), and
 BTC-like with injected NaN holes (singleton, sub-window run, super-window run,
-trailing), a zero-volume bar (→ `+inf` in `vol_ret_lag*`), a zero
-`quote_volume` bar and a flat bar.
+trailing), a zero-volume bar (→ NaN in `vol_ret_lag*` on the bars after it —
+see below), a zero `quote_volume` bar and a flat bar.
 
 **Cells are classified `finite / NaN / +inf / -inf` and the classifications
 must match EXACTLY before a single value is diffed.** This is the one place the
@@ -1207,6 +1207,25 @@ Reproduced faithfully, because they are what production computes:
   the `VOL_Q_WINDOW` comment says the point is that "the new cutoffs and the
   incumbent median share one lookback". Changing `VOL_Q_WINDOW` would silently
   *not* move q50. Latent, not currently wrong (both are 700).
+
+Changed in BOTH engines together (2026-09-26):
+
+- **`vol_ret` over a zero previous volume is NaN, not `+inf`.** research.py
+  was `volume.pct_change()`, so the bar after a zero-volume bar got `+inf` in
+  `vol_ret_lag1..3`, and the port reproduced it. It is now
+  `vol / vol.shift(1).where(vol.shift(1) != 0) - 1` in research.py and
+  `pctChange` with those cells masked to NaN here; every other cell is
+  unchanged bit for bit. Why: live knull handed the `+inf` to
+  `RobustScaler.transform`, which raises, and the bare `except` dropped the
+  whole regime for the bar for every symbol (divergence 2 above). Measured on
+  shield2 that day: `+inf` in ~0.7% of agamotto base+stock 15m filter-parquet
+  rows (US stocks leave zero-volume bars) and 712 cells across base 1m.
+  `feature_parity.py` `zero_volume_vol_ret_check` pins NaN on both sides and
+  requires at least one such bar to be exercised; the parity gate's C++-only
+  mutant (the mask removed) goes red on 3 classification columns. On the model
+  gate this removes 4 of the `(regime, row)` pairs divergence 2 reported
+  (2 → 0 on the NaN-holes scenario, 56 → 54 on the `_safe` scenario); those
+  rows now take the reproduced NaN→0.0 fill on both sides.
 
 Declared divergence:
 
