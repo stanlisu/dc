@@ -37,6 +37,15 @@ nothing here reads a raw substring. Following gauntlet/start_oms.py on marvel
     ps row (hydra: 1286380 is the wrapper, 1286381 is the launcher) and
     nothing is lost by refusing to parse the string.
 
+INFRA IS REPORTED, NOT BLOCKING (user directive 2026-09-30). The sentinel
+venue plumbing -- the OMS (`tsLtpShmOms`), the market-data feed
+(`tsBinanceFeedPublisher`), their supervisor, and the kline refresher -- stays
+up between bot runs and imports no dc package: the OMS and feed are C++
+binaries, and refresh_fleet_klines.sh runs a stdlib-only fetcher (verified on
+hydra 2026-09-30). Blocking on it meant hydra could never take a dc build even
+with every bot closed. Only a BOT (knull, a bridge, the tsLtpBaseAlgo strategy
+host, or a launcher/close-all mid-flight) blocks.
+
 WHY THREE CLASSES, not one boolean. A live trading process is a hard STOP: it
 holds venue credentials and a mapped import tree. A research job is also a
 reason not to deploy -- a `pip install -e` mid-run corrupts it -- but it is the
@@ -58,7 +67,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 # Exit codes. The shell callers branch on these, so they are part of the API.
-RC_CLEAR = 0
+RC_CLEAR = 0         # nothing running, or INFRA only (reported, not blocking)
 RC_BLOCKED = 1      # TRADING or OPS -- refuse
 RC_UNUSABLE = 2     # listing unusable -- refuse, host state UNKNOWN
 RC_RESEARCH = 3     # research only -- refuse by default, operator may wait
@@ -66,6 +75,7 @@ RC_RESEARCH = 3     # research only -- refuse by default, operator may wait
 CLASS_TRADING = "TRADING"
 CLASS_OPS = "OPS"
 CLASS_RESEARCH = "RESEARCH"
+CLASS_INFRA = "INFRA"
 
 # A real host runs dozens of processes. Fewer than this is a broken capture,
 # not an idle machine. Kernel threads alone clear it on every Linux box.
@@ -74,9 +84,10 @@ MIN_ROWS = 5
 # --- what counts -----------------------------------------------------------
 # C++ sentinel fleet, by argv[0] BASENAME. The two directory rules below cover
 # binaries not named here, so this list never has to be exhaustive.
-SENTINEL_BINARIES = frozenset({
-    "tsLtpBaseAlgo", "tsLtpShmOms", "tsBinanceFeedPublisher",
-})
+SENTINEL_BINARIES = frozenset({"tsLtpBaseAlgo"})
+# Venue plumbing that outlives the bots and imports no dc package. Checked
+# BEFORE the directory rules, so an unnamed /opt/bin/ts* binary still blocks.
+INFRA_BINARIES = frozenset({"tsLtpShmOms", "tsBinanceFeedPublisher"})
 # Any executable shipped by the sentinel release process is fleet, so a binary
 # nobody listed above is still caught. The release tree nests a build-type
 # directory under bin/ -- measured on hydra 2026-08-28:
@@ -101,8 +112,10 @@ TRADING_STEM_SUFFIXES = ("_bridge",)
 
 OPS_SCRIPTS = frozenset({
     "launch_sentinel_bots", "launch_bots", "launch_xmen_bots",
-    "refresh_fleet_klines", "watchdog", "close_all", "close_all_positions",
-    "start_oms", "stop_oms",
+    "watchdog", "close_all", "close_all_positions",
+})
+INFRA_SCRIPTS = frozenset({
+    "refresh_fleet_klines", "supervise_oms", "start_oms", "stop_oms",
 })
 
 # Heavy jobs a `pip install -e` mid-run corrupts.
@@ -206,6 +219,8 @@ def _stem(path: str) -> str:
 
 def _classify(target: str) -> str | None:
     name = PurePosixPath(target).name
+    if name in INFRA_BINARIES:
+        return CLASS_INFRA
     if name in SENTINEL_BINARIES:
         return CLASS_TRADING
     if any(rule.match(target) for rule in SENTINEL_DIR_RULES):
@@ -214,6 +229,8 @@ def _classify(target: str) -> str | None:
     stem = _stem(target)
     if stem in TRADING_SCRIPTS or stem.endswith(TRADING_STEM_SUFFIXES):
         return CLASS_TRADING
+    if stem in INFRA_SCRIPTS:
+        return CLASS_INFRA
     if stem in OPS_SCRIPTS:
         return CLASS_OPS
     if stem in RESEARCH_SCRIPTS:
@@ -266,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f.render())
     if any(f.klass in (CLASS_TRADING, CLASS_OPS) for f in found):
         return RC_BLOCKED
-    if found:
+    if any(f.klass == CLASS_RESEARCH for f in found):
         return RC_RESEARCH
     return RC_CLEAR
 

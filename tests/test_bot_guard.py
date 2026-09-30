@@ -99,9 +99,10 @@ def test_three_name_mutant_misses_ts_ltp_base_algo():
     assert three_name_gate(listing(BASE_ALGO)) == []
 
 
-def test_shm_oms_and_feed_publishers_detected():
+def test_shm_oms_and_feed_publishers_detected_as_infra():
+    """Seen and reported, but INFRA: venue plumbing, imports no dc (2026-09-30)."""
     found = bot_guard.scan(listing(SHM_OMS, FEED_P1, FEED_P2))
-    assert [f.klass for f in found] == ["TRADING"] * 3
+    assert [f.klass for f in found] == ["INFRA"] * 3
     assert [f.pid for f in found] == [2909173, 598913, 598915]
 
 
@@ -182,7 +183,7 @@ def test_three_name_mutant_misses_launch_sentinel_bots():
 
 def test_refresh_fleet_klines_shell_script_detected():
     """argv[0] is /bin/bash and the SCRIPT is argv[1] — not a -c string."""
-    assert classes(listing(REFRESH_FLEET)) == ["OPS"]
+    assert classes(listing(REFRESH_FLEET)) == ["INFRA"]
 
 
 def test_watchdog_detected():
@@ -220,8 +221,8 @@ def test_research_jobs_detected(row):
 
 def test_classes_are_reported_separately():
     """The gate must not be one boolean: an operator may wait on RESEARCH."""
-    text = listing(SHM_OMS, LAUNCH_SENTINEL, ROLLING_PREDICT)
-    assert classes(text) == ["TRADING", "OPS", "RESEARCH"]
+    text = listing(BASE_ALGO, SHM_OMS, LAUNCH_SENTINEL, ROLLING_PREDICT)
+    assert classes(text) == ["TRADING", "INFRA", "OPS", "RESEARCH"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +311,9 @@ def test_cli_clear_exits_0():
 
 
 def test_cli_trading_exits_1_and_prints_pid_elapsed_argv():
-    r = run_cli(listing(SHM_OMS))
+    r = run_cli(listing(BASE_ALGO))
     assert r.returncode == bot_guard.RC_BLOCKED
-    assert "2909173" in r.stdout and "17:53:49" in r.stdout and "tsLtpShmOms" in r.stdout
+    assert "1286900" in r.stdout and "04:11:02" in r.stdout and "tsLtpBaseAlgo" in r.stdout
 
 
 def test_cli_research_only_exits_3_so_the_operator_can_choose_to_wait():
@@ -322,7 +323,36 @@ def test_cli_research_only_exits_3_so_the_operator_can_choose_to_wait():
 
 
 def test_cli_trading_wins_over_research():
-    assert run_cli(listing(SHM_OMS, ROLLING_PREDICT)).returncode == bot_guard.RC_BLOCKED
+    assert run_cli(listing(BASE_ALGO, ROLLING_PREDICT)).returncode == bot_guard.RC_BLOCKED
+
+
+# Verbatim from hydra 2026-09-30 after /close-all: every bot down, the sentinel
+# venue plumbing still up. The old gate skipped hydra on exactly this listing.
+HYDRA_INFRA_ONLY = (
+    "2629499  1-22:31:52 /opt/bin/tsLtpShmOms -f /opt/infra_configs/oms_ltp_config.json",
+    "2629527  1-22:31:46 /opt/bin/tsLtpShmOms -f /opt/infra_configs/oms_ltp_LTP_MFT3.json",
+    "2629672  1-22:31:41 /opt/bin/tsBinanceFeedPublisher -f /opt/infra_configs/feed_publisher.json",
+    "3319311  4-13:11:51 /bin/bash ./refresh_fleet_klines.sh",
+    "2632466  1-21:50:00 /home/stan/miniconda3/envs/py313/bin/python -u gauntlet/supervise_oms.py",
+)
+
+
+def test_cli_infra_only_is_clear_and_still_reported():
+    """User directive 2026-09-30: deploy while infra is up; only bots block."""
+    r = run_cli(listing(*HYDRA_INFRA_ONLY))
+    assert r.returncode == bot_guard.RC_CLEAR
+    assert r.stdout.count("INFRA") == 5
+    assert "tsLtpShmOms" in r.stdout and "refresh_fleet_klines" in r.stdout
+
+
+@pytest.mark.parametrize("bot", [BASE_ALGO, RELEASE_BIN, LAUNCH_SENTINEL,
+                                 "  4242    00:05:00 python3 ../knull/run_knull.py -c x/setting.json --venue ltp"])
+def test_cli_a_bot_beside_infra_still_blocks(bot):
+    assert run_cli(listing(*HYDRA_INFRA_ONLY, bot)).returncode == bot_guard.RC_BLOCKED
+
+
+def test_cli_research_beside_infra_is_still_research():
+    assert run_cli(listing(*HYDRA_INFRA_ONLY, ROLLING_PREDICT)).returncode == bot_guard.RC_RESEARCH
 
 
 def test_cli_unusable_listing_exits_2():
@@ -370,6 +400,14 @@ def test_shell_classify_clear_returns_0(tmp_path):
     f.write_text(FILLER)
     r = run_sh(f'bot_guard_classify < "{f}"; echo "rc=$?"')
     assert "rc=0" in r.stdout
+
+
+def test_shell_report_infra_only_is_clear_and_lists_it(tmp_path):
+    f = tmp_path / "ps.txt"
+    f.write_text(listing(*HYDRA_INFRA_ONLY))
+    r = run_sh(f'bot_guard_report hydra < "{f}"; echo "rc=$?"')
+    assert "rc=0" in r.stdout
+    assert "infra left up" in r.stdout and "tsBinanceFeedPublisher" in r.stdout
 
 
 def test_shell_classify_research_returns_3(tmp_path):
@@ -437,7 +475,7 @@ def test_real_hydra_listing_finds_what_the_old_gate_missed():
     names = sorted({f.target for f in found})
     assert names == ["launch_sentinel_bots", "refresh_fleet_klines",
                      "tsBinanceFeedPublisher", "tsLtpShmOms"]
-    assert sorted({f.klass for f in found}) == ["OPS", "TRADING"]
+    assert sorted({f.klass for f in found}) == ["INFRA", "OPS"]
     assert len(found) == 5  # 2x feed publisher + oms + launcher + refresher
 
 
