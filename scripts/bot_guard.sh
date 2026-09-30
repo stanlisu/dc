@@ -9,7 +9,7 @@
 #     listing="$(ssh "$host" "$BOT_GUARD_PS_CMD" 2>/dev/null)" || listing=""
 #     findings="$(printf '%s\n' "$listing" | bot_guard_classify)"; rc=$?
 #     case $rc in
-#       0) : deploy ;;
+#       0) : deploy (findings may list INFRA -- reported, not blocking) ;;
 #       1) : live trading/ops -- HARD STOP ;;
 #       3) : research job in flight -- refuse, but the operator may prefer to wait ;;
 #       2) : listing unusable -- host state UNKNOWN, never deploy blind ;;
@@ -60,7 +60,12 @@ bot_guard_report() {
     local host="$1" findings rc
     findings="$(bot_guard_classify)"; rc=$?
     case "$rc" in
-        0) echo "    ${host}: clear -- no trading, ops or research process running" ;;
+        0) if [ -n "$findings" ]; then
+               echo "    ${host}: clear -- no bot running; infra left up (not blocking):"
+               printf '%s\n' "$findings" | sed 's/^/      /'
+           else
+               echo "    ${host}: clear -- no trading, ops or research process running"
+           fi ;;
         1) echo "    ${host}: LIVE TRADING/OPS PROCESSES -- refusing:"
            printf '%s\n' "$findings" | sed 's/^/      /' ;;
         3) echo "    ${host}: RESEARCH job in flight -- refusing (a pip install"

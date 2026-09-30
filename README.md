@@ -129,6 +129,16 @@ printf '%s\n' "$listing" | bot_guard_report "$host"     # or bot_guard_classify
 Exit codes, which are the API: `0` clear · `1` TRADING/OPS (hard stop) ·
 `3` RESEARCH only · `2` listing unusable · `4` classifier missing.
 
+**Only bots block — venue infra does not (user directive 2026-09-30).**
+`tsLtpShmOms`, `tsBinanceFeedPublisher`, `supervise_oms`/`start_oms`/`stop_oms`
+and `refresh_fleet_klines.sh` are class **INFRA**: listed in the report, exit
+`0`. They stay up between bot runs and import no dc package (C++ binaries, and a
+stdlib-only kline fetcher — checked on hydra 2026-09-30), so blocking on them
+meant hydra never took a build even after `/close-all`. Still blocking: every
+knull bot/bridge, the `tsLtpBaseAlgo` strategy host and any other `/opt/bin/ts*`
+or `/opt/releases/*/bin/*` binary not named as infra (TRADING), the launchers
+and close-all mid-flight (OPS), and research jobs (RESEARCH, exit `3`).
+
 **Three classes, never one boolean.** A live trading process holds venue
 credentials and a mapped import tree — stop. A research job is also a reason to
 refuse (a `pip install -e` mid-run corrupts it) but the operator may prefer to
