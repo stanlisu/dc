@@ -77,7 +77,14 @@ class ScepterResearch(OrbResearch):
         if "ANCHOR_SYMBOLS" not in config:
             raise KeyError("ANCHOR_SYMBOLS is required in config but not set")
         self.anchor_symbols: list[str] = config["ANCHOR_SYMBOLS"]
-        self.anchor_windows: list[int] = config.get("ANCHOR_WINDOWS", [14, 28])
+        # No default: the windows size the corr/spread/rel_strength/atr_ratio
+        # features, so a missing key must not silently pick them.
+        if "ANCHOR_WINDOWS" not in config:
+            raise KeyError("ANCHOR_WINDOWS is required in config but not set "
+                           "(e.g. [14, 28]); no default (CLAUDE.md: no silent fallbacks)")
+        if not config["ANCHOR_WINDOWS"]:
+            raise ValueError("ANCHOR_WINDOWS is empty; min/max of it size the anchor features")
+        self.anchor_windows: list[int] = config["ANCHOR_WINDOWS"]
         # Anchor keys may be given as CODES or real names; normalise to real
         # (code->real, real->real) so _apply_filter_mask's real base_name lookup
         # works while committed configs can use obfuscated codes.
@@ -145,8 +152,25 @@ class ScepterResearch(OrbResearch):
                 op = cond["op"]
                 val = float(cond["val"])
                 if col not in df.columns:
-                    logger.warning(f"ANCHOR_REGIMES column '{col}' missing — defaulting to True")
-                    return pd.Series(True, index=df.index)
+                    # Same boundary as agamotto's apply_filter_mask `df.empty`
+                    # guard: a length-0 mask cannot make a regime fire.
+                    if df.empty:
+                        return pd.Series(dtype=bool)
+                    # An all-True mask here drops the anchor half of the regime
+                    # and trades it unconditioned. Plain ValueError, NOT
+                    # MissingFilterColumnError: create() skips regimes on that
+                    # one, and every scepter regime carries an anchor part, so
+                    # an arm-wide config mismatch (e.g. ANCHOR_REGIMES copied
+                    # from a BTC arm onto a QQQ arm) would skip the whole stack.
+                    raise ValueError(
+                        f"ANCHOR_REGIMES[{base_name!r}] needs column {col!r}, "
+                        f"which the frame does not carry. ANCHOR_SYMBOLS="
+                        f"{self.anchor_symbols} build columns with prefix(es) "
+                        f"{self._anchor_prefixes()}. Either ANCHOR_REGIMES was "
+                        "written for a different anchor, or the anchor's klines "
+                        "never loaded. Refusing to default the anchor leg to "
+                        "True (CLAUDE.md: no silent fallbacks)."
+                    )
                 ops = {">": df[col] > val, "<": df[col] < val,
                        ">=": df[col] >= val, "<=": df[col] <= val,
                        "==": df[col] == val}
@@ -155,6 +179,14 @@ class ScepterResearch(OrbResearch):
                 return ops[op].fillna(False)
 
         return super()._apply_filter_mask(df, filter_name, position)
+
+    def _anchor_prefixes(self) -> list[str]:
+        """Column prefixes _attach_anchor_features derives from ANCHOR_SYMBOLS."""
+        out = []
+        for sym in self.anchor_symbols:
+            native = _symbol_to_native(sym)
+            out.append(native[:3].lower() if native is not None else f"<unmappable {sym}>")
+        return out
 
     @staticmethod
     def _rolling_beta(y: pd.Series, x: pd.Series, window: int) -> pd.Series:
