@@ -624,3 +624,7 @@ STILL BLOCKING PRODUCTION: the five orb arms are NOT yet re-rolled. Deployed orb
 2026-09-13T14:49:15Z  deploy 9 algos -> shield shield2  dc=3bfef8384  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
 2026-09-14T09:20:37Z  deploy 9 algos -> shield shield2  dc=9b2b72b61-dirty  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
 2026-09-14T09:25:36Z  deploy 9 algos -> hydra  dc=9b2b72b61-dirty  (via scripts/deploy_host.sh, same build as 09:20:37Z shield/shield2; hydra infra (OMS/feed/refresher/reconciler) stopped first to clear the guard; dirty file = deploy.log only)  skipped: none  failed: none
+2026-09-15T07:47:19Z  deploy 9 algos -> shield  dc=1cf43b845  (via scripts/sync_all_repos.sh)  skipped: hydra(live) shield2(research)  failed: none
+2026-09-15T08:19:53Z  deploy 9 algos -> hydra shield  dc=1cf43b845-dirty(deploy.log only)  (via scripts/deploy_host.sh; hydra with --i-accept-a-torn-import-tree: only C++ OMS/feed + bash refresher running, no python dc importer)  skipped: shield2(research, 36 procs; already same package code 9b2b72b)  failed: none
+2026-09-21T03:22:25Z  deploy 9 algos -> shield shield2  dc=60d8f56a4-dirty  (via scripts/sync_all_repos.sh)  skipped: hydra(live)  failed: none
+2026-09-21T03:39:57Z  deploy 9 algos -> hydra  dc=60d8f56a4  (via scripts/deploy_host.sh, SAME build_dist as the 03:22:25Z shield/shield2 entry -- not a rebuild; the kline refresher pid 684630 was stopped first, so NO override flag was needed and the guard passed normally)  skipped: none  failed: none
