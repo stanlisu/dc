@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 # price_range_pct_q80/q90/q95 cutoffs are built with
 # ``rolling(VOL_Q_WINDOW, min_periods=VOL_Q_WINDOW)`` (research.py:421-425), so
 # they need 700 CLOSED bars before they emit a single non-NaN value, and
-# ``_process_combined`` drops the in-flight candle (``combined.iloc[:-1]``).
+# ``_process_combined`` keeps ``limit - 1`` closed bars (it drops the in-flight
+# candle, or takes ``tail(limit - 1)`` of a closed-bar-only buffer).
 # At the old default of 700 that left 699 closed bars -- one short -- so every
 # cutoff was NaN, ``price_range_pct > NaN`` was False on every bar, and every
 # high_vol_q80/q90/q95 regime was silently, permanently dead. Measured on the
@@ -544,17 +545,37 @@ class AgamottoTrading(AgamottoResearch):
                     f"Decisions will be CLOSE (all zeros).")
 
     def _process_combined(self, combined: pd.DataFrame,
-                          limit: int) -> None:
-        """Shared post-processing for both REST and WS paths."""
+                          limit: int, last_row_in_flight: bool) -> None:
+        """Shared post-processing for both REST and WS paths.
+
+        ``last_row_in_flight`` says what the frame's newest row IS, and the
+        caller must state it — it is not inferable from the frame. ``True``: the
+        REST frame and marvel's in-flight ``KlineStreamer`` buffer, whose last
+        row is the candle still forming; it is dropped so features use only
+        closed bars, matching the training pipeline. ``False``: a closed-bar-only
+        buffer (marvel knull ``KLINE_WAKE_ON_CLOSE``), whose last row is the
+        just-closed bar the decision is about; dropping it would leave the frame
+        one full TIME_UNIT stale. Either way agamotto gets the same ``limit - 1``
+        closed bars, so the closed-bar path changes latency and nothing else.
+        """
+        if not isinstance(last_row_in_flight, bool):
+            raise TypeError(
+                f"last_row_in_flight must be a bool, got "
+                f"{type(last_row_in_flight).__name__} {last_row_in_flight!r}")
         combined = combined[~combined.index.duplicated(keep="last")]
         if combined.index.tz is not None:
             combined.index = combined.index.tz_localize(None)
-        combined = combined.tail(limit)
 
-        # Drop the current incomplete bar so features use only closed bars,
-        # matching the training pipeline behaviour.
-        if len(combined) > 1:
-            combined = combined.iloc[:-1]
+        if last_row_in_flight:
+            combined = combined.tail(limit)
+            # Drop the current incomplete bar so features use only closed
+            # bars, matching the training pipeline behaviour.
+            if len(combined) > 1:
+                combined = combined.iloc[:-1]
+        else:
+            # Closed bars only: keep exactly the count the in-flight path
+            # keeps after its drop.
+            combined = combined.tail(limit - 1)
 
         self.raw = combined
         self.engineer_features()
@@ -630,7 +651,12 @@ class AgamottoTrading(AgamottoResearch):
                     frames.append(df)
                 if len(frames) == len(native_symbols):
                     combined = pd.concat(frames, axis=1).sort_index()
-                    self._process_combined(combined, limit)
+                    # The buffer, not this method, knows whether its newest
+                    # row is in flight. No default: a buffer that cannot say
+                    # raises AttributeError rather than being guessed at.
+                    self._process_combined(
+                        combined, limit,
+                        last_row_in_flight=kline_buffer.last_row_in_flight)
                     return
                 # A caller that wired up a WS buffer believes this cycle is
                 # cheap; falling back to REST costs ~10s inside the decision
@@ -718,7 +744,8 @@ class AgamottoTrading(AgamottoResearch):
             raise RuntimeError("Failed to fetch trading data via REST API.")
 
         combined = pd.concat(frames, axis=1).sort_index()
-        self._process_combined(combined, limit)
+        # REST always serves the in-flight candle as the last row.
+        self._process_combined(combined, limit, last_row_in_flight=True)
 
 
 

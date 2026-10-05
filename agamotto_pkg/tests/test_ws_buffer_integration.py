@@ -95,7 +95,7 @@ class TestWsBufferPath:
     def test_buffer_ready_skips_rest(self):
         """When buffer has all symbols, REST is not called."""
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
 
         for sym in ["BTCUSDT", "ETHUSDT"]:
             df = _make_kline_df(sym, "15m", n_bars=100)
@@ -115,7 +115,7 @@ class TestWsBufferPath:
     def test_buffer_not_ready_falls_back_to_rest(self):
         """When buffer is missing a symbol, falls through to REST."""
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
 
         # Only initialize one symbol
         buf.initialize("BTCUSDT", "15m",
@@ -153,7 +153,7 @@ class TestWsBufferPath:
     def test_buffer_data_drops_incomplete_bar(self):
         """WS buffer path should still drop the last bar (incomplete)."""
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
 
         n_bars = 50
         for sym in ["BTCUSDT", "ETHUSDT"]:
@@ -171,7 +171,7 @@ class TestWsBufferPath:
     def test_buffer_data_is_tz_naive(self):
         """Output from buffer path should be tz-naive like REST path."""
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
 
         for sym in ["BTCUSDT", "ETHUSDT"]:
             df = _make_kline_df(sym, "15m", n_bars=50)
@@ -191,7 +191,7 @@ class TestWsBufferPath:
         bans the silent version: the log must say WHY and WHICH symbols.
         """
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
         buf.initialize("BTCUSDT", "15m",
                        _make_kline_df("BTCUSDT", "15m", n_bars=100))
         inst._kline_buffer = buf
@@ -213,7 +213,7 @@ class TestWsBufferPath:
     def test_incomplete_read_fallback_names_the_empty_symbols(self, caplog):
         """``is_ready`` passes (both keys present) but one entry is empty."""
         inst = _make_trading_instance()
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
         buf.initialize("BTCUSDT", "15m",
                        _make_kline_df("BTCUSDT", "15m", n_bars=100))
         buf.initialize("ETHUSDT", "15m", pd.DataFrame())
@@ -240,7 +240,7 @@ class TestWsBufferPath:
             "TIME_UNIT": "1h",
             "FEATURE_TF": "15m",
         })
-        buf = KlineBuffer()
+        buf = KlineBuffer(last_row_in_flight=True)
 
         for sym in ["BTCUSDT", "ETHUSDT"]:
             df = _make_kline_df(sym, "15m", n_bars=100)
