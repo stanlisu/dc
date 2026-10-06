@@ -169,8 +169,10 @@ mutate "entry timeout ABANDONS a partially filled position (-> FLAT)" \
         return s_;
     }"
 
+# applyClock's own expiry test (sentinel !6 folded the four entry-clock tests into
+# entryClockExpired; this is the applyClock one, s_ not aState).
 mutate "entry timeout never fires (stuck ENTERING forever)" \
-    "    if (aNowSec - s_.entered_at < aCfg.entry_timeout_sec) return s_;" \
+    "    if (!entryClockExpired(s_, aNowSec, aCfg)) return s_;" \
     "    if (true) return s_;"
 
 mutate "a fill during ENTERING does not open the position" \
@@ -229,11 +231,15 @@ mutate "unknown ATR treated as usable (stop at the touch)" \
     "    if (!(aAtr > 0.0) || !(aCfg.trail_trigger_atr > 0.0)) return false;" \
     "    if (!(aCfg.trail_trigger_atr > 0.0)) return false;"
 
+# Anchored on the trigger-not-met branch: the switch-OFF branch above it clears
+# the peak with the same three lines, and replace() takes the FIRST match.
 mutate "trailing peak LATCHES instead of clearing below the trigger" \
-    "        s_.trail_armed = false;
+    "    if (!trailArmable(s_, aBook, aAtr, aCfg)) {
+        s_.trail_armed = false;
         s_.trail_peak = 0.0;
         return s_;" \
-    "        return s_;"
+    "    if (!trailArmable(s_, aBook, aAtr, aCfg)) {
+        return s_;"
 
 mutate "trailing arms below the trigger" \
     "    return move_ >= aCfg.trail_trigger_atr * aAtr;" \
@@ -260,13 +266,23 @@ mutate "the aim ladder rests on the SAME side as the position" \
     "        d_.side = -aState.side;      // a long position aims by SELLING" \
     "        d_.side = aState.side;      // a long position aims by SELLING"
 
+# The MAKER entry ladder (LadderKind::ENTRY) -- reemitOpening and the ANCHOR/Taker
+# single order carry the same line earlier in desiredLadder.
 mutate "an ENTRY ladder is marked reduce_only (would never open)" \
-    "        d_.reduce_only = false;      // an entry OPENS exposure" \
-    "        d_.reduce_only = true;      // an entry OPENS exposure"
+    "        d_.kind = LadderKind::ENTRY;
+        d_.side = aTarget.side;
+        d_.reduce_only = false;      // an entry OPENS exposure" \
+    "        d_.kind = LadderKind::ENTRY;
+        d_.side = aTarget.side;
+        d_.reduce_only = true;      // an entry OPENS exposure"
 
+# Phase B's line, at 12 spaces after a newline: the hold-timer crossing branch
+# (16 spaces) contains the bare text and comes first.
 mutate "phase B prices off the MAKER side instead of the consuming side" \
-    "            const double anchor_ = aDepthConsume[idx_];" \
-    "            const double anchor_ = aBook.ask;"
+    "
+            const double anchor_ = aDepthConsume[idx_];" \
+    "
+            const double anchor_ = aBook.ask;"
 
 mutate "the exit never leaves the passive phase" \
     "        if (!inCrossingPhase(aState, aNowSec, aCfg)) {" \
