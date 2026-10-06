@@ -378,14 +378,18 @@ int main()
         LadderState st{};
         check(st.phase == Phase::FLAT, "starts FLAT");
         // Placing the first entry rung is what moves us, not the signal.
+        // cycle_at (8th arg) is the hold timer's t0: the cycle boundary the
+        // entry decision belongs to, latched ONCE at FLAT -> ENTERING.
         LadderState s1 = onPlaced(st, /*uid*/1, 100.0, 0.001, +1, 1000.0,
-                                  /*unit_qty*/0.001);
+                                  /*unit_qty*/0.001, /*cycle_at*/900.0);
         check(s1.phase == Phase::ENTERING, "first placed rung -> ENTERING");
         checkClose(s1.unit_qty, 0.001, 1e-15,
                    "the entry placement latches the target's unit qty");
         check(!s1.halted, "an entry rung WITH a unit does not halt");
         check(s1.side == +1, "side is latched on the first placement");
         checkClose(s1.entered_at, 1000.0, 1e-9, "entry clock starts");
+        checkClose(s1.cycle_at, 900.0, 1e-9,
+                   "the entry placement latches the target's cycle boundary");
         checkClose(s1.tier_capacity, 0.001, 1e-12,
                    "tier capacity latches to the first ladder's size");
 
@@ -485,24 +489,26 @@ int main()
         // every size-up would raise the cap it is measured against and the
         // position cap would never bind.
         LadderState st{};
-        LadderState s1 = onPlaced(st, 1, 100.0, 0.001, +1, 1000.0, 0.001);
-        LadderState s2 = onPlaced(s1, 2, 99.9, 0.001, +1, 1000.0, 0.001);
+        LadderState s1 = onPlaced(st, 1, 100.0, 0.001, +1, 1000.0, 0.001, 900.0);
+        LadderState s2 = onPlaced(s1, 2, 99.9, 0.001, +1, 1000.0, 0.001, 900.0);
         checkClose(s2.tier_capacity, 0.002, 1e-12,
                    "capacity accrues across the FIRST ladder's rungs");
         s2.level = 2;                     // a size-up tier has fired
         // Past level 1 the unit is not read: passing none must not halt.
-        LadderState s3 = onPlaced(s2, 3, 99.0, 0.005, +1, 1100.0, 0.0);
+        LadderState s3 = onPlaced(s2, 3, 99.0, 0.005, +1, 1100.0, 0.0, 1800.0);
         checkClose(s3.tier_capacity, 0.002, 1e-12,
                    "capacity does NOT grow once past level 1");
         check(!s3.halted && s3.unit_qty == 0.001,
               "a size-up placement neither halts nor rewrites the latched unit");
+        checkClose(s3.cycle_at, 900.0, 1e-9,
+                   "a later placement does not move the latched cycle boundary");
     }
     {
         // An entry rung that reached the venue with NO unit: desiredLadder never
         // emits one (a target without units rests nothing), so the model is
         // already wrong. Counting OPEN's aim/exit rungs in a unit of zero would
         // rest nothing on a live position -- halt instead.
-        LadderState s = onPlaced(LadderState{}, 1, 100.0, 0.001, +1, 1000.0, 0.0);
+        LadderState s = onPlaced(LadderState{}, 1, 100.0, 0.001, +1, 1000.0, 0.0, 900.0);
         check(s.halted, "an entry rung placed with no unit HALTS the ladder");
     }
 
@@ -598,6 +604,18 @@ int main()
         c.trail_distance_atr = 0.5;
         const double atr = 1.0;
 
+        // The trailing stop is OFF unless the switch is on (sentinel
+        // trailing_stop_enabled, knull's TRAILING_STOP_ENABLED): with it off,
+        // even a move far past the trigger arms nothing.
+        {
+            LadderState off{};
+            off.phase = Phase::OPEN; off.side = +1;
+            off.filled_qty = 0.002; off.avg_cost = 100.0;
+            LadderState o = applyTrailing(off, book(105.0, 105.1), atr, c);
+            check(!o.trail_armed, "switch OFF: a 5x ATR move does not arm the trail");
+        }
+        c.trail_enabled = true;
+
         LadderState st{};
         st.phase = Phase::OPEN;
         st.side = +1;
@@ -640,9 +658,11 @@ int main()
         // ATR unknown (-1) must DISABLE trailing, not treat it as zero.
         // A zero ATR makes the trigger 0 and the distance 0 -- arming
         // instantly and exiting instantly, i.e. a stop at the touch.
+        // The switch is ON here, so only the ATR guard can refuse.
         Config c = cfg();
         c.trail_trigger_atr = 1.5;
         c.trail_distance_atr = 0.5;
+        c.trail_enabled = true;
         LadderState st{};
         st.phase = Phase::OPEN;
         st.side = +1;
