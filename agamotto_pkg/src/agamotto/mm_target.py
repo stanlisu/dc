@@ -101,7 +101,9 @@ def target_mode(config: Dict) -> str:
 
 TARGET_RETURN_CLOSE_TO_CLOSE = "close_to_close"
 TARGET_RETURN_TYPICAL_OVER_OPEN = "typical_over_open"
-_TARGET_RETURN_MODES = (TARGET_RETURN_CLOSE_TO_CLOSE, TARGET_RETURN_TYPICAL_OVER_OPEN)
+TARGET_RETURN_TYPICAL_OVER_CLOSE = "typical_over_close"
+_TARGET_RETURN_MODES = (TARGET_RETURN_CLOSE_TO_CLOSE, TARGET_RETURN_TYPICAL_OVER_OPEN,
+                        TARGET_RETURN_TYPICAL_OVER_CLOSE)
 
 
 def target_return_mode(config: Dict) -> str:
@@ -120,6 +122,16 @@ def target_return_mode(config: Dict) -> str:
     PnL. The realistic-fill answer is Step 8, which walks real 1m bars and never
     reads this column.
 
+    ``"typical_over_close"`` is ``((H+L+C)/3)[t+1] / close[t] - 1``: decide at the
+    close of bar t, count the entry at that same close (the "last close"), and mark
+    out at bar t+1's typical price. Same denoising as ``typical_over_open`` and the
+    same caveat -- it is NOT a fillable exit, H and L are known only once bar t+1
+    has closed. Unlike ``typical_over_open`` it is anchored on ``close[t]``, the
+    very anchor the ladder rung COUNTS are measured from
+    (``compute_ladder_multiplier(close[t], low[t+1], ...)``), so for LADDER>1 rung
+    j's return ``typ[t+1] / (close[t] * (1 -/+ (j-1)*step)) - 1`` prices each rung
+    from the entry its count assumed.
+
     # DEPRECATED: drop the absent->close_to_close branch after 2027-01-01. Every
     # committed kline setting predates this key; breaking them all at once would
     # strand every experiment. Same precedent and shape as `target_mode` above, and
@@ -133,7 +145,8 @@ def target_return_mode(config: Dict) -> str:
         raise ValueError(
             f"TARGET_RETURN_MODE={mode!r} is not one of {_TARGET_RETURN_MODES}. "
             f"'{TARGET_RETURN_CLOSE_TO_CLOSE}' is close[t+1]/close[t]-1; "
-            f"'{TARGET_RETURN_TYPICAL_OVER_OPEN}' is ((H+L+C)/3)[t+1]/open[t+1]-1.")
+            f"'{TARGET_RETURN_TYPICAL_OVER_OPEN}' is ((H+L+C)/3)[t+1]/open[t+1]-1; "
+            f"'{TARGET_RETURN_TYPICAL_OVER_CLOSE}' is ((H+L+C)/3)[t+1]/close[t]-1.")
     return str(mode)
 
 
