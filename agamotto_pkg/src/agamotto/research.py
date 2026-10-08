@@ -34,6 +34,7 @@ except ImportError:
     except ImportError:
         pass
 
+from .kline_load import load_csv_frames, load_parquet_frames
 from .features_scalefree import SCALE_FREE_FEATURES, scale_free_levels
 from .ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params
 from .mm_target import (
@@ -43,6 +44,7 @@ from .mm_target import (
     TARGET_RETURN_TYPICAL_OVER_CLOSE,
     TARGET_RETURN_TYPICAL_OVER_OPEN,
     compute_mm_target,
+    forward_price_return,
     target_mode,
     target_return_mode,
 )
@@ -307,148 +309,11 @@ class AgamottoResearch:
         """
         pass
 
-    # Kline columns `load()` keeps, in this order. Shared by the CSV and parquet
-    # readers so the two can never produce different frames.
-    _KLINE_REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
-    _KLINE_OPTIONAL_COLS = [
-        "quote_volume",
-        "number_of_trades",
-        "taker_buy_base_volume",
-        "taker_buy_quote_volume",
-    ]
-
-    @classmethod
-    def _prepare_kline_file(cls, df: pd.DataFrame, path: str) -> pd.DataFrame:
-        """One monthly kline file -> UTC-indexed float OHLCV frame.
-
-        The per-file post-processing both `load()` readers share: index from
-        `open_time_ms`, duplicate timestamps dropped keep="last", required columns
-        enforced, optional columns kept when present, everything cast to float.
-        Raises on a missing required column; what the caller does with that raise
-        is the caller's policy (the CSV reader logs and skips, the parquet reader
-        propagates).
-        """
-        if "open_time_ms" not in df.columns:
-            raise ValueError(f"Missing required column 'open_time_ms' in {path}")
-
-        df["timestamp"] = pd.to_datetime(df["open_time_ms"], unit="ms", utc=True)
-        df.set_index("timestamp", inplace=True)
-        df = df[~df.index.duplicated(keep="last")]
-
-        missing_required = [col for col in cls._KLINE_REQUIRED_COLS if col not in df.columns]
-        if missing_required:
-            raise ValueError(f"Missing required columns: {missing_required}")
-
-        existing_cols = [col for col in cls._KLINE_REQUIRED_COLS + cls._KLINE_OPTIONAL_COLS
-                         if col in df.columns]
-        return df[existing_cols].astype(float)
-
-    @staticmethod
-    def _finish_symbol_frame(symbol: str, symbol_frames: List[pd.DataFrame]) -> pd.DataFrame:
-        """Concatenate one symbol's monthly frames and prefix its columns.
-
-        The sort MUST be stable: files are concatenated in path order, and the
-        keep="last" dedupe below means "the later file wins" only if equal
-        timestamps keep that order. The default (quicksort) does not — on two
-        fully overlapping 5,000-row files it kept the EARLIER file's row on
-        ~2,500 of them (tests/test_load_parquet.py).
-        """
-        symbol_df = pd.concat(symbol_frames).sort_index(kind="stable")
-        symbol_df = symbol_df[~symbol_df.index.duplicated(keep="last")]
-        symbol_df.columns = [f"{symbol}_{col}" for col in symbol_df.columns]
-        return symbol_df
-
-    def _load_csv_frames(self, source_dir: str, whitelist: set, timeframe: str) -> List[pd.DataFrame]:
-        """The CSV tree reader — the historical `load()` body, behaviour unchanged."""
-        frames: List[pd.DataFrame] = []
-        for symbol_dir in sorted(glob.glob(f"{source_dir}/*")):
-            if not os.path.isdir(symbol_dir):
-                continue
-
-            symbol = os.path.basename(symbol_dir)
-            if whitelist and symbol.upper() not in whitelist:
-                continue
-
-            symbol_frames = []
-            for csv_path in sorted(glob.glob(f"{symbol_dir}/*_{timeframe}.csv")):
-                logger.debug(f"Loading {csv_path}")
-                try:
-                    df = pd.read_csv(csv_path, header=0)
-                    symbol_frames.append(self._prepare_kline_file(df, csv_path))
-                except Exception as exc:
-                    # WHY: historical CSV behaviour, kept byte-for-byte so no
-                    # existing arm's frame changes. The parquet reader below
-                    # does NOT copy this — it raises on any bad file.
-                    logger.warning(f"Failed to load {csv_path}: {exc}")
-                    continue
-
-            if symbol_frames:
-                frames.append(self._finish_symbol_frame(symbol, symbol_frames))
-        return frames
-
-    def _load_parquet_frames(self, parquet_root: str, whitelist: set, timeframe: str,
-                             data_family: str) -> List[pd.DataFrame]:
-        """Read `{KLINE_PARQUET_ROOT}/{TIME_UNIT}/{DATA}/{SYMBOL}/*_{TIME_UNIT}.parquet`.
-
-        Same symbol directories, same whitelist matching and same per-file
-        post-processing as the CSV reader, so the frame is identical. Unlike the
-        CSV reader nothing is skipped: an unreadable or malformed file raises with
-        its path, and a whitelisted symbol with no parquet files raises naming the
-        symbol and the directory searched.
-        """
-        if not os.path.isabs(parquet_root):
-            raise ValueError(
-                f"KLINE_PARQUET_ROOT={parquet_root!r} must be an absolute local directory "
-                f"(s3:// and relative paths are not supported).")
-        if not os.path.isdir(parquet_root):
-            raise FileNotFoundError(
-                f"KLINE_PARQUET_ROOT={parquet_root!r} is not an existing directory.")
-
-        source_dir = f"{parquet_root.rstrip('/')}/{timeframe}/{data_family}"
-        frames: List[pd.DataFrame] = []
-        loaded: set = set()
-        for symbol_dir in sorted(glob.glob(f"{source_dir}/*")):
-            if not os.path.isdir(symbol_dir):
-                continue
-
-            symbol = os.path.basename(symbol_dir)
-            if whitelist and symbol.upper() not in whitelist:
-                continue
-
-            paths = sorted(glob.glob(f"{symbol_dir}/*_{timeframe}.parquet"))
-            if not paths:
-                raise FileNotFoundError(
-                    f"no *_{timeframe}.parquet files for {symbol} under {symbol_dir}.")
-
-            symbol_frames = []
-            for pq_path in paths:
-                logger.debug(f"Loading {pq_path}")
-                try:
-                    df = pd.read_parquet(pq_path)
-                except Exception as exc:
-                    raise ValueError(f"unreadable kline parquet {pq_path}: {exc!r}") from exc
-                try:
-                    symbol_frames.append(self._prepare_kline_file(df, pq_path))
-                except Exception as exc:
-                    raise ValueError(f"malformed kline parquet {pq_path}: {exc}") from exc
-
-            frames.append(self._finish_symbol_frame(symbol, symbol_frames))
-            loaded.add(symbol.upper())
-
-        missing = sorted(whitelist - loaded)
-        if missing:
-            raise FileNotFoundError(
-                f"no kline parquet directory for SYMBOLS {missing}: searched "
-                f"{[f'{source_dir}/{sym}' for sym in missing]}.")
-        if not frames:
-            raise RuntimeError(f"No parquet files matched in {source_dir}")
-        return frames
-
     def load(self) -> None:
         """Load the kline panel into `self.raw`.
 
         `KLINE_PARQUET_ROOT` absent or null -> the CSV tree under home_root/data;
-        set -> the parquet tree under it (see `_load_parquet_frames`).
+        set -> the parquet tree under it (see `kline_load.load_parquet_frames`).
         """
         whitelist = {
             _symbol_to_native(sym)
@@ -468,7 +333,7 @@ class AgamottoResearch:
                 raise ValueError(
                     "KLINE_PARQUET_ROOT is not supported with EXCHANGE='STOCKS': the "
                     "parquet reader mirrors the BINANCEFUTURES tree layout only.")
-            frames = self._load_parquet_frames(parquet_root, whitelist, timeframe, data_family)
+            frames = load_parquet_frames(parquet_root, whitelist, timeframe, data_family)
         else:
             # No KLINE_PARQUET_ROOT: the CSV tree under home_root/data. This is
             # not a fallback — it is the existing behaviour of every arm that
@@ -477,7 +342,7 @@ class AgamottoResearch:
                 source_dir = f"{self.home_root}/data/{data_family}/{timeframe}"
             else:
                 source_dir = f"{self.home_root}/data/BINANCEFUTURES/{timeframe}/{data_family}"
-            frames = self._load_csv_frames(source_dir, whitelist, timeframe)
+            frames = load_csv_frames(source_dir, whitelist, timeframe)
             if not frames:
                 raise RuntimeError(f"No CSV files matched in {source_dir}")
 
@@ -535,7 +400,7 @@ class AgamottoResearch:
                 d.set_index("timestamp")[["high", "low", "close"]].astype(float))
 
         # Stable sort so keep="last" means "the later file wins" (see
-        # `_finish_symbol_frame`).
+        # `kline_load.finish_symbol_frame`).
         out = pd.concat(frames).sort_index(kind="stable")
         out = out[~out.index.duplicated(keep="last")]
         out.index = out.index.tz_convert(None)
@@ -715,44 +580,9 @@ class AgamottoResearch:
                 low_open_pct = ((low_series - open_series) / (open_series + 1e-8)).rename(f"{base}_low_open_pct")
                 
                 hist_return = close.pct_change(fill_method=None)
-                if ret_mode == TARGET_RETURN_TYPICAL_OVER_OPEN:
-                    # Enter at bar t+1's OPEN, measure to its TYPICAL price.
-                    # `sdf.get(col, close)` above substitutes `close` when an OHL
-                    # column is absent; under this mode that would silently make the
-                    # target ((C+C+C)/3)/C-1 == 0 for every row -- a target of
-                    # exactly zero, which trains a model that predicts nothing and
-                    # raises nowhere. Refuse instead (CLAUDE.md: no silent fallback).
-                    missing = [c for c in (open_col, high_col, low_col) if c not in sdf.columns]
-                    if missing:
-                        raise ValueError(
-                            f"TARGET_RETURN_MODE={TARGET_RETURN_TYPICAL_OVER_OPEN!r} needs real "
-                            f"OHL columns, and {missing} are absent for {base!r}. Without them the "
-                            f"target collapses to a constant 0. Rebuild this symbol's bars with "
-                            f"open/high/low, or use the close_to_close mode.")
-                    open_next = open_series.shift(-1)
-                    typical_next = ((high_series + low_series + close) / 3.0).shift(-1)
-                    price_return = typical_next / open_next.replace(0, np.nan) - 1.0
-                elif ret_mode == TARGET_RETURN_TYPICAL_OVER_CLOSE:
-                    # Enter at bar t's CLOSE (the decision bar's last price),
-                    # measure to bar t+1's TYPICAL price. Anchored on close[t] --
-                    # the same anchor `compute_ladder_multiplier` counts rungs
-                    # from below -- so rung j's return is
-                    # typ[t+1] / (close[t] * (1 -/+ (j-1)*step)) - 1.
-                    # `sdf.get(col, close)` above substitutes `close` for an absent
-                    # high/low; under this mode that would silently turn the label
-                    # into ((C+C+C)/3)[t+1]/C[t]-1 == close-to-close under another
-                    # name. Refuse instead (CLAUDE.md: no silent fallback).
-                    missing = [c for c in (high_col, low_col) if c not in sdf.columns]
-                    if missing:
-                        raise ValueError(
-                            f"TARGET_RETURN_MODE={TARGET_RETURN_TYPICAL_OVER_CLOSE!r} needs real "
-                            f"high/low columns, and {missing} are absent for {base!r}. Without "
-                            f"them the target silently degrades to close-to-close. Rebuild this "
-                            f"symbol's bars with high/low, or use the close_to_close mode.")
-                    typical_next = ((high_series + low_series + close) / 3.0).shift(-1)
-                    price_return = typical_next / close.replace(0, np.nan) - 1.0
-                else:
-                    price_return = hist_return.shift(-1)
+                price_return = forward_price_return(
+                    ret_mode, base, sdf.columns, (open_col, high_col, low_col),
+                    open_series, high_series, low_series, close, hist_return)
 
                 ret_lag1 = hist_return.shift(1).rename(f"{base}_ret_lag1")
                 ret_lag2 = hist_return.shift(2).rename(f"{base}_ret_lag2")
