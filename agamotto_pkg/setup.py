@@ -11,6 +11,7 @@ setup(
         "numpy",
         "joblib",
         "requests",
+        "pyarrow",
     ],
     python_requires=">=3.7",
 )

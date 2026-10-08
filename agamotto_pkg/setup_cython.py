@@ -33,6 +33,7 @@ setup(
         "numpy",
         "joblib",
         "requests",
+        "pyarrow",
         "cython",
     ],
     python_requires=">=3.7",

@@ -13,6 +13,7 @@ import pandas as pd
 from agamotto import AgamottoResearch
 from agamotto.features_scalefree import SCALE_FREE_FEATURES
 from agamotto.ladder import compute_ladder_multiplier, compute_ladder_return, ladder_params
+from agamotto.mm_target import TARGET_RETURN_CLOSE_TO_CLOSE, target_return_mode
 from agamotto.research import VOL_QUANTILE_FEATURES
 from agamotto.utils import _symbol_to_native
 
@@ -457,6 +458,15 @@ class OrbResearch(AgamottoResearch):
         if self.features is None:
             raise RuntimeError(
                 "Call engineer_features() before verticalize().")
+        ret_mode = target_return_mode(self.config)
+        if self.target_tf != self.base_tf and ret_mode != TARGET_RETURN_CLOSE_TO_CLOSE:
+            # The cross-TF label below is exit_close / entry_close - 1, i.e.
+            # close-to-close by construction. Building it under another mode
+            # would hand the arm a convention it did not ask for, silently.
+            raise ValueError(
+                f"Cross-TF orb (BASE_TF={self.base_tf!r} != TARGET_TF={self.target_tf!r}) does not "
+                f"support TARGET_RETURN_MODE={ret_mode!r}: the cross-TF label is "
+                f"exit_close/entry_close-1 (close-to-close). Use close_to_close, or a same-TF arm.")
 
         symbols = self.config["SYMBOLS"]
         frames = []
