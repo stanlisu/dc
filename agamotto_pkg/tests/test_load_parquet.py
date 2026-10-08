@@ -27,10 +27,12 @@ T0_MS = 1_785_542_400_000          # 2026-08-01 00:00:00 UTC
 
 def _month(rng, start_bar, n_bars):
     """One monthly file's rows. `number_of_trades` stays int64 on purpose, so
-    the float cast is exercised on both readers."""
+    the float cast is exercised on both readers. Floats are rounded to 8
+    decimals, like Binance's string prices, so the CSV text round-trips exactly
+    and the CSV-vs-parquet comparison can be bit-exact."""
     open_ms = T0_MS + (start_bar + np.arange(n_bars, dtype=np.int64)) * BAR_MS
     close = 100.0 + rng.normal(0, 1, n_bars).cumsum()
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "open_time_ms": open_ms.astype(np.int64),
         "open": close - 0.1,
         "high": close + 0.5,
@@ -43,6 +45,9 @@ def _month(rng, start_bar, n_bars):
         "taker_buy_base_volume": rng.random(n_bars) * 5,
         "taker_buy_quote_volume": rng.random(n_bars) * 500,
     }, columns=COLUMNS)
+    floats = [c for c in COLUMNS if df[c].dtype == float]
+    df[floats] = df[floats].round(8)
+    return df
 
 
 def _symbol_months(rng, sym):
@@ -90,7 +95,7 @@ class TestParity:
         home, pq_root = _write_trees(tmp_path)
         csv_raw = _load(home, _cfg())
         pq_raw = _load(home, _cfg(KLINE_PARQUET_ROOT=str(pq_root)))
-        pd.testing.assert_frame_equal(csv_raw, pq_raw)
+        pd.testing.assert_frame_equal(csv_raw, pq_raw, check_exact=True)
 
         # Not a vacuous equality: both symbols, whitelist honoured, outer join.
         assert {c.split("_")[0] for c in pq_raw.columns} == {"BTCUSDT", "ETHUSDT"}
@@ -111,11 +116,39 @@ class TestParity:
         btc = _symbol_months(rng, "BTCUSDT")
         assert pq_raw["BTCUSDT_close"].iloc[5] == btc["2026-09"]["close"].iloc[0]
 
+    @pytest.mark.parametrize("reader", ["csv", "parquet"])
+    def test_later_file_wins_on_a_large_overlap(self, tmp_path, reader):
+        """Two files covering the SAME 5,000 bars with different values: every
+        row must come from the later file. With an unstable `sort_index()` the
+        keep="last" dedupe kept the EARLIER file's row on roughly half of them
+        (the small fixture above only passes by an insertion-sort accident)."""
+        rng = np.random.default_rng(5)
+        n = 5_000
+        early = _month(rng, 0, n)
+        late = _month(rng, 0, n)
+        ohlc = ["open", "high", "low", "close"]
+        late[ohlc] = (late[ohlc] + 1000.0).round(8)     # never equal to `early`
+        home = tmp_path / "home"
+        pq_root = tmp_path / "pq"
+        csv_dir = home / "data" / "BINANCEFUTURES" / TF / DATA / "BTCUSDT"
+        pq_dir = pq_root / TF / DATA / "BTCUSDT"
+        csv_dir.mkdir(parents=True)
+        pq_dir.mkdir(parents=True)
+        for month, df in (("2026-08", early), ("2026-09", late)):
+            df.to_csv(csv_dir / f"BTCUSDT-{month}_{TF}.csv", index=False)
+            df.to_parquet(pq_dir / f"BTCUSDT-{month}_{TF}.parquet", index=False)
+        cfg = _cfg(symbols=("BTC",))
+        if reader == "parquet":
+            cfg["KLINE_PARQUET_ROOT"] = str(pq_root)
+        raw = _load(home, cfg)
+        assert len(raw) == n
+        np.testing.assert_array_equal(raw["BTCUSDT_close"].to_numpy(), late["close"].to_numpy())
+
     def test_empty_whitelist_loads_every_symbol_on_both_paths(self, tmp_path):
         home, pq_root = _write_trees(tmp_path)
         csv_raw = _load(home, _cfg(symbols=()))
         pq_raw = _load(home, _cfg(symbols=(), KLINE_PARQUET_ROOT=str(pq_root)))
-        pd.testing.assert_frame_equal(csv_raw, pq_raw)
+        pd.testing.assert_frame_equal(csv_raw, pq_raw, check_exact=True)
         assert {c.split("_")[0] for c in pq_raw.columns} == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 

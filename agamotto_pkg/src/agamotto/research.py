@@ -345,8 +345,15 @@ class AgamottoResearch:
 
     @staticmethod
     def _finish_symbol_frame(symbol: str, symbol_frames: List[pd.DataFrame]) -> pd.DataFrame:
-        """Concatenate one symbol's monthly frames and prefix its columns."""
-        symbol_df = pd.concat(symbol_frames).sort_index()
+        """Concatenate one symbol's monthly frames and prefix its columns.
+
+        The sort MUST be stable: files are concatenated in path order, and the
+        keep="last" dedupe below means "the later file wins" only if equal
+        timestamps keep that order. The default (quicksort) does not — on two
+        fully overlapping 5,000-row files it kept the EARLIER file's row on
+        ~2,500 of them (tests/test_load_parquet.py).
+        """
+        symbol_df = pd.concat(symbol_frames).sort_index(kind="stable")
         symbol_df = symbol_df[~symbol_df.index.duplicated(keep="last")]
         symbol_df.columns = [f"{symbol}_{col}" for col in symbol_df.columns]
         return symbol_df
@@ -438,6 +445,11 @@ class AgamottoResearch:
         return frames
 
     def load(self) -> None:
+        """Load the kline panel into `self.raw`.
+
+        `KLINE_PARQUET_ROOT` absent or null -> the CSV tree under home_root/data;
+        set -> the parquet tree under it (see `_load_parquet_frames`).
+        """
         whitelist = {
             _symbol_to_native(sym)
             for sym in self.config.get("SYMBOLS", [])
@@ -522,7 +534,9 @@ class AgamottoResearch:
             frames.append(
                 d.set_index("timestamp")[["high", "low", "close"]].astype(float))
 
-        out = pd.concat(frames).sort_index()
+        # Stable sort so keep="last" means "the later file wins" (see
+        # `_finish_symbol_frame`).
+        out = pd.concat(frames).sort_index(kind="stable")
         out = out[~out.index.duplicated(keep="last")]
         out.index = out.index.tz_convert(None)
         return out
@@ -547,7 +561,19 @@ class AgamottoResearch:
         Returns:
             DataFrame with return_long, return_short, return_long_raw,
             return_short_raw — indexed like `df`.
+
+        Raises:
+            ValueError: if TARGET_RETURN_MODE is anything but close_to_close.
+                This copy builds close[t+1]/close[t]-1 only; honouring the key
+                silently would label an arm with a convention it did not ask for.
         """
+        ret_mode = target_return_mode(self.config)
+        if ret_mode != TARGET_RETURN_CLOSE_TO_CLOSE:
+            raise ValueError(
+                f"_compute_ladder_returns does not support TARGET_RETURN_MODE={ret_mode!r}: it "
+                f"builds the close-to-close target only, so the label would silently not be "
+                f"the {ret_mode!r} one the config asks for. Only engineer_features' inline "
+                f"target implements the other modes.")
         # TARGET_MODE='mm' prices what knull's MarketMaker actually earns — a
         # post-only entry ladder, a resting close at avg_cost +/- MM_PROFIT_AIM,
         # and a crossing exit when the passive rung does not fill in time —

@@ -14,6 +14,7 @@ from agamotto.mm_target import (
     TARGET_RETURN_TYPICAL_OVER_OPEN,
     target_return_mode,
 )
+from agamotto.ladder import compute_ladder_return
 from agamotto.research import AgamottoResearch
 
 
@@ -235,3 +236,71 @@ class TestTypicalOverCloseEngineered:
         fee_cost = 2.0 * fee_bps / 10000.0
         raw_long = f["BTCUSDT_return_long_raw"].iloc[1]     # 2 long rungs
         assert f["BTCUSDT_return_long"].iloc[1] == pytest.approx(raw_long - 2 * fee_cost, abs=1e-15)
+
+
+# ---------------------------------------------------------------------------
+# Paths that build close-to-close BY CONSTRUCTION must refuse any other mode,
+# rather than silently ignore the key.
+# ---------------------------------------------------------------------------
+_NON_C2C = [TARGET_RETURN_TYPICAL_OVER_OPEN, TARGET_RETURN_TYPICAL_OVER_CLOSE]
+
+
+def _ohlc():
+    return pd.DataFrame({"open": [100.0, 100.0], "high": [100.1, 100.2],
+                         "low": [99.9, 99.8], "close": [100.0, 100.1]})
+
+
+class TestComputeLadderReturnsRefusesNonC2C:
+    @pytest.mark.parametrize("mode", _NON_C2C)
+    def test_non_c2c_mode_raises(self, mode):
+        r = AgamottoResearch.__new__(AgamottoResearch)
+        r.config = {"LADDER": 2, "LADDER_BPS": 1.0, "FEE": 0.0, "TARGET_RETURN_MODE": mode}
+        with pytest.raises(ValueError, match=f"TARGET_RETURN_MODE='{mode}'"):
+            r._compute_ladder_returns(_ohlc(), "close", "low", "high")
+
+    @pytest.mark.parametrize("extra", [{}, {"TARGET_RETURN_MODE": TARGET_RETURN_CLOSE_TO_CLOSE}])
+    def test_absent_or_c2c_still_works(self, extra):
+        r = AgamottoResearch.__new__(AgamottoResearch)
+        r.config = {"LADDER": 2, "LADDER_BPS": 1.0, "FEE": 0.0, **extra}
+        out = r._compute_ladder_returns(_ohlc(), "close", "low", "high")
+        assert out["return_long_raw"].iloc[0] == pytest.approx(
+            compute_ladder_return(pd.Series([0.001]), pd.Series([2]), 1.0, "long").iloc[0])
+
+
+def _orb(mode, target_tf):
+    pytest.importorskip("orb.research", reason="orb package not installed")
+    from orb.research import OrbResearch
+
+    orb = OrbResearch.__new__(OrbResearch)
+    orb.config = {"SYMBOLS": ["BINANCE_PERP_BTC_USDT"], "LADDER": 2, "LADDER_BPS": 1.0,
+                  "FEE": 0.0, "TARGET_RETURN_MODE": mode}
+    orb.timeframes = sorted({"15m", target_tf})
+    orb.base_tf = "15m"
+    orb.target_tf = target_tf
+    orb.features = pd.DataFrame({
+        "15m_BTCUSDT_close": [100.0],
+        f"{target_tf}_BTCUSDT_exit_close": [99.9],
+        f"{target_tf}_BTCUSDT_exit_low": [99.9],
+        f"{target_tf}_BTCUSDT_exit_high": [100.0],
+        "year": [2026], "month": [1],
+    }, index=pd.date_range("2026-01-01", periods=1, freq="15min"))
+    return orb
+
+
+class TestOrbCrossTfRefusesNonC2C:
+    @pytest.mark.parametrize("mode", _NON_C2C)
+    def test_cross_tf_non_c2c_raises(self, mode):
+        with pytest.raises(ValueError, match=f"TARGET_RETURN_MODE='{mode}'"):
+            _orb(mode, "1h").verticalize()
+
+    def test_cross_tf_c2c_still_builds_the_label(self):
+        orb = _orb(TARGET_RETURN_CLOSE_TO_CLOSE, "1h")
+        orb.verticalize()
+        assert orb.vertical_features["return"].iloc[0] == pytest.approx(99.9 / 100.0 - 1.0)
+
+    @pytest.mark.parametrize("mode", _NON_C2C)
+    def test_same_tf_is_not_refused(self, mode):
+        """Same-TF orb takes its labels from the per-TF AgamottoResearch, which
+        honours the mode — the guard must not fire there (the three committed
+        orb base+stock 1m arms run typical_over_open same-TF)."""
+        _orb(mode, "15m").verticalize()
