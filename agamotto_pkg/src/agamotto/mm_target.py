@@ -150,6 +150,53 @@ def target_return_mode(config: Dict) -> str:
     return str(mode)
 
 
+def forward_price_return(ret_mode, base, columns, ohl_cols, open_series,
+                         high_series, low_series, close, hist_return):
+    """The one-bar forward return the ladder target is built from, per mode.
+
+    Called once per symbol by ``AgamottoResearch.engineer_features``. Lives
+    here, beside ``target_return_mode``, for a build reason: PyArmor's TRIAL
+    licence refuses to obfuscate research.py past a size limit ("out of
+    license"), and dc PR #97 pushed it past (deploy, 2026-10-08). Same
+    expressions, same guards, moved.
+    """
+    open_col, high_col, low_col = ohl_cols
+    if ret_mode == TARGET_RETURN_TYPICAL_OVER_OPEN:
+        # Enter at bar t+1's OPEN, measure to its TYPICAL price.
+        # `sdf.get(col, close)` in engineer_features substitutes `close` when an
+        # OHL column is absent; under this mode that would silently make the
+        # target ((C+C+C)/3)/C-1 == 0 for every row -- a target of exactly zero,
+        # which trains a model that predicts nothing and raises nowhere. Refuse
+        # instead (CLAUDE.md: no silent fallback).
+        missing = [c for c in (open_col, high_col, low_col) if c not in columns]
+        if missing:
+            raise ValueError(
+                f"TARGET_RETURN_MODE={TARGET_RETURN_TYPICAL_OVER_OPEN!r} needs real "
+                f"OHL columns, and {missing} are absent for {base!r}. Without them the "
+                f"target collapses to a constant 0. Rebuild this symbol's bars with "
+                f"open/high/low, or use the close_to_close mode.")
+        open_next = open_series.shift(-1)
+        typical_next = ((high_series + low_series + close) / 3.0).shift(-1)
+        return typical_next / open_next.replace(0, np.nan) - 1.0
+    if ret_mode == TARGET_RETURN_TYPICAL_OVER_CLOSE:
+        # Enter at bar t's CLOSE (the decision bar's last price), measure to bar
+        # t+1's TYPICAL price. Anchored on close[t] -- the same anchor
+        # `compute_ladder_multiplier` counts rungs from -- so rung j's return is
+        # typ[t+1] / (close[t] * (1 -/+ (j-1)*step)) - 1. An absent high/low
+        # substituted by `close` would silently turn the label into
+        # ((C+C+C)/3)[t+1]/C[t]-1 == close-to-close under another name. Refuse.
+        missing = [c for c in (high_col, low_col) if c not in columns]
+        if missing:
+            raise ValueError(
+                f"TARGET_RETURN_MODE={TARGET_RETURN_TYPICAL_OVER_CLOSE!r} needs real "
+                f"high/low columns, and {missing} are absent for {base!r}. Without "
+                f"them the target silently degrades to close-to-close. Rebuild this "
+                f"symbol's bars with high/low, or use the close_to_close mode.")
+        typical_next = ((high_series + low_series + close) / 3.0).shift(-1)
+        return typical_next / close.replace(0, np.nan) - 1.0
+    return hist_return.shift(-1)
+
+
 def assert_supported_timeframe(config: Dict) -> None:
     """Refuse any signal grid other than 15m. See SUPPORTED_TIMEFRAME."""
     tf = config.get("TIME_UNIT")
