@@ -871,9 +871,9 @@ Table engineerFeatures(const RawBars& bars)
     t.put(codes::F_PRICE_RANGE_PCT_Q50,
           pdops::rollQuantile(price_range_pct, 700, 1, 0.5));
 
-    // research.py:371-376. min_periods=VOL_Q_WINDOW, so these are ALL-NaN on a
-    // PANEL_BARS-wide panel. See the VOL_Q_WINDOW banner in the header: live
-    // behaviour under an open production finding, reproduced and NOT fixed.
+    // research.py:371-376. min_periods=VOL_Q_WINDOW, so these are NaN on the
+    // first 699 rows of the 799-row panel and valid after. See the VOL_Q_WINDOW
+    // banner in the header: the old all-NaN panel was RESOLVED 2026-09-11.
     // One sort per window serves all three levels; the pdops driver asserts
     // rollQuantiles is cell-identical to three rollQuantile calls.
     {

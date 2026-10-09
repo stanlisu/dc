@@ -280,8 +280,8 @@ void compute(const std::vector<double>& open,
 constexpr size_t PANEL_BARS = 799;
 
 // research.py:61. Doubles as the min_periods of the q80/q90/q95 cutoffs
-// (research.py:373), which is why those three columns are ENTIRELY NaN on a
-// PANEL_BARS-wide panel: 699 observations < 700 min_periods, on every row.
+// (research.py:373), so those three columns are NaN until a row has 700
+// observations behind it: the first 699 rows of the PANEL_BARS panel.
 //
 // This is the window AND the min_periods, exactly as research.py has it. Do
 // not lower min_periods here to make the columns populate on a short panel —
