@@ -1701,6 +1701,48 @@ Trades strictly inside the spread are counted `unclassified` rather than
 guessed, and every bar carries `aggressor_source` so no consumer can mistake a
 quote-rule approximation for an exact figure.
 
+## Context timeframes for orb (ABI 6, 2026-10-10)
+
+orb regimes name each atom's timeframe (`1d_r012_and_15m_r003_long`). An atom on a
+**context** timeframe (any prefix other than `bar_sec`) is evaluated on that
+timeframe's own panel, engineered (`engineerFeaturesContext`) from native klines the
+strategy hands in with `ingestContextBars`, at the row `src/context_asof.hpp` picks:
+the newest bar whose close (`open + tf`) is at or before the base bar's **open**, which
+must be the bar closing at `floor(T/tf)*tf` -- orb `research.py` `_align_timeframes`'
+backward as-of, one base bar of lag included. Any other row is stale or missing: the
+regime does not fire and `ContextStats` counts it. Agamotto stacks carry no timeframe
+and take the old path unchanged (`core_integration_driver` is untouched and passes).
+
+| test | what it proves | where |
+|---|---|---|
+| `tests/ctx_tf_driver.cpp` (68 checks, in `build_linux.sh`) | createCore/setRegimeStack/ingest validation, the as-of row, the one-bar lag, stale holds regimes off, a short 1d history, mixed 15m/1h/1d conjunctions = AND of parts | dev105 build image |
+| `tests/run_ctx_tf_mutants.sh` | 9/9 mutants killed (newest row, no freshness, row-1, base panel, base-only path, prefix dropped from the weights dir, open bar kept, unconfigured tf, short panel refused) | dev105 host + image |
+| `tests/orb_context_parity.py` + `tests/orb_parity_driver.cpp` | the REAL knull orb (`OrbTrading`, fed from fixed CSVs at each decision time) vs the core's pieces, per (bar, symbol, regime) | python on shield2, C++ on dev105 |
+
+**Measured 2026-10-10** (window_2026_10_10 weights, 29 symbols, exported with marvel
+`export_agamotto_sentinel_weights.py`):
+
+| stack | window | regime rows | fired | fired mismatches | y over 1e-9 rel and 1e-13 abs | vote mismatches |
+|---|---|---|---|---|---|---|
+| October 10-leg (single-atom long, 15m/1h/4h/1d) | 2026-10-02 .. 10-10, 768 bars | 222,720 | 85,993 | 0 | 0 (worst 9.1e-11 rel) | 0 of 22,272 |
+| all 75 two-atom + 10 single short regimes of the window | 2026-10-07 .. 10-10, 288 bars | 709,920 | 156,792 | 0 | 0 | 0 of 8,352 |
+
+The window trains no regime wider than two atoms; three-atom and wider conjunctions
+are covered by `ctx_tf_driver` and sentinel's `regime_name_driver` (8 accepted, 9
+refused).
+
+To re-run (shield2 for python, dev105 for C++; never the Mac):
+
+```bash
+# shield2, from ~/sandbox/marvel with PYTHONPATH="agamotto_pkg/src:."
+python orb_context_parity.py fetch --symbols <SYMS> --timeframes 15m,1h,4h,1d --start <S> --end <E> --out klines
+python orb_context_parity.py reference --setting <arm setting.json> --stack <stack.csv> --home-root <dir holding gauntlet/<arm>/{setting.json,weights/<W>}> --period <W> --klines klines --start <S> --end <E> --out ref.jsonl --workers 48
+# dev105, build image
+orb_parity_driver --klines klines --symbols <SYMS> --base 15m --context 1h,4h,1d --stack <stack.csv> --weights <exported> --gate CL,TL,CS,TS --start <ms> --end <ms> --out cpp.jsonl --threads 24
+# shield2
+python orb_context_parity.py compare --ref ref.jsonl --cpp cpp.jsonl --rel-tol 1e-9 --abs-tol 1e-13
+```
+
 ## Build
 
 **Use `./build_linux.sh`.** It builds in `mjolnir-core-build:latest`

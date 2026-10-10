@@ -180,6 +180,23 @@ target_compile_definitions(core_integration_driver PRIVATE
 target_link_libraries(core_integration_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(core_integration_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
+# ABI 6: context timeframes (orb). The same sources as the integration gate,
+# because it drives createCore() end to end; it also calls atomMask and
+# engineerFeaturesContext directly to build its INDEPENDENT expectation.
+add_executable(ctx_tf_driver tests/ctx_tf_driver.cpp
+                             src/core_impl.cpp
+                             src/kline_builder.cpp
+                             src/feature_engine.cpp
+                             src/talib_block.cpp
+                             src/regime_gate.cpp
+                             src/model_runner.cpp
+                             src/decision_rule.cpp)
+target_include_directories(ctx_tf_driver PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
+target_compile_definitions(ctx_tf_driver PRIVATE
+    AGAMOTTO_CORE_GITSHA="${AGAMOTTO_CORE_GITSHA}")
+target_link_libraries(ctx_tf_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
+target_compile_options(ctx_tf_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
 # ORDER-PATH ARITHMETIC (sentinel side). Links NOTHING from src/ and no
 # ta-lib: the unit under test is order_path_math.hpp, which includes only
 # <cmath>/<cstdint> precisely so it can be tested without the vendor SDK.
@@ -259,6 +276,19 @@ add_executable(decision_parity_driver tests/decision_parity_driver.cpp
 target_include_directories(decision_parity_driver PRIVATE src ${TALIB_INC})
 target_link_libraries(decision_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(decision_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
+# ABI 6 orb parity: the core's pieces over real klines, graded against the real
+# orb code by tests/orb_context_parity.py. Reads sentinel's regime_name.hpp and
+# backfill_csv.hpp from CONTRACT_DIR -- the parser and CSV reader that run live.
+add_executable(orb_parity_driver tests/orb_parity_driver.cpp
+                                 src/decision_rule.cpp
+                                 src/model_runner.cpp
+                                 src/regime_gate.cpp
+                                 src/feature_engine.cpp
+                                 src/talib_block.cpp)
+target_include_directories(orb_parity_driver PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
+target_link_libraries(orb_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
+target_compile_options(orb_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
 # The ta-lib LINK PROOF. find_library above only proves the file exists; this
 # target is the one that actually resolves TA_* symbols, so a broken or

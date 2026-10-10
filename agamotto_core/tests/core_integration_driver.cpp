@@ -352,7 +352,7 @@ int run(int bench_n, const std::string& weights_override,
     bool threw_ = false;
     try {
         (void)createCore(kProduct, kBarSec, static_cast<int>(PANEL_BARS),
-                         weights_.c_str(), kGate);
+                         weights_.c_str(), kGate, nullptr, 0);
     } catch (const std::invalid_argument&) {
         threw_ = true;
     }
@@ -364,7 +364,7 @@ int run(int bench_n, const std::string& weights_override,
     for (const char* bad_ : {static_cast<const char*>(nullptr), "", "/nonexistent/weights"}) {
         bool rejected_ = false;
         try {
-            (void)createCore(kProduct, kBarSec, kWarmup, bad_, kGate);
+            (void)createCore(kProduct, kBarSec, kWarmup, bad_, kGate, nullptr, 0);
         } catch (const std::invalid_argument&) {
             rejected_ = true;
         }
@@ -395,7 +395,7 @@ int run(int bench_n, const std::string& weights_override,
         for (const BadGate& b : bad_) {
             bool rejected_ = false;
             try {
-                (void)createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), b.g);
+                (void)createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), b.g, nullptr, 0);
             } catch (const std::invalid_argument&) {
                 rejected_ = true;
             }
@@ -404,7 +404,7 @@ int run(int bench_n, const std::string& weights_override,
     }
 
     std::unique_ptr<ICore> core =
-        createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate, nullptr, 0);
     check(core->coreIsRealImplementation(), "core reports itself real");
     const std::string tag_ = core->coreBuildTag();
     check(tag_.find("-phase5-decision") != std::string::npos,
@@ -1061,8 +1061,8 @@ int run(int bench_n, const std::string& weights_override,
     // torn-read and wrong-bar-attribution failures the test exists to catch.
     std::printf("\n[5f] async scoring == synchronous scoring\n");
     {
-        auto sync_  = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
-        auto async_ = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        auto sync_  = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate, nullptr, 0);
+        auto async_ = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate, nullptr, 0);
         sync_->setRegimeStack(kStack, kNStack);
         async_->setRegimeStack(kStack, kNStack);
         async_->setAsyncScoring(true);
@@ -1168,7 +1168,7 @@ int run(int bench_n, const std::string& weights_override,
     // not hold, or erase the evidence that the feed was damaged.
     std::printf("\n[5g] reconcileAgainst corrects only what disagrees\n");
     {
-        auto rc = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        auto rc = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate, nullptr, 0);
         rc->setRegimeStack(kStack, kNStack);
         check(rc->ingestBackfill(bf.data(), static_cast<int>(bf.size())),
               "reconcile fixture takes the backfill");
@@ -1192,7 +1192,7 @@ int run(int bench_n, const std::string& weights_override,
         damaged[victim].volume           = good_vol * 0.90;
         damaged[victim].number_of_trades = good_n - 7;
 
-        auto rc2 = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate);
+        auto rc2 = createCore(kProduct, kBarSec, kWarmup, weights_.c_str(), kGate, nullptr, 0);
         rc2->setRegimeStack(kStack, kNStack);
         check(rc2->ingestBackfill(damaged.data(), static_cast<int>(damaged.size())),
               "a fixture carrying one SHORT bar is ingested");

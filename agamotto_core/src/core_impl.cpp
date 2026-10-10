@@ -28,6 +28,18 @@
 // multiplied by REVERSE, and that sign is the decision. src/decision_rule.cpp
 // carries the line-by-line transcription of the three reference files.
 //
+// ABI 6 adds CONTEXT TIMEFRAMES for orb. orb's regimes name each atom's
+// timeframe (`1d_r012_and_15m_r003_long`); an atom on a context timeframe is
+// evaluated on THAT timeframe's own panel, engineered from native klines the
+// caller hands in through ingestContextBars, at the row the reference's
+// backward as-of picks: the newest context bar whose close (open + tf) is at or
+// before the base bar's OPEN (orb research.py `_align_timeframes`). That lags
+// the context bar closing together with the base bar by one base bar, in
+// research and in knull orb alike, and is reproduced here, not "fixed". The row
+// must be the bar closing at floor(T / tf) * tf; an older one is stale and the
+// regime does not fire (counted in ContextStats). Agamotto stacks carry no
+// timeframe and take exactly the path they took before.
+//
 // *** THERE IS STILL NO ORDER PATH. *** Not in this core, not in the public
 // AgamottoStrategy, and not behind a flag. `Decision` crosses the ABI and gets
 // LOGGED. Arming is an operator-gated decision that this port does not make.
@@ -41,6 +53,7 @@
 // the regimes whose models carry 5 features, while all 9 firable ones carry 16
 // — see model_runner.hpp and CoreDiagnostics::model_feature_count_variants.
 #include "agamotto_core.hpp"
+#include "context_asof.hpp"
 #include "decision_rule.hpp"
 #include "feature_engine.hpp"
 #include "kline_builder.hpp"
@@ -49,13 +62,16 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -69,6 +85,10 @@ namespace agamotto {
 namespace {
 
 class RealCore final : public ICore {
+    // Defined with the stack members below; declared here because the ABI 6
+    // gate helpers take it by reference before that point.
+    struct Spec;
+
   public:
     // The worker holds a `this` pointer, so it MUST be stopped before any
     // member it touches is destroyed. Joining in the destructor is the only
@@ -76,10 +96,31 @@ class RealCore final : public ICore {
     ~RealCore() override { stopWorker(); }
 
     RealCore(int64_t product_id, int bar_sec, int warmup_bars, const char* weights_dir,
-             const DecisionGate& gate)
-      : mProductId(product_id), mWarmupBars(warmup_bars), mBuilder(bar_sec, warmup_bars),
-        mGateAbi(gate)
+             const DecisionGate& gate, const int* context_tf_sec, int n_context)
+      : mProductId(product_id), mBarSec(bar_sec), mWarmupBars(warmup_bars),
+        mBuilder(bar_sec, warmup_bars), mGateAbi(gate)
     {
+        // ABI 6. The context timeframes are validated first along with the
+        // gate: both are cheap and both are typed by hand into a config.
+        if (n_context < 0 || n_context > 8 || (n_context > 0 && context_tf_sec == nullptr)) {
+            throw std::invalid_argument(
+                "agamotto::createCore: n_context=" + std::to_string(n_context) +
+                " must be 0..8 with a non-null list");
+        }
+        for (int k = 0; k < n_context; ++k) {
+            const int tf = context_tf_sec[k];
+            if (tf <= 0 || tf % 60 != 0 || tf == bar_sec || mCtxTfs.count(tf) != 0) {
+                throw std::invalid_argument(
+                    "agamotto::createCore: context timeframe " + std::to_string(tf) +
+                    " s must be a positive whole number of minutes, differ from "
+                    "bar_sec=" + std::to_string(bar_sec) + " and appear once");
+            }
+            mCtxTfs.insert(tf);
+            CtxInput in;
+            in.stats.tf_sec = tf;
+            mCtxIn.emplace(tf, std::move(in));
+        }
+
         // PHASE 5. The gate is validated BEFORE anything else in this ctor,
         // because it is the cheapest check and the one an operator is most
         // likely to have got wrong by hand. Field-for-field, name-for-name:
@@ -161,6 +202,90 @@ class RealCore final : public ICore {
             mBackfilled += n;
         }
         return ok;
+    }
+
+    // ABI 6. Copies and validates; computes nothing. The panel is engineered
+    // on the scoring path (refreshContextPanels), because the caller is the
+    // thread that drains the SHM ring and every 1h boundary changes 28
+    // symbols' files at once.
+    bool ingestContextBars(int tf_sec, const KlineBar* bars, int n) override
+    {
+        std::lock_guard<std::mutex> lk(mCtxMx);
+        const auto it = mCtxIn.find(tf_sec);
+        if (it == mCtxIn.end()) {
+            mLastContextError = "ingestContextBars: timeframe " + std::to_string(tf_sec) +
+                                " s was not passed to createCore";
+            return false;
+        }
+        ContextStats& st = it->second.stats;
+        const auto refuse = [&](const std::string& why) {
+            ++st.ingests_refused;
+            mLastContextError = "ingestContextBars tf=" + std::to_string(tf_sec) + ": " + why;
+            return false;
+        };
+        if (bars == nullptr || n <= 0) return refuse("no bars");
+
+        const int64_t tf_ms = static_cast<int64_t>(tf_sec) * 1000;
+        const int64_t now_ms = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        std::vector<KlineBar> kept;
+        kept.reserve(static_cast<size_t>(n));
+        int64_t dropped = 0;
+        int64_t gaps = 0;
+        for (int i = 0; i < n; ++i) {
+            const KlineBar& b = bars[i];
+            if (b.bucket_open_ms <= 0 || b.bucket_open_ms % tf_ms != 0) {
+                return refuse("bar " + std::to_string(i) + " opens off the timeframe grid");
+            }
+            if (i > 0) {
+                const int64_t prev = bars[i - 1].bucket_open_ms;
+                if (b.bucket_open_ms <= prev) {
+                    return refuse("bar " + std::to_string(i) + " is not newer than its predecessor");
+                }
+                if (b.bucket_open_ms != prev + tf_ms) ++gaps;
+            }
+            // Still open: its close is in the future. Dropped by TIME, never
+            // by position, so a file that happens to end on a closed bar
+            // loses nothing.
+            if (b.bucket_open_ms + tf_ms > now_ms) {
+                ++dropped;
+                continue;
+            }
+            kept.push_back(b);
+        }
+        if (kept.empty()) return refuse("no closed bar");
+        if (kept.size() > PANEL_BARS) {
+            kept.erase(kept.begin(),
+                       kept.end() - static_cast<std::ptrdiff_t>(PANEL_BARS));
+        }
+        ++st.ingests;
+        st.open_bars_dropped += dropped;
+        st.gaps_last_ingest = gaps;
+        CtxInput& in = it->second;
+        if (!in.bars || !sameBars(*in.bars, kept)) {
+            in.bars = std::make_shared<const std::vector<KlineBar>>(std::move(kept));
+            ++in.version;
+            ++st.ingests_changed;
+        }
+        st.bars_held = static_cast<int64_t>(in.bars->size());
+        st.newest_close_ms = in.bars->back().bucket_open_ms + tf_ms;
+        return true;
+    }
+
+    bool contextStats(int tf_sec, ContextStats* out) const override
+    {
+        std::lock_guard<std::mutex> lk(mCtxMx);
+        const auto it = mCtxIn.find(tf_sec);
+        if (it == mCtxIn.end() || out == nullptr) return false;
+        *out = it->second.stats;
+        return true;
+    }
+
+    std::string lastContextError() const override
+    {
+        std::lock_guard<std::mutex> lk(mCtxMx);
+        return mLastContextError;
     }
 
     // The panel is computed HERE, on the pop, not on the emit. The builder
@@ -491,6 +616,40 @@ class RealCore final : public ICore {
             Spec sp;
             sp.pos = (s.position == 1) ? Position::LONG : Position::SHORT;
             for (uint8_t k = 0; k < s.n_atoms; ++k) sp.atoms.push_back(s.atom_codes[k]);
+            // ABI 6. Every atom names a timeframe or none does: a regime
+            // that mixed the two has no directory name either side could
+            // agree on. Unused slots must be 0, the same discipline as a
+            // stray atom code would get.
+            size_t prefixed = 0;
+            for (uint8_t k = 0; k < s.n_atoms; ++k) {
+                const uint32_t tf = s.atom_tf_sec[k];
+                sp.tfs.push_back(tf);
+                if (tf == 0) continue;
+                ++prefixed;
+                const int tfi = static_cast<int>(tf);
+                if (tfi == mBarSec) continue;
+                if (mCtxTfs.count(tfi) == 0) {
+                    throw std::invalid_argument(
+                        "agamotto::setRegimeStack: regime " + std::to_string(i) +
+                        " evaluates an atom on timeframe " + std::to_string(tf) +
+                        " s, which is neither bar_sec nor a context timeframe "
+                        "passed to createCore");
+                }
+                sp.ctx = true;
+            }
+            for (size_t k = s.n_atoms; k < MAX_REGIME_ATOMS; ++k) {
+                if (s.atom_tf_sec[k] != 0) {
+                    throw std::invalid_argument(
+                        "agamotto::setRegimeStack: regime " + std::to_string(i) +
+                        " carries a timeframe beyond its " +
+                        std::to_string(static_cast<unsigned>(s.n_atoms)) + " atoms");
+                }
+            }
+            if (prefixed != 0 && prefixed != sp.atoms.size()) {
+                throw std::invalid_argument(
+                    "agamotto::setRegimeStack: regime " + std::to_string(i) +
+                    " names a timeframe on some atoms and not others");
+            }
             // PROVE each atom is one this core can evaluate, HERE, at
             // configuration time. Discovering it at the first warm bar would
             // mean a run that boots clean, waits 7.3 days for warmup and only
@@ -517,13 +676,22 @@ class RealCore final : public ICore {
         // simply when the core first learns WHICH regimes it needs.
         std::vector<std::string> dirs;
         dirs.reserve(parsed.size());
-        for (const Spec& sp : parsed) dirs.push_back(regimeDirName(sp.atoms, sp.pos));
+        std::set<int> used_ctx;
+        for (const Spec& sp : parsed) {
+            const bool prefixed = sp.tfs.front() != 0;   // all or none, checked above
+            dirs.push_back(prefixed ? regimeDirName(sp.atoms, sp.tfs, sp.pos)
+                                    : regimeDirName(sp.atoms, sp.pos));
+            for (const uint32_t tf : sp.tfs) {
+                if (tf != 0 && static_cast<int>(tf) != mBarSec) used_ctx.insert(static_cast<int>(tf));
+            }
+        }
 
         ModelBook book;
         book.load(mWeightsDir, dirs);   // throws, naming the regime and the path
 
         mStack = std::move(parsed);
         mRegimeDirs = std::move(dirs);
+        mUsedCtx = std::move(used_ctx);
         mModels = std::move(book);
         // Counts belong to the stack they were accumulated against; carrying
         // them across a replacement would attribute one regime's fires to
@@ -639,8 +807,10 @@ class RealCore final : public ICore {
 
     std::string coreBuildTag() const override
     {
-        return std::string("agamotto-core-") + AGAMOTTO_CORE_GITSHA + "-phase5-decision";
+        return std::string("agamotto-core-") + AGAMOTTO_CORE_GITSHA + "-phase5-decision-ctxtf";
     }
+
+    int coreAbiVersion() const override { return AGAMOTTO_CORE_ABI_VERSION; }
 
   private:
     // Runs the feature engine for the bar that was just popped, or records
@@ -795,14 +965,26 @@ class RealCore final : public ICore {
         }
         const std::chrono::steady_clock::time_point g0 = std::chrono::steady_clock::now();
         try {
+            // ABI 6. One as-of lookup per context timeframe per bar, shared by
+            // every regime that names it. -1 = unusable (stale or missing).
+            std::map<int, int> ctx_row;
+            if (!mUsedCtx.empty()) {
+                refreshContextPanels();
+                for (const int tf : mUsedCtx) ctx_row[tf] = lookupContextRow(tf, mPanelBarTsMs);
+            }
             int64_t fired = 0;
             for (size_t i = 0; i < mStack.size(); ++i) {
-                const std::vector<char> m =
-                    regimeMask(mPanel, mStack[i].atoms, mStack[i].pos);
-                // The LAST row is the bar that just closed. NaN compared false
-                // all the way through, which is how the 53 vol-quantile-gated
-                // regimes stay at 0 for the whole run.
-                const bool hit = m.back() != 0;
+                bool hit = false;
+                if (!mStack[i].ctx) {
+                    const std::vector<char> m =
+                        regimeMask(mPanel, mStack[i].atoms, mStack[i].pos);
+                    // The LAST row is the bar that just closed. NaN compared
+                    // false all the way through, which is how the 53
+                    // vol-quantile-gated regimes stayed at 0 for the whole run.
+                    hit = m.back() != 0;
+                } else {
+                    hit = contextRegimeFires(mStack[i], ctx_row);
+                }
                 mFiredLatest[i] = hit ? 1 : 0;
                 if (hit) {
                     ++mFireCounts[i];
@@ -932,6 +1114,132 @@ class RealCore final : public ICore {
         }
     }
 
+    // ABI 6. Re-engineer a context timeframe's panel only when its bars
+    // changed (a new version), on the scoring thread. A failure leaves that
+    // timeframe without a panel, so its regimes do not fire, and is counted
+    // and reported; it never throws into the gate.
+    void refreshContextPanels()
+    {
+        for (const int tf : mUsedCtx) {
+            std::shared_ptr<const std::vector<KlineBar>> bars;
+            uint64_t version = 0;
+            {
+                std::lock_guard<std::mutex> lk(mCtxMx);
+                const CtxInput& in = mCtxIn.at(tf);
+                bars = in.bars;
+                version = in.version;
+            }
+            CtxPanel& cp = mCtxPanels[tf];
+            if (!bars) {
+                cp = CtxPanel{};
+                continue;
+            }
+            if (cp.version == version) continue;
+            cp = CtxPanel{};
+            cp.version = version;
+            const int64_t tf_ms = static_cast<int64_t>(tf) * 1000;
+            RawBars rb;
+            for (const KlineBar& b : *bars) appendRaw(rb, b);
+            try {
+                cp.panel = engineerFeaturesContext(rb);
+                cp.close_ms.reserve(bars->size());
+                for (const KlineBar& b : *bars) cp.close_ms.push_back(b.bucket_open_ms + tf_ms);
+                cp.ok = true;
+                std::lock_guard<std::mutex> lk(mCtxMx);
+                ContextStats& st = mCtxIn.at(tf).stats;
+                ++st.panels_computed;
+                st.panel_rows = static_cast<int64_t>(bars->size());
+            } catch (const std::exception& e) {
+                cp.panel = Table{};
+                cp.close_ms.clear();
+                cp.ok = false;
+                std::lock_guard<std::mutex> lk(mCtxMx);
+                ContextStats& st = mCtxIn.at(tf).stats;
+                ++st.panel_errors;
+                st.panel_rows = 0;
+                mLastContextError = "context panel tf=" + std::to_string(tf) + ": " + e.what();
+            }
+        }
+    }
+
+    // The reference's backward as-of: the newest context row whose close is
+    // at or before the base bar's OPEN `base_open_ms`, and it must be the row
+    // closing at floor(base_open_ms / tf) * tf. -1 when it is not.
+    int lookupContextRow(int tf, int64_t base_open_ms)
+    {
+        const CtxPanel& cp = mCtxPanels[tf];
+        std::lock_guard<std::mutex> lk(mCtxMx);
+        ContextStats& st = mCtxIn.at(tf).stats;
+        ++st.lookups;
+        if (!cp.ok || cp.close_ms.empty()) {
+            ++st.lookups_missing;
+            st.last_lookup_close_ms = 0;
+            return -1;
+        }
+        AsofStatus status = AsofStatus::MISSING;
+        const int row = contextAsofRow(cp.close_ms, base_open_ms,
+                                       static_cast<int64_t>(tf) * 1000, &status,
+                                       &st.last_lookup_close_ms);
+        if (status == AsofStatus::STALE) ++st.lookups_stale;
+        if (status == AsofStatus::MISSING) ++st.lookups_missing;
+        return row;
+    }
+
+    // A regime with at least one context atom. EVERY atom is evaluated (an
+    // unknown column throws for any of them, as regimeMask does), each on its
+    // own timeframe's panel at its own row, then ANDed. The position rule is
+    // the conjunction's, exactly as regimeMask applies it.
+    bool contextRegimeFires(const Spec& sp, const std::map<int, int>& ctx_row) const
+    {
+        if (!positionAllowed(sp.atoms, sp.pos)) return false;
+        bool all = true;
+        for (size_t k = 0; k < sp.atoms.size(); ++k) {
+            const int tf = static_cast<int>(sp.tfs[k]);
+            if (tf == 0 || tf == mBarSec) {
+                const std::vector<char> m = atomMask(mPanel, sp.atoms[k], sp.pos);
+                all = all && (m.back() != 0);
+                continue;
+            }
+            const int row = ctx_row.at(tf);
+            if (row < 0) {
+                all = false;
+                continue;
+            }
+            const std::vector<char> m = atomMask(mCtxPanels.at(tf).panel, sp.atoms[k], sp.pos);
+            all = all && (m.at(static_cast<size_t>(row)) != 0);
+        }
+        return all;
+    }
+
+    static void appendRaw(RawBars& rb, const KlineBar& b)
+    {
+        rb.open.push_back(b.open);
+        rb.high.push_back(b.high);
+        rb.low.push_back(b.low);
+        rb.close.push_back(b.close);
+        rb.volume.push_back(b.volume);
+        rb.quote_volume.push_back(b.quote_volume);
+        rb.taker_buy_quote_volume.push_back(b.taker_buy_quote_volume);
+        rb.number_of_trades.push_back(static_cast<double>(b.number_of_trades));
+    }
+
+    static bool sameBars(const std::vector<KlineBar>& a, const std::vector<KlineBar>& b)
+    {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const KlineBar& x = a[i];
+            const KlineBar& y = b[i];
+            if (x.bucket_open_ms != y.bucket_open_ms || x.open != y.open || x.high != y.high ||
+                x.low != y.low || x.close != y.close || x.volume != y.volume ||
+                x.quote_volume != y.quote_volume || x.number_of_trades != y.number_of_trades ||
+                x.taker_buy_base_volume != y.taker_buy_base_volume ||
+                x.taker_buy_quote_volume != y.taker_buy_quote_volume) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void clearFiredLatest()
     {
         mFiredLatest.assign(mFiredLatest.size(), 0);
@@ -960,6 +1268,7 @@ class RealCore final : public ICore {
     }
 
     const int64_t mProductId;
+    const int     mBarSec;
     const int     mWarmupBars;
     KlineBuilder  mBuilder;
     int64_t       mBackfilled{0};
@@ -1002,6 +1311,8 @@ class RealCore final : public ICore {
     // per bar.
     struct Spec {
         std::vector<uint16_t> atoms;
+        std::vector<uint32_t> tfs;   // ABI 6: parallel to atoms, 0 = no prefix
+        bool ctx{false};             // some atom is on a context timeframe
         Position pos{Position::LONG};
     };
     std::vector<Spec>    mStack;
@@ -1054,15 +1365,38 @@ class RealCore final : public ICore {
     int64_t     mDecisionsShort{0};
     int64_t     mDecisionErrors{0};
     std::string mLastDecisionError;
+
+    // ---- ABI 6: context timeframes ----------------------------------------
+    // mCtxIn is written by ingestContextBars (the caller's thread) and read by
+    // the scoring path, so it and the stats live under mCtxMx. The engineered
+    // panels are scoring-thread only and keyed by the input's version.
+    struct CtxInput {
+        std::shared_ptr<const std::vector<KlineBar>> bars;
+        uint64_t version{0};
+        ContextStats stats;
+    };
+    struct CtxPanel {
+        uint64_t version{0};
+        bool ok{false};
+        Table panel;
+        std::vector<int64_t> close_ms;   // open + tf, one per panel row
+    };
+    std::set<int>             mCtxTfs;     // fixed at construction
+    std::set<int>             mUsedCtx;    // the subset the stack names
+    mutable std::mutex        mCtxMx;
+    std::map<int, CtxInput>   mCtxIn;      // guarded by mCtxMx
+    std::string               mLastContextError;   // guarded by mCtxMx
+    std::map<int, CtxPanel>   mCtxPanels;  // scoring thread only
 };
 
 } // namespace
 
 std::unique_ptr<ICore> createCore(int64_t product_id, int bar_sec, int warmup_bars,
-                                  const char* weights_dir, const DecisionGate& gate)
+                                  const char* weights_dir, const DecisionGate& gate,
+                                  const int* context_tf_sec, int n_context)
 {
-    return std::unique_ptr<ICore>(
-        new RealCore(product_id, bar_sec, warmup_bars, weights_dir, gate));
+    return std::unique_ptr<ICore>(new RealCore(product_id, bar_sec, warmup_bars, weights_dir,
+                                               gate, context_tf_sec, n_context));
 }
 
 } // namespace agamotto
