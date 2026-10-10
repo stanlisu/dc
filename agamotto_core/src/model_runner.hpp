@@ -157,6 +157,18 @@ const std::vector<std::string>& canonicalPanelColumns();
 // `r001_and_r029_...` are different directories.
 std::string regimeDirName(const std::vector<uint16_t>& atom_codes, Position pos);
 
+// ABI 6 (orb). The same, with each atom's timeframe prefix restored:
+// `{12, 3}` + `{86400, 900}` + LONG -> `1d_r012_and_15m_r003_long`. tf_sec 0 is
+// "no prefix" (agamotto); any other value is rendered by timeframeLabel.
+// `tf_sec` must be as long as `atom_codes`, or this throws.
+std::string regimeDirName(const std::vector<uint16_t>& atom_codes,
+                          const std::vector<uint32_t>& tf_sec, Position pos);
+
+// 900 -> "15m", 3600 -> "1h", 14400 -> "4h", 86400 -> "1d": the reference's
+// timeframe spelling (the largest of d/h/m that divides it). THROWS on 0 or on
+// a value that is not a whole number of minutes, rather than inventing one.
+std::string timeframeLabel(uint32_t tf_sec);
+
 // One regime's linear model, with its feature codes already resolved to panel
 // column indices.
 struct LinearModel {

@@ -179,6 +179,41 @@ std::string regimeDirName(const std::vector<uint16_t>& atom_codes, Position pos)
     return out;
 }
 
+std::string timeframeLabel(uint32_t tf_sec)
+{
+    if (tf_sec == 0 || tf_sec % 60 != 0) {
+        throw std::invalid_argument(
+            "agamotto::timeframeLabel: " + std::to_string(tf_sec) +
+            " s is not a whole number of minutes");
+    }
+    if (tf_sec % 86400 == 0) return std::to_string(tf_sec / 86400) + "d";
+    if (tf_sec % 3600 == 0) return std::to_string(tf_sec / 3600) + "h";
+    return std::to_string(tf_sec / 60) + "m";
+}
+
+std::string regimeDirName(const std::vector<uint16_t>& atom_codes,
+                          const std::vector<uint32_t>& tf_sec, Position pos)
+{
+    if (tf_sec.size() != atom_codes.size()) {
+        throw std::invalid_argument(
+            "agamotto::regimeDirName: " + std::to_string(tf_sec.size()) +
+            " timeframes for " + std::to_string(atom_codes.size()) + " atoms");
+    }
+    if (atom_codes.empty()) {
+        return regimeDirName(atom_codes, pos);   // throws: the empty conjunction
+    }
+    std::string out;
+    for (size_t i = 0; i < atom_codes.size(); ++i) {
+        if (i) out += "_and_";
+        if (tf_sec[i] != 0) out += timeframeLabel(tf_sec[i]) + "_";
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "r%03u", static_cast<unsigned>(atom_codes[i]));
+        out += buf;
+    }
+    out += (pos == Position::LONG) ? "_long" : "_short";
+    return out;
+}
+
 size_t LinearModel::unitScaleFeatures() const
 {
     size_t n = 0;

@@ -75,6 +75,9 @@ docker run --rm \
         # runs every bar) on every code. Disagreement means a stack that
         # validates at boot and throws on the first warm panel, 7.3 days later.
         ./build-linux/regime_parity_driver --selftest
+        # ABI 6: orb's context timeframes -- the as-of row, the one-bar lag,
+        # a stale context bar holding its regimes off, a short 1d history.
+        ./build-linux/ctx_tf_driver | tail -4
     "
 
 [ -f "$OUT" ] || { echo "FAIL: $OUT was not produced" >&2; exit 1; }

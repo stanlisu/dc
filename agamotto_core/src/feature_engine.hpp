@@ -448,4 +448,12 @@ struct RawBars {
 // ragged / missing required columns.
 Table engineerFeatures(const RawBars& bars);
 
+// ABI 6 (orb context timeframes): the same engine on a CONTEXT timeframe's
+// native klines. Accepts MIN_CONTEXT_BARS..PANEL_BARS rows: PANEL_BARS when the
+// venue has that much history, fewer only because the symbol is younger than
+// that (the reference then engineers its whole history too). The BASE panel
+// never comes through here; it stays exactly PANEL_BARS.
+constexpr size_t MIN_CONTEXT_BARS = 100;
+Table engineerFeaturesContext(const RawBars& bars);
+
 } // namespace agamotto

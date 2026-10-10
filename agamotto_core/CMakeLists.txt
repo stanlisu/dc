@@ -180,6 +180,23 @@ target_compile_definitions(core_integration_driver PRIVATE
 target_link_libraries(core_integration_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(core_integration_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
+# ABI 6: context timeframes (orb). The same sources as the integration gate,
+# because it drives createCore() end to end; it also calls atomMask and
+# engineerFeaturesContext directly to build its INDEPENDENT expectation.
+add_executable(ctx_tf_driver tests/ctx_tf_driver.cpp
+                             src/core_impl.cpp
+                             src/kline_builder.cpp
+                             src/feature_engine.cpp
+                             src/talib_block.cpp
+                             src/regime_gate.cpp
+                             src/model_runner.cpp
+                             src/decision_rule.cpp)
+target_include_directories(ctx_tf_driver PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
+target_compile_definitions(ctx_tf_driver PRIVATE
+    AGAMOTTO_CORE_GITSHA="${AGAMOTTO_CORE_GITSHA}")
+target_link_libraries(ctx_tf_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
+target_compile_options(ctx_tf_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
 # ORDER-PATH ARITHMETIC (sentinel side). Links NOTHING from src/ and no
 # ta-lib: the unit under test is order_path_math.hpp, which includes only
 # <cmath>/<cstdint> precisely so it can be tested without the vendor SDK.

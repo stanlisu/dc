@@ -822,6 +822,10 @@ std::vector<double> fillNaZeroLocal(std::vector<double> x)
 
 } // namespace
 
+namespace {
+Table engineerFeaturesUnchecked(const RawBars& bars);
+} // namespace
+
 Table engineerFeatures(const RawBars& bars)
 {
     const size_t n = bars.close.size();
@@ -841,6 +845,30 @@ Table engineerFeatures(const RawBars& bars)
     // artifact, precisely because it does not look like data — keep every
     // column reference in this file symbolic.
 
+    return engineerFeaturesUnchecked(bars);
+}
+
+// ABI 6 (orb context timeframes). The reference engineers each context
+// timeframe on the closed bars live fetched for it: PANEL_BARS when the venue
+// has that much history, the symbol's WHOLE history when it has less (HYPE has
+// ~489 daily bars). Both are the reference's own width, so a short panel here
+// is parity, not a divergence; below MIN_CONTEXT_BARS the moving averages
+// cannot form and it is refused.
+Table engineerFeaturesContext(const RawBars& bars)
+{
+    const size_t n = bars.close.size();
+    if (n < MIN_CONTEXT_BARS || n > PANEL_BARS)
+        throw std::invalid_argument(
+            "engineerFeaturesContext: context panel is " + std::to_string(n) +
+            " bars; accepted is " + std::to_string(MIN_CONTEXT_BARS) + ".." +
+            std::to_string(PANEL_BARS));
+    return engineerFeaturesUnchecked(bars);
+}
+
+namespace {
+Table engineerFeaturesUnchecked(const RawBars& bars)
+{
+    const size_t n = bars.close.size();
     requireColumn(bars.open, "open", n);
     requireColumn(bars.high, "high", n);
     requireColumn(bars.low, "low", n);
@@ -1043,5 +1071,7 @@ Table engineerFeatures(const RawBars& bars)
 
     return t;
 }
+
+} // namespace
 
 } // namespace agamotto
