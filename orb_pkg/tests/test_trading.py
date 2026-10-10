@@ -176,3 +176,27 @@ def test_data_not_fresh_returns_zeros(orb):
     decisions = orb.make_decision()
     _, qty = decisions["BINANCE_PERP_BTC_USDT"]
     assert qty == 0.0
+
+
+# -------------------------------------------------------------------
+# Panel width (2026-10-10): one width with agamotto and agamotto_core
+# -------------------------------------------------------------------
+def test_panel_is_799_closed_bars_like_agamotto_and_the_core():
+    import inspect
+    from agamotto.trading import DEFAULT_KLINE_LOOKBACK
+    from orb import trading as ot
+    assert ot.PANEL_CLOSED_BARS == DEFAULT_KLINE_LOOKBACK - 1 == 799
+    for fn in (OrbTrading.load_data, OrbTrading._fetch_and_prepare_data):
+        assert inspect.signature(fn).parameters["limit"].default == 799
+    assert "limit=700" not in inspect.getsource(ot)
+
+
+def test_init_loads_the_799_bar_panel(base_config):
+    def fake_load_regime_stack(self_inner):
+        self_inner.regime_stack = []
+        self_inner.models = {"long": {}, "short": {}}
+    with patch.object(OrbTrading, "_load_regime_stack", fake_load_regime_stack), \
+         patch.object(OrbTrading, "_calculate_sizes"), \
+         patch.object(OrbTrading, "load_data") as ld:
+        OrbTrading(config=base_config, home_root="/tmp", period="window_test")
+    ld.assert_called_once_with(limit=799)

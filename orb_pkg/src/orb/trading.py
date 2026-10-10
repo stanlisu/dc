@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 # duplicate-label guard — and neither reached this copy. Two copies of the same
 # rule is how engines drift apart; there is now one.
 from agamotto.trading import _closes_at_timestamp  # noqa: F401
+from agamotto.trading import DEFAULT_KLINE_LOOKBACK
+
+# Closed bars per timeframe in the live panel (2026-10-10, was 700). agamotto
+# fetches DEFAULT_KLINE_LOOKBACK rows and drops the open one, leaving 799 closed
+# bars; agamotto_core's PANEL_BARS is the same 799. orb's ``limit`` counts CLOSED
+# bars (it fetches limit + 1 and drops the open bar), hence the - 1. One width for
+# every engine, so the sentinel C++ core can evaluate orb's context-TF atoms on
+# the same panels knull orb does; a different width changes the panel-length-
+# dependent features (cumulative obv/ad) with nothing raising.
+PANEL_CLOSED_BARS = DEFAULT_KLINE_LOOKBACK - 1
 
 
 class OrbTrading(OrbResearch):
@@ -121,7 +131,7 @@ class OrbTrading(OrbResearch):
 
         if not skip_load:
             try:
-                self.load_data(limit=700)
+                self.load_data(limit=PANEL_CLOSED_BARS)
             except Exception as e:
                 logger.warning(
                     f"Failed to load initial data in __init__: {e}")
@@ -292,7 +302,7 @@ class OrbTrading(OrbResearch):
     # Data loading — fetches ALL timeframes
     # ------------------------------------------------------------------
 
-    def load_data(self, limit: int = 700) -> None:
+    def load_data(self, limit: int = PANEL_CLOSED_BARS) -> None:
         self._fetch_and_prepare_data(limit=limit)
 
         tf_seconds = _timeframe_to_seconds(
@@ -322,7 +332,7 @@ class OrbTrading(OrbResearch):
                     f"(last bar {last_ts}, expected >= {expected_last}). "
                     f"Decisions will be CLOSE (all zeros).")
 
-    def _fetch_and_prepare_data(self, limit: int = 700) -> None:
+    def _fetch_and_prepare_data(self, limit: int = PANEL_CLOSED_BARS) -> None:
         """Fetch klines for ALL timeframes, then align."""
         from agamotto import AgamottoResearch
 
