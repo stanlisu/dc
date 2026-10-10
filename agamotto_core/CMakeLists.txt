@@ -277,6 +277,19 @@ target_include_directories(decision_parity_driver PRIVATE src ${TALIB_INC})
 target_link_libraries(decision_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
 target_compile_options(decision_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
 
+# ABI 6 orb parity: the core's pieces over real klines, graded against the real
+# orb code by tests/orb_context_parity.py. Reads sentinel's regime_name.hpp and
+# backfill_csv.hpp from CONTRACT_DIR -- the parser and CSV reader that run live.
+add_executable(orb_parity_driver tests/orb_parity_driver.cpp
+                                 src/decision_rule.cpp
+                                 src/model_runner.cpp
+                                 src/regime_gate.cpp
+                                 src/feature_engine.cpp
+                                 src/talib_block.cpp)
+target_include_directories(orb_parity_driver PRIVATE ${CONTRACT_DIR} src ${TALIB_INC})
+target_link_libraries(orb_parity_driver PRIVATE ${TALIB_LIB} m Threads::Threads)
+target_compile_options(orb_parity_driver PRIVATE -Wall -Wextra ${AGAMOTTO_FP_FLAGS})
+
 # The ta-lib LINK PROOF. find_library above only proves the file exists; this
 # target is the one that actually resolves TA_* symbols, so a broken or
 # ABI-mismatched archive fails the build here rather than at Phase 2.2.

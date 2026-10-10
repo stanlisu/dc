@@ -73,17 +73,15 @@ PYEOF
 
 echo
 echo "=== mutants ==="
-mutate "the NEWEST context bar instead of the as-of one" src/core_impl.cpp \
-    "auto it = std::upper_bound(cp.close_ms.begin(), cp.close_ms.end(), base_open_ms);" \
-    "auto it = cp.close_ms.end();"
-mutate "no freshness check (a stale bar is used)" src/core_impl.cpp \
-    "        if (*it != need) {
-            ++st.lookups_stale;" \
-    "        if (false) {
-            ++st.lookups_stale;"
-mutate "one-row shift (the as-of row minus one)" src/core_impl.cpp \
-    "return static_cast<int>(it - cp.close_ms.begin());" \
-    "return static_cast<int>(it - cp.close_ms.begin()) - 1;"
+mutate "the NEWEST context bar instead of the as-of one" src/context_asof.hpp \
+    "const auto it = std::upper_bound(close_ms.begin(), close_ms.end(), base_open_ms);" \
+    "const auto it = close_ms.end();"
+mutate "no freshness check (a stale bar is used)" src/context_asof.hpp \
+    "    if (*row != need) {" \
+    "    if (false) {"
+mutate "one-row shift (the as-of row minus one)" src/context_asof.hpp \
+    "return static_cast<int>(row - close_ms.begin());" \
+    "return static_cast<int>(row - close_ms.begin()) - 1;"
 mutate "a context atom read off the BASE panel" src/core_impl.cpp \
     "atomMask(mCtxPanels.at(tf).panel, sp.atoms[k], sp.pos);" \
     "atomMask(mPanel, sp.atoms[k], sp.pos);"

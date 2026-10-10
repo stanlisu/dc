@@ -53,6 +53,7 @@
 // the regimes whose models carry 5 features, while all 9 firable ones carry 16
 // — see model_runner.hpp and CoreDiagnostics::model_feature_count_variants.
 #include "agamotto_core.hpp"
+#include "context_asof.hpp"
 #include "decision_rule.hpp"
 #include "feature_engine.hpp"
 #include "kline_builder.hpp"
@@ -1167,8 +1168,6 @@ class RealCore final : public ICore {
     int lookupContextRow(int tf, int64_t base_open_ms)
     {
         const CtxPanel& cp = mCtxPanels[tf];
-        const int64_t tf_ms = static_cast<int64_t>(tf) * 1000;
-        const int64_t need = (base_open_ms / tf_ms) * tf_ms;
         std::lock_guard<std::mutex> lk(mCtxMx);
         ContextStats& st = mCtxIn.at(tf).stats;
         ++st.lookups;
@@ -1177,19 +1176,13 @@ class RealCore final : public ICore {
             st.last_lookup_close_ms = 0;
             return -1;
         }
-        auto it = std::upper_bound(cp.close_ms.begin(), cp.close_ms.end(), base_open_ms);
-        if (it == cp.close_ms.begin()) {
-            ++st.lookups_missing;
-            st.last_lookup_close_ms = 0;
-            return -1;
-        }
-        --it;
-        st.last_lookup_close_ms = *it;
-        if (*it != need) {
-            ++st.lookups_stale;
-            return -1;
-        }
-        return static_cast<int>(it - cp.close_ms.begin());
+        AsofStatus status = AsofStatus::MISSING;
+        const int row = contextAsofRow(cp.close_ms, base_open_ms,
+                                       static_cast<int64_t>(tf) * 1000, &status,
+                                       &st.last_lookup_close_ms);
+        if (status == AsofStatus::STALE) ++st.lookups_stale;
+        if (status == AsofStatus::MISSING) ++st.lookups_missing;
+        return row;
     }
 
     // A regime with at least one context atom. EVERY atom is evaluated (an
